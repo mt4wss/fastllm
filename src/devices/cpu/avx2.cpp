@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <cstdio>
 
 #ifdef __AVX2__
 #include "immintrin.h"
@@ -1218,27 +1220,28 @@ namespace fastllm {
     }
 
 #ifdef __AVX2__
-    static inline __m256 NVFP4ToFloat32_AVX2(const uint8_t *packed) {
-        uint32_t raw;
-        memcpy(&raw, packed, sizeof(raw));
-        __m128i bytes = _mm_cvtsi32_si128(static_cast<int>(raw));
-        const __m128i lowMask = _mm_set1_epi8(0x0F);
-        __m128i low = _mm_and_si128(bytes, lowMask);
-        __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), lowMask);
-        __m128i interleaved = _mm_unpacklo_epi8(low, high);
+    // =====================================================
+    // Optimized NVFP4 kernels: PSHUFB LUT + 4-token blocking
+    // Replaces arithmetic bit-reconstruction with table lookup
+    // for FP4 E2M1 → FP32 dequantization, plus token-level
+    // weight decode amortization across 4 consecutive inputs.
+    // =====================================================
 
-        __m256i fp4 = _mm256_cvtepu8_epi32(interleaved);
-        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(fp4, _mm256_set1_epi32(0x8)), 28);
-        __m256i body = _mm256_and_si256(fp4, _mm256_set1_epi32(0x7));
-
-        __m256i exp = _mm256_slli_epi32(_mm256_add_epi32(_mm256_srli_epi32(body, 1), _mm256_set1_epi32(126)), 23);
-        __m256i mant = _mm256_slli_epi32(_mm256_and_si256(body, _mm256_set1_epi32(1)), 22);
-        mant = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_set1_epi32(1)), mant);
-
-        __m256i bits = _mm256_or_si256(sign, _mm256_or_si256(exp, mant));
-        bits = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_setzero_si256()), bits);
-        return _mm256_castsi256_ps(bits);
-    }
+    // FP4 E2M1 → BF16 lookup tables (low/high byte of each BF16).
+    // 16 entries = one per nibble value {0..15}.
+    // Duplicated across both 128-bit lanes to satisfy PSHUFB lane constraint.
+    alignas(32) static constexpr uint8_t nvfp4_bf16_lo[32] = {
+        0x00,0x00,0x80,0xC0, 0x00,0x40,0x80,0xC0,
+        0x00,0x00,0x80,0xC0, 0x00,0x40,0x80,0xC0,
+        0x00,0x00,0x80,0xC0, 0x00,0x40,0x80,0xC0,
+        0x00,0x00,0x80,0xC0, 0x00,0x40,0x80,0xC0
+    };
+    alignas(32) static constexpr uint8_t nvfp4_bf16_hi[32] = {
+        0x00,0x3F,0x3F,0x3F, 0x40,0x40,0x40,0x40,
+        0x80,0xBF,0xBF,0xBF, 0xC0,0xC0,0xC0,0xC0,
+        0x00,0x3F,0x3F,0x3F, 0x40,0x40,0x40,0x40,
+        0x80,0xBF,0xBF,0xBF, 0xC0,0xC0,0xC0,0xC0
+    };
 
     static inline float NVFP4E8M0ScaleToFloatFast(uint8_t v) {
         uint32_t bits = v == 0 ? 0x00400000u : ((uint32_t)v << 23);
@@ -1247,93 +1250,224 @@ namespace fastllm {
         return ret;
     }
 
-    static constexpr float NVFP4_E2M1_TABLE_AVX2[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-       -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
-    };
-
     static inline float GetNVFP4ScaleValue_AVX2(const float *scales, const uint8_t *scaleBytes, size_t idx) {
         return scales != nullptr ? scales[idx] : NVFP4E8M0ScaleToFloatFast(scaleBytes[idx]);
     }
 
-    template <int COLS, bool INPUT_BF16>
-    static inline void LinearNVFP4Cols_AVX2(
-        const void *inputBase, const uint8_t *weightRows, const float *biasData, float *output,
-        int outputCol, int m, int blockK, int blockM, const float *scales, const uint8_t *scaleBytes,
-        int ms, int packedM
+    /// Dequantize 4 packed bytes (= 8 FP4 E2M1 nibbles) → 8 FP32 values via PSHUFB.
+    /// Nibble order: packed[j] = {lo_nib=col 2j, hi_nib=col 2j+1}.
+    /// Output: sequential columns 0..7.
+    static inline __m256 fp4x8_to_fp32_avx2(const uint8_t* packed, __m256i v_lut_lo, __m256i v_lut_hi) {
+        uint32_t raw;
+        memcpy(&raw, packed, sizeof(uint32_t));
+        __m128i data = _mm_cvtsi32_si128(static_cast<int>(raw));
+        const __m128i low_mask = _mm_set1_epi8(0x0F);
+
+        __m128i lo_nib = _mm_and_si128(data, low_mask);
+        __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(data, 4), low_mask);
+
+        // PSHUFB table lookup → 4 BF16 per lane (cols {0,2,4,6} and {1,3,5,7})
+        __m128i lo_bf16 = _mm_unpacklo_epi8(
+            _mm_shuffle_epi8(_mm256_castsi256_si128(v_lut_lo), lo_nib),
+            _mm_shuffle_epi8(_mm256_castsi256_si128(v_lut_hi), lo_nib));
+        __m128i hi_bf16 = _mm_unpacklo_epi8(
+            _mm_shuffle_epi8(_mm256_castsi256_si128(v_lut_lo), hi_nib),
+            _mm_shuffle_epi8(_mm256_castsi256_si128(v_lut_hi), hi_nib));
+
+        // Interleave → 8 BF16 in 128 bits, then zero-extend to FP32
+        __m128i bf16_8 = _mm_unpacklo_epi16(lo_bf16, hi_bf16);
+        return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_8), 16));
+    }
+
+    /// Scalar fallback for single nibble (tail handling).
+    static inline float fp4_scalar_avx2(uint8_t nib, __m256i v_lut_lo, __m256i v_lut_hi) {
+        uint32_t raw = static_cast<uint32_t>(nib);
+        __m128i data = _mm_cvtsi32_si128(static_cast<int>(raw));
+        __m128i lo_bf16 = _mm_unpacklo_epi8(
+            _mm_shuffle_epi8(_mm256_castsi256_si128(v_lut_lo), data),
+            _mm_shuffle_epi8(_mm256_castsi256_si128(v_lut_hi), data));
+        __m128i bf16_1 = _mm_unpacklo_epi16(lo_bf16, _mm_setzero_si128());
+        __m256 fp32 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf16_1), 16));
+        return _mm_cvtss_f32(_mm256_castps256_ps128(fp32));
+    }
+
+    /// 4-token M-blocked inner kernel: processes `n` tokens × 1 output column `j`.
+    /// Weight row b_row is decoded once per block and FMAdd'ed into 4 token accumulators.
+    template <bool INPUT_BF16>
+    static inline void nvfp4_col_kernel_avx2(
+        const void* inputBase, const uint8_t* weightRows, const float* biasData, float* outputData,
+        int n, int m, int k, int blockK, int blockM, const float* scales, const uint8_t* scaleBytes,
+        int ms, int packedM, int j, __m256i v_lut_lo, __m256i v_lut_hi
     ) {
-        const float *inputF32 = reinterpret_cast<const float*>(inputBase);
-        const uint16_t *inputBF16 = reinterpret_cast<const uint16_t*>(inputBase);
+        const float* inputF32 = reinterpret_cast<const float*>(inputBase);
+        const uint16_t* inputBF16 = reinterpret_cast<const uint16_t*>(inputBase);
 
-        __m256 acc[COLS];
-        float now[COLS];
-        for (int c = 0; c < COLS; c++) {
-            acc[c] = _mm256_setzero_ps();
-            now[c] = biasData ? biasData[outputCol + c] : 0.0f;
+        const int numBlocks = ms;
+
+        int mi = 0;
+        // 4-token blocked path: decode weight once, FMAdd into 4 accumulators
+        for (; mi + 3 < n; mi += 4) {
+            const float* in0 = INPUT_BF16
+                ? nullptr : inputF32 + (size_t)(mi + 0) * m;
+            const float* in1 = INPUT_BF16
+                ? nullptr : inputF32 + (size_t)(mi + 1) * m;
+            const float* in2 = INPUT_BF16
+                ? nullptr : inputF32 + (size_t)(mi + 2) * m;
+            const float* in3 = INPUT_BF16
+                ? nullptr : inputF32 + (size_t)(mi + 3) * m;
+
+            const uint16_t* bf0 = INPUT_BF16 ? inputBF16 + (size_t)(mi + 0) * m : nullptr;
+            const uint16_t* bf1 = INPUT_BF16 ? inputBF16 + (size_t)(mi + 1) * m : nullptr;
+            const uint16_t* bf2 = INPUT_BF16 ? inputBF16 + (size_t)(mi + 2) * m : nullptr;
+            const uint16_t* bf3 = INPUT_BF16 ? inputBF16 + (size_t)(mi + 3) * m : nullptr;
+
+            const uint8_t* b_row = weightRows + (size_t)j * packedM;
+
+            __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
+            __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
+            float scalar0 = 0.0f, scalar1 = 0.0f, scalar2 = 0.0f, scalar3 = 0.0f;
+
+            for (int midx = 0; midx < numBlocks; midx++) {
+                float scale = GetNVFP4ScaleValue_AVX2(scales, scaleBytes,
+                    (size_t)(j / blockK) * ms + midx);
+                __m256 scaleVec = _mm256_set1_ps(scale);
+
+                int l = midx * blockM;
+                int blockEnd = std::min(m, midx * blockM + blockM);
+
+                __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+
+                for (; l + 7 < blockEnd; l += 8) {
+                    __m256 wv = fp4x8_to_fp32_avx2(b_row + (l >> 1), v_lut_lo, v_lut_hi);
+
+                    __m256 a0, a1, a2, a3;
+                    if (INPUT_BF16) {
+                        __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf0 + l));
+                        a0 = bf16_to_fp32_avx2(v0);
+                        __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf1 + l));
+                        a1 = bf16_to_fp32_avx2(v1);
+                        __m128i v2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf2 + l));
+                        a2 = bf16_to_fp32_avx2(v2);
+                        __m128i v3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf3 + l));
+                        a3 = bf16_to_fp32_avx2(v3);
+                    } else {
+                        a0 = _mm256_loadu_ps(in0 + l);
+                        a1 = _mm256_loadu_ps(in1 + l);
+                        a2 = _mm256_loadu_ps(in2 + l);
+                        a3 = _mm256_loadu_ps(in3 + l);
+                    }
+
+                    acc0 = _mm256_fmadd_ps(a0, wv, acc0);
+                    acc1 = _mm256_fmadd_ps(a1, wv, acc1);
+                    acc2 = _mm256_fmadd_ps(a2, wv, acc2);
+                    acc3 = _mm256_fmadd_ps(a3, wv, acc3);
+                }
+
+                // Tail elements (scalar fallback)
+                for (; l < blockEnd; l++) {
+                    uint8_t shift = (l & 1) ? 4 : 0;
+                    uint8_t packed = b_row[l >> 1];
+                    uint8_t nib = (packed >> shift) & 0x0F;
+                    float w = fp4_scalar_avx2(nib, v_lut_lo, v_lut_hi);
+                    float x0, x1, x2, x3;
+                    if (INPUT_BF16) {
+                        uint32_t b0 = (uint32_t)bf0[l] << 16; memcpy(&x0, &b0, 4);
+                        uint32_t b1 = (uint32_t)bf1[l] << 16; memcpy(&x1, &b1, 4);
+                        uint32_t b2 = (uint32_t)bf2[l] << 16; memcpy(&x2, &b2, 4);
+                        uint32_t b3 = (uint32_t)bf3[l] << 16; memcpy(&x3, &b3, 4);
+                    } else {
+                        x0 = in0[l]; x1 = in1[l]; x2 = in2[l]; x3 = in3[l];
+                    }
+                    scalar0 += scale * x0 * w;
+                    scalar1 += scale * x1 * w;
+                    scalar2 += scale * x2 * w;
+                    scalar3 += scale * x3 * w;
+                }
+
+                tot0 = _mm256_fmadd_ps(acc0, scaleVec, tot0);
+                tot1 = _mm256_fmadd_ps(acc1, scaleVec, tot1);
+                tot2 = _mm256_fmadd_ps(acc2, scaleVec, tot2);
+                tot3 = _mm256_fmadd_ps(acc3, scaleVec, tot3);
+            }
+
+            auto hsum = [](const __m256 v) -> float {
+                __m128 lo = _mm256_castps256_ps128(v);
+                __m128 hi = _mm256_extractf128_ps(v, 1);
+                __m128 s = _mm_add_ps(lo, hi);
+                s = _mm_hadd_ps(s, s);
+                s = _mm_hadd_ps(s, s);
+                return _mm_cvtss_f32(s);
+            };
+
+            float bias = biasData ? biasData[j] : 0.0f;
+            outputData[(size_t)(mi + 0) * k + j] = hsum(tot0) + scalar0 + bias;
+            outputData[(size_t)(mi + 1) * k + j] = hsum(tot1) + scalar1 + bias;
+            outputData[(size_t)(mi + 2) * k + j] = hsum(tot2) + scalar2 + bias;
+            outputData[(size_t)(mi + 3) * k + j] = hsum(tot3) + scalar3 + bias;
         }
 
-        for (int midx = 0; midx < ms; midx++) {
-            __m256 scaleVec[COLS];
-            float scaleVal[COLS];
-            if (outputCol / blockK == (outputCol + COLS - 1) / blockK) {
-                float v = GetNVFP4ScaleValue_AVX2(scales, scaleBytes, (size_t)(outputCol / blockK) * ms + midx);
-                __m256 vv = _mm256_set1_ps(v);
-                for (int c = 0; c < COLS; c++) {
-                    scaleVal[c] = v;
-                    scaleVec[c] = vv;
+        // M-tail: single-token fallback
+        for (; mi < n; mi++) {
+            const float* in = INPUT_BF16 ? nullptr
+                : reinterpret_cast<const float*>(inputBase) + (size_t)mi * m;
+            const uint16_t* bf = INPUT_BF16
+                ? reinterpret_cast<const uint16_t*>(inputBase) + (size_t)mi * m : nullptr;
+            const uint8_t* b_row = weightRows + (size_t)j * packedM;
+
+            __m256 total = _mm256_setzero_ps();
+            float scalar = 0.0f;
+
+            for (int midx = 0; midx < numBlocks; midx++) {
+                float scale = GetNVFP4ScaleValue_AVX2(scales, scaleBytes,
+                    (size_t)(j / blockK) * ms + midx);
+                __m256 scaleVec = _mm256_set1_ps(scale);
+
+                int l = midx * blockM;
+                int blockEnd = std::min(m, midx * blockM + blockM);
+                __m256 acc = _mm256_setzero_ps();
+
+                for (; l + 7 < blockEnd; l += 8) {
+                    __m256 wv = fp4x8_to_fp32_avx2(b_row + (l >> 1), v_lut_lo, v_lut_hi);
+                    __m256 a;
+                    if (INPUT_BF16) {
+                        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf + l));
+                        a = bf16_to_fp32_avx2(v);
+                    } else {
+                        a = _mm256_loadu_ps(in + l);
+                    }
+                    acc = _mm256_fmadd_ps(a, wv, acc);
                 }
-            } else {
-                for (int c = 0; c < COLS; c++) {
-                    size_t scaleIdx = (size_t)((outputCol + c) / blockK) * ms + midx;
-                    scaleVal[c] = GetNVFP4ScaleValue_AVX2(scales, scaleBytes, scaleIdx);
-                    scaleVec[c] = _mm256_set1_ps(scaleVal[c]);
+
+                for (; l < blockEnd; l++) {
+                    uint8_t shift = (l & 1) ? 4 : 0;
+                    uint8_t packed = b_row[l >> 1];
+                    uint8_t nib = (packed >> shift) & 0x0F;
+                    float w = fp4_scalar_avx2(nib, v_lut_lo, v_lut_hi);
+                    float x = INPUT_BF16
+                        ? ([&]{ uint32_t b = (uint32_t)bf[l] << 16; float r; memcpy(&r, &b, 4); return r; })()
+                        : in[l];
+                    scalar += scale * x * w;
                 }
+
+                total = _mm256_fmadd_ps(acc, scaleVec, total);
             }
 
-            int l = midx * blockM;
-            int blockEnd = std::min(m, (midx + 1) * blockM);
-            __m256 blockAcc[COLS];
-            for (int c = 0; c < COLS; c++) {
-                blockAcc[c] = _mm256_setzero_ps();
-            }
-            for (; l + 7 < blockEnd; l += 8) {
-                __m256 vi;
-                if constexpr (INPUT_BF16) {
-                    __m128i bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputBF16 + l));
-                    vi = bf16_to_fp32_avx2(bf16);
-                } else {
-                    vi = _mm256_loadu_ps(inputF32 + l);
-                }
-                for (int c = 0; c < COLS; c++) {
-                    __m256 vw = NVFP4ToFloat32_AVX2(weightRows + (size_t)c * packedM + (l >> 1));
-                    blockAcc[c] = _mm256_fmadd_ps(vi, vw, blockAcc[c]);
-                }
-            }
-            for (int c = 0; c < COLS; c++) {
-                acc[c] = _mm256_fmadd_ps(blockAcc[c], scaleVec[c], acc[c]);
-            }
+            auto hsum = [](const __m256 v) -> float {
+                __m128 lo = _mm256_castps256_ps128(v);
+                __m128 hi = _mm256_extractf128_ps(v, 1);
+                __m128 s = _mm_add_ps(lo, hi);
+                s = _mm_hadd_ps(s, s);
+                s = _mm_hadd_ps(s, s);
+                return _mm_cvtss_f32(s);
+            };
 
-            for (; l < blockEnd; l++) {
-                float x;
-                if constexpr (INPUT_BF16) {
-                    uint32_t inputBits = static_cast<uint32_t>(inputBF16[l]) << 16;
-                    memcpy(&x, &inputBits, sizeof(x));
-                } else {
-                    x = inputF32[l];
-                }
-                uint8_t shift = (l & 1) ? 4 : 0;
-                for (int c = 0; c < COLS; c++) {
-                    uint8_t packed = weightRows[(size_t)c * packedM + (l >> 1)];
-                    now[c] += scaleVal[c] * x * NVFP4_E2M1_TABLE_AVX2[(packed >> shift) & 0xF];
-                }
-            }
-        }
-
-        for (int c = 0; c < COLS; c++) {
-            output[c] = now[c] + Floatsum(acc[c]);
+            float bias = biasData ? biasData[j] : 0.0f;
+            outputData[(size_t)mi * k + j] = hsum(total) + scalar + bias;
         }
     }
 
+    /// Dispatch: iterate output columns [st, end), call per-column kernel.
     template <bool INPUT_BF16>
     static inline bool LinearNVFP4_AVX2_Run(
         const void *inputData, uint8_t *weightData, float *biasData, float *outputData,
@@ -1341,38 +1475,14 @@ namespace fastllm {
         const float *scales, const uint8_t *scaleBytes, int ms
     ) {
         int packedM = m >> 1;
-        for (int i = 0; i < n; i++) {
-            const void *input;
-            if constexpr (INPUT_BF16) {
-                input = reinterpret_cast<const uint16_t*>(inputData) + (size_t)i * m;
-            } else {
-                input = reinterpret_cast<const float*>(inputData) + (size_t)i * m;
-            }
+        __m256i v_lut_lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(nvfp4_bf16_lo));
+        __m256i v_lut_hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(nvfp4_bf16_hi));
 
-            int j = st;
-            for (; j + 3 < end; j += 4) {
-                LinearNVFP4Cols_AVX2<4, INPUT_BF16>(
-                    input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
-                    j, m, blockK, blockM, scales, scaleBytes, ms, packedM);
-            }
-            switch (end - j) {
-                case 0: break;
-                case 1:
-                    LinearNVFP4Cols_AVX2<1, INPUT_BF16>(
-                        input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
-                        j, m, blockK, blockM, scales, scaleBytes, ms, packedM);
-                    break;
-                case 2:
-                    LinearNVFP4Cols_AVX2<2, INPUT_BF16>(
-                        input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
-                        j, m, blockK, blockM, scales, scaleBytes, ms, packedM);
-                    break;
-                case 3:
-                    LinearNVFP4Cols_AVX2<3, INPUT_BF16>(
-                        input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
-                        j, m, blockK, blockM, scales, scaleBytes, ms, packedM);
-                    break;
-            }
+        for (int j = st; j < end; j++) {
+            nvfp4_col_kernel_avx2<INPUT_BF16>(
+                inputData, weightData, biasData, outputData,
+                n, m, k, blockK, blockM, scales, scaleBytes,
+                ms, packedM, j, v_lut_lo, v_lut_hi);
         }
         return true;
     }
