@@ -203,16 +203,18 @@ namespace fastllm {
         bool mtpWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
         bool speculativeCollectAllLogits = false;
+        bool speculativeCaptureAllHiddenStates = false;
         bool speculativeCacheOnlyForward = false;
         Data speculativeHiddenStates;
+        std::vector<unsigned char> speculativeTypicalAccepted;
         bool speculativeCaptureFirstTokenLinearState = false;
         int speculativeLinearStateCaptureSlots = 0;
         std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
         std::vector<std::vector<int> > speculativeLinearCaptureMask;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;
-        std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
-        std::mutex mtpCacheMutex;
+        mutable std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
+        mutable std::mutex mtpCacheMutex;
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
         std::atomic<long long> mtpValidationCount{0};
@@ -318,6 +320,7 @@ namespace fastllm {
                                         const Data &mropePositionDelta,
                                         Data &adjustedPositionIds);
         bool HasMtpWeights() const;
+        bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
@@ -327,7 +330,8 @@ namespace fastllm {
                               const Data &targetHiddenStates,
                               const std::vector<int> &inputTokens,
                               const Data &positionIds, int sampleRow,
-                              Data *sampledHiddenStates = nullptr);
+                              Data *sampledHiddenStates = nullptr,
+                              bool cacheOnly = false);
         void Qwen35MTPLoop();
         bool Qwen35MTPForward(
                 bool useGPUForward,
