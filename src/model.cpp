@@ -696,6 +696,11 @@ namespace fastllm {
                         AssertInFastLLM(scale2->len == 1,
                                         "CreateBufferWithScale error: NVFP4 scale2 should be scalar.");
                         scale2Value = ((float*)scale2->buffer)[0];
+                        if (StringEndWith(scale2->tensorName, ".weight_global_scale")) {
+                            AssertInFastLLM(scale2Value != 0.0f,
+                                            "CreateBufferWithScale error: NVFP4 weight_global_scale should be non-zero.");
+                            scale2Value = 1.0f / scale2Value;
+                        }
                     }
 
                     size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
@@ -1084,6 +1089,22 @@ namespace fastllm {
             return it != safeTensors.itmeDict.end() &&
                    (it->second.dtype == "F8_E4M3" || IsPackedFP4StorageDType(it->second.dtype));
         };
+        if (StringEndWith(name, ".weight_scale")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_scale"));
+            return isQuantTensor(prefix + ".weight") || isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_scale_2")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_scale_2"));
+            return isQuantTensor(prefix + ".weight") || isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_global_scale")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_global_scale"));
+            return isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".input_global_scale")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".input_global_scale"));
+            return isQuantTensor(prefix + ".weight_packed");
+        }
         if (StringEndWith(name, "_scale_inv")) {
             return isQuantTensor(name.substr(0, name.size() - strlen("_scale_inv")));
         }
@@ -1095,12 +1116,6 @@ namespace fastllm {
         }
         if (StringEndWith(name, ".scale")) {
             return isQuantTensor(name.substr(0, name.size() - strlen(".scale")) + ".weight");
-        }
-        if (StringEndWith(name, ".weight_scale")) {
-            return isQuantTensor(name.substr(0, name.size() - strlen(".weight_scale")) + ".weight");
-        }
-        if (StringEndWith(name, ".weight_scale_2")) {
-            return isQuantTensor(name.substr(0, name.size() - strlen(".weight_scale_2")) + ".weight");
         }
         return false;
     }
@@ -1115,6 +1130,9 @@ namespace fastllm {
             std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
             candidates.push_back(prefix + ".scale_inv");
             candidates.push_back(prefix + ".scale");
+            candidates.push_back(prefix + ".weight_scale");
+        } else if (StringEndWith(tensorName, ".weight_packed")) {
+            std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight_packed"));
             candidates.push_back(prefix + ".weight_scale");
         }
         for (auto &candidate : candidates) {
@@ -1133,6 +1151,9 @@ namespace fastllm {
         if (StringEndWith(tensorName, ".weight")) {
             std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
             candidates.push_back(prefix + ".weight_scale_2");
+        } else if (StringEndWith(tensorName, ".weight_packed")) {
+            std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight_packed"));
+            candidates.push_back(prefix + ".weight_global_scale");
         }
         for (auto &candidate : candidates) {
             if (safeTensors.itmeDict.find(candidate) != safeTensors.itmeDict.end()) {
@@ -1140,6 +1161,31 @@ namespace fastllm {
             }
         }
         return "";
+    }
+
+    static DataType ResolveSafeTensorAutoDataType(const SafeTensors &safeTensors,
+                                                  const std::string &tensorName,
+                                                  DataType tensorDataType,
+                                                  DataType linearDataType,
+                                                  DataType originalDataType) {
+        bool useLinearDataType = tensorDataType == DataType::DATA_AUTO_LINEAR ||
+                                 tensorDataType == DataType::DATA_AUTO_CONV;
+        DataType requestedDataType = useLinearDataType ? linearDataType : tensorDataType;
+        if (requestedDataType == DataType::DATA_AUTO_SOURCE) {
+            auto tensorIt = safeTensors.itmeDict.find(tensorName);
+            if (tensorIt != safeTensors.itmeDict.end() && tensorIt->second.dtype == "F8_E4M3" &&
+                !FindSafeTensorScaleTensorName(safeTensors, tensorName).empty()) {
+                return DataType::FP8_E4M3;
+            }
+            return DataType::FLOAT16;
+        }
+        if (useLinearDataType) {
+            return linearDataType;
+        }
+        if (tensorDataType >= DataType::DATA_AUTO_NONE) {
+            return originalDataType;
+        }
+        return tensorDataType;
     }
 
     static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
@@ -1886,7 +1932,12 @@ namespace fastllm {
     static void ResolveExportDataTypeForTensor(const SafeTensorItem &tensor, bool isPackedFp4,
                                                DataType linearDataType, DataType oriDataType,
                                                DataType &dataType) {
-        if (dataType >= DATA_AUTO_NONE) {
+        if (linearDataType == DataType::DATA_AUTO_SOURCE) {
+            linearDataType = DataType::FLOAT16;
+        }
+        if (dataType == DataType::DATA_AUTO_SOURCE) {
+            dataType = DataType::FLOAT16;
+        } else if (dataType >= DATA_AUTO_NONE) {
             DataType autoType = dataType;
             dataType = IsExportLinearAutoDataType(autoType) ? linearDataType : oriDataType;
             if (isPackedFp4 && !IsExportLinearAutoDataType(autoType)) {
@@ -2622,7 +2673,9 @@ if (false) {
 
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
-                    dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                    dataType = ResolveSafeTensorAutoDataType(safeTensors, tensorName,
+                                                             dataType, linearDataType,
+                                                             oriDataType);
                     
                     // 如果原始权重不是FP8_E4M3格式，目前不做转换
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
@@ -2771,7 +2824,9 @@ if (false) {
                             }
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
-                                dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                                dataType = ResolveSafeTensorAutoDataType(safeTensors, tensorName,
+                                                                         dataType, linearDataType,
+                                                                         oriDataType);
                             }
                             if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                                 dataType = DataType::FLOAT16;
