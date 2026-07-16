@@ -189,9 +189,11 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Ernie4_5_MoeForCausalLM",
         "PanguProMoEForCausalLM",
         "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "Qwen3NextForCausalLM",
         "MiniMaxM2ForCausalLM",
-    ] or model_type in ["deepseek_v4", "qwen3_5_moe"] or text_model_type == "qwen3_5_moe_text")
+        "HYV3ForCausalLM",
+    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3"] or text_model_type == "qwen3_5_moe_text")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
@@ -330,6 +332,7 @@ def make_normal_llm_model(args):
         config_path = os.path.join(args.ori, "config.json")
     is_moe_model = False
     is_thread_tp_moe_model = False
+    is_multicuda_tp_model = False
     if (os.path.exists(config_path)):
         try:
             import json
@@ -369,20 +372,25 @@ def make_normal_llm_model(args):
                 architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
-                architecture == 'Glm4MoeForCausalLM'):
+                architecture == 'Glm4MoeForCausalLM' or architecture == 'GlmMoeDsaForCausalLM' or
+                architecture == 'HYV3ForCausalLM' or model_type == 'glm_moe_dsa' or
+                model_type == 'hy_v3'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
             if ((architecture == 'Qwen3_5ForConditionalGeneration' or
                  model_type == 'qwen3_5' or text_model_type == 'qwen3_5_text') and
                 (not user_set_device) and _has_cuda_device()):
                 args.device = "cuda"
-            if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe'):
+            if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe' or
+                architecture == 'HYV3ForCausalLM' or model_type == 'hy_v3'):
                 is_thread_tp_moe_model = True
             if (architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text'):
                 is_thread_tp_moe_model = True
             if (architecture == 'MiniMaxM2ForCausalLM' or model_type == 'minimax_m2'):
                 is_thread_tp_moe_model = True
+            if (architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4'):
+                is_multicuda_tp_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
@@ -420,10 +428,25 @@ def make_normal_llm_model(args):
 
     if (_uses_thread_tp(getattr(args, "tp", ""))):
         tp_device = _first_thread_tp_cuda_device(args.tp)
-        if (not user_set_device):
-            args.device = tp_device
-        if (not user_set_moe_device):
-            args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
+        cuda_spec = _thread_tp_cuda_device_spec(args.tp)
+        if is_multicuda_tp_model:
+            multicuda_spec = "multicuda:" + cuda_spec.split(":", 1)[1]
+            if (not user_set_device):
+                args.device = multicuda_spec
+            if (not user_set_moe_device):
+                args.moe_device = multicuda_spec
+        else:
+            if (not user_set_device):
+                args.device = tp_device
+            if (not user_set_moe_device):
+                args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
+    if is_multicuda_tp_model and _uses_multicuda_device(args.moe_device):
+        # DeepSeek-V4 has tens of thousands of routed-expert tensors.  Splitting
+        # every one into a separate allocation can exhaust the CUDA driver's
+        # allocation-count limit long before device memory is full.  Keep the
+        # simple `--tp N` path usable by packing model weights into slabs.
+        if args.cuda_slab <= 0:
+            args.cuda_slab = 256
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -460,6 +483,9 @@ def make_normal_llm_model(args):
             args.atype = "float32"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    raw_main_device = str(args.device or "").strip()
+    os.environ["FASTLLM_CUDAPP_SERIAL"] = "1" if raw_main_device.lower().startswith("cudapp=") else "0"
+
     tp_arg = getattr(args, "tp", "")
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
@@ -476,7 +502,7 @@ def make_normal_llm_model(args):
     if (args.device and args.device != ""):
         expanded = expand_cudapp_device(args.device)
         if expanded != args.device:
-            print(f"[device] cudapp expand: {args.device} => {expanded}")
+            print(f"[device] cudapp expand: {args.device} => {expanded}", flush=True)
             args.device = expanded
     if (args.moe_device and args.moe_device != ""):
         args.moe_device = expand_cudapp_device(args.moe_device)
@@ -524,8 +550,9 @@ def make_normal_llm_model(args):
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding):
         llm.set_cuda_embedding(True)
-    if (args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]):
-        llm.set_cuda_shared_expert(True)
+    llm.set_cuda_shared_expert(
+        args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]
+    )
     if (args.enable_amx.lower() not in ["", "false", "0", "off"]):
         llm.set_enable_amx(True)
     if (args.tokens > 0):

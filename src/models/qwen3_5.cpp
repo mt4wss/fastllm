@@ -241,6 +241,15 @@ namespace fastllm {
         return enabled;
     }
 
+    static bool Qwen35MtpFp8DraftHeadEnabled() {
+        static bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_MTP_FP8_DRAFT_HEAD");
+            return env == nullptr || env[0] == '\0' ||
+                   Qwen35MoeIsTrueString(env);
+        }();
+        return enabled;
+    }
+
     static int Qwen35MtpProfileInterval() {
         static int interval = []() {
             const char *env = std::getenv("FASTLLM_QWEN35_MTP_PROFILE");
@@ -4825,6 +4834,15 @@ namespace fastllm {
         Qwen35EraseLinearPrefixSnapshots(this);
 #ifdef USE_CUDA
         Qwen35EraseCudaGraphDecodeStates(this);
+        int previousDevice = FastllmCudaGetDevice();
+        for (auto &it : mtpDraftLmHeadWeights) {
+            FastllmCudaSetDevice(it.first);
+            delete it.second;
+        }
+        mtpDraftLmHeadWeights.clear();
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
 #endif
     }
 
@@ -4832,7 +4850,17 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios);
+        return CanUseGPUForward() &&
+               GetQwen35ThreadTpDevices(this->deviceMap, devices, ratios);
+#else
+        return false;
+#endif
+    }
+
+    bool Qwen3_5Model::CanUseGPUForward() const {
+#ifdef USE_CUDA
+        return !GetKVCacheInCPU() &&
+               Qwen35CanUseGPUForward(this->deviceMap, this->moeDeviceMap);
 #else
         return false;
 #endif
@@ -5304,12 +5332,9 @@ namespace fastllm {
 #ifndef USE_CUDA
         return false;
 #else
-        std::vector<int> devices;
-        std::map<int, int> ratios;
         return !Qwen35MtpDisabledByEnv() &&
                HasMtpWeights() &&
-               GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
-               !devices.empty();
+               CanUseGPUForward();
 #endif
     }
 
@@ -6045,13 +6070,20 @@ namespace fastllm {
                     Qwen3CudaToDataType(cudaRunner, partial, buf.hiddenStates.dataType);
                 }
                 if (tensorParallel) {
-                    if (firstTensorParallelRank) {
-                        Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
-                    } else {
-                        Qwen35CudaCopyTensor(cudaRunner, partial, buf.hiddenStates);
+                    if (!Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                            partial, buf.hiddenStates, gpuId)) {
+                        if (firstTensorParallelRank) {
+                            Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
+                        } else {
+                            Qwen35CudaCopyTensor(
+                                cudaRunner, partial, buf.hiddenStates);
+                        }
+                        FastllmNcclAllReduce(
+                            buf.hiddenStates.cudaData,
+                            buf.hiddenStates.cudaData,
+                            buf.hiddenStates.Count(0),
+                            buf.hiddenStates.dataType, gpuId);
                     }
-                    FastllmNcclAllReduce(buf.hiddenStates.cudaData, buf.hiddenStates.cudaData,
-                                         buf.hiddenStates.Count(0), buf.hiddenStates.dataType, gpuId);
                 } else {
                     Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
                 }
@@ -6125,7 +6157,8 @@ namespace fastllm {
                             *requireLocal(weight[oWeightName], oWeightName),
                             *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                             buf.attenLastOutput, buf.hiddenStates,
-                            tensorParallel, firstTensorParallelRank, gpuId);
+                            tensorParallel, firstTensorParallelRank, gpuId,
+                            true);
                     } else {
                         Qwen35ZeroCudaLike(buf.attenLastOutput, buf.hiddenStates, gpuId);
                         addPartialToResidualReduce(buf.attenLastOutput);
@@ -6352,7 +6385,7 @@ namespace fastllm {
                         *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                       outProjWeightName + ".tp_bias"),
                         buf.attenLastOutput, buf.hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
 
                 Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
@@ -6377,7 +6410,8 @@ namespace fastllm {
                             cudaRunner, buf.swigluResult,
                             downWeight, downBias,
                             buf.mlpPart, buf.hiddenStates,
-                            tensorParallel, firstTensorParallelRank, gpuId);
+                            tensorParallel, firstTensorParallelRank, gpuId,
+                            true);
                     }
                     continue;
                 }
@@ -6396,6 +6430,7 @@ namespace fastllm {
                 if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
                     AssertInFastLLM(weight.weight.find(sharedGateupWeightName) != weight.weight.end(),
                                     "Qwen3.5 CUDA graph requires merged shared expert gateup weight.\n");
+                    FastllmCudaGraphMarkQwen35MoeFork(i);
                     Qwen3CudaLinearSwiglu(cudaRunner, buf.attenInput,
                                           *requireLocal(weight[sharedGateupWeightName], sharedGateupWeightName),
                                           *requireLocal(GetThreadTensorParallelBias(sharedGateupWeightName + ".tp_bias"),
@@ -6419,25 +6454,34 @@ namespace fastllm {
                     // 共享专家输出不单独归约：延后与路由专家输出本地相加后一次 allReduce，
                     // 每个 MoE 层省一次集合通信（小 hidden 下 allReduce 为纯延迟型，TP 解码收益明显）。
                     sharedExpertPending = true;
+                    FastllmCudaGraphMarkQwen35MoeSharedDone(i);
                 }
 
+                if (sharedExpertPending) {
+                    FastllmCudaGraphMarkQwen35MoeRoutedBegin(i);
+                }
                 int localBatch = buf.attenInput.dims[0];
                 int localLen = buf.attenInput.dims[1];
                 buf.attenInput.Reshape({localBatch * localLen, buf.attenInput.dims[2]});
                 Qwen3CudaLinear(cudaRunner, buf.attenInput,
                                 *requireLocal(weight[gateWeightName], gateWeightName),
                                 *GetEmptyData(), buf.routerLogits, true);
-                Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits,
-                                           buf.routerLogitsTemp, DataType::FLOAT32);
-                Qwen3CudaSoftmax(cudaRunner, buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
                 Data *localGateBias = nullptr;
                 if (weight.weight.find(gateBiasName) != weight.weight.end()) {
                     localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
                 }
-                Qwen3CudaSelectExpert(cudaRunner, buf.routerLogitsTemp,
-                                      buf.expertIndex, buf.expertScore,
-                                      this->num_experts_per_tok, this->norm_topk_prob,
-                                      this->routed_scaling_factor, localGateBias);
+                if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
+                        cudaRunner, buf.routerLogits, buf.expertIndex, buf.expertScore,
+                        this->num_experts_per_tok, this->norm_topk_prob,
+                        this->routed_scaling_factor, localGateBias)) {
+                    Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits,
+                                               buf.routerLogitsTemp, DataType::FLOAT32);
+                    Qwen3CudaSoftmax(cudaRunner, buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
+                    Qwen3CudaSelectExpert(cudaRunner, buf.routerLogitsTemp,
+                                          buf.expertIndex, buf.expertScore,
+                                          this->num_experts_per_tok, this->norm_topk_prob,
+                                          this->routed_scaling_factor, localGateBias);
+                }
 
                 if (HasFusedMoeWeights(i)) {
                     Data *localGate = GetFusedMoeWeightForDevice(moeGate3DWeights[i], gpuId);
@@ -6469,6 +6513,7 @@ namespace fastllm {
                 }
                 buf.moeFinal.Reshape(buf.hiddenStates.dims);
                 if (sharedExpertPending) {
+                    FastllmCudaGraphMarkQwen35MoeJoin(i);
                     if (buf.sharedOutput.dataType != buf.moeFinal.dataType) {
                         Qwen3CudaToDataType(cudaRunner, buf.sharedOutput, buf.moeFinal.dataType);
                     }
@@ -6549,44 +6594,100 @@ namespace fastllm {
             return true;
         }
 
-        void *capturedGraph = nullptr;
-        FastllmCudaClearThreadError();
-        if (!FastllmCudaGraphBeginCapture()) {
-            printf("Warning: Qwen3.5 CUDA graph begin capture failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
-        runGraphBody();
-        bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
-        if (usedUnsafeMoeFallback) {
-            printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during capture.\n",
-                   gpuId);
-            fflush(stdout);
-            Qwen35AbortCudaGraphCapture();
-            Qwen35DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        if (FastllmCudaGetThreadError() || FastllmCudaGraphCaptureInvalidated()) {
-            printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because errors occurred inside capture body. Fallback to eager mode.\n",
-                   gpuId);
-            fflush(stdout);
-            Qwen35AbortCudaGraphCapture();
-            Qwen35DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
-        }
-        if (!FastllmCudaGraphEndCapture(&capturedGraph) || capturedGraph == nullptr) {
-            printf("Warning: Qwen3.5 CUDA graph end capture failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            if (capturedGraph != nullptr) {
-                FastllmCudaGraphDestroy(capturedGraph);
+        enum class Qwen35GraphCaptureFailure {
+            None,
+            Begin,
+            UnsafeMoeFallback,
+            Body,
+            End
+        };
+        auto capturePreparedGraph = [&](bool enableMoeMarkers,
+                                        void *&capturedGraph) {
+            struct MoeMarkerScope {
+                bool previous;
+                explicit MoeMarkerScope(bool enabled) :
+                    previous(FastllmCudaGraphSetQwen35MoeMarkersEnabled(enabled)) {}
+                ~MoeMarkerScope() {
+                    FastllmCudaGraphSetQwen35MoeMarkersEnabled(previous);
+                }
+            } markerScope(enableMoeMarkers);
+
+            capturedGraph = nullptr;
+            FastllmCudaClearThreadError();
+            if (!FastllmCudaGraphBeginCapture()) {
+                return Qwen35GraphCaptureFailure::Begin;
             }
+            FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+            runGraphBody();
+            if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) {
+                Qwen35AbortCudaGraphCapture();
+                return Qwen35GraphCaptureFailure::UnsafeMoeFallback;
+            }
+            if (FastllmCudaGetThreadError() ||
+                FastllmCudaGraphCaptureInvalidated()) {
+                Qwen35AbortCudaGraphCapture();
+                return Qwen35GraphCaptureFailure::Body;
+            }
+            if (!FastllmCudaGraphEndCapture(&capturedGraph) ||
+                capturedGraph == nullptr) {
+                if (capturedGraph != nullptr) {
+                    FastllmCudaGraphDestroy(capturedGraph);
+                    capturedGraph = nullptr;
+                }
+                return Qwen35GraphCaptureFailure::End;
+            }
+            return Qwen35GraphCaptureFailure::None;
+        };
+        auto reportCaptureFailure = [&](Qwen35GraphCaptureFailure failure,
+                                        bool markerless) {
+            const char *phase = markerless ? "markerless recapture" : "capture";
+            if (failure == Qwen35GraphCaptureFailure::Begin) {
+                printf("Warning: Qwen3.5 CUDA graph %s begin failed on gpu %d: %s. Disable graph for this GPU.\n",
+                       phase, gpuId, FastllmCudaGraphLastError());
+            } else if (failure == Qwen35GraphCaptureFailure::UnsafeMoeFallback) {
+                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during %s.\n",
+                       gpuId, phase);
+            } else if (failure == Qwen35GraphCaptureFailure::Body) {
+                printf("Warning: Qwen3.5 CUDA graph disabled on gpu %d because errors occurred inside %s body. Fallback to eager mode.\n",
+                       gpuId, phase);
+            } else if (failure == Qwen35GraphCaptureFailure::End) {
+                printf("Warning: Qwen3.5 CUDA graph %s end failed on gpu %d: %s. Disable graph for this GPU.\n",
+                       phase, gpuId, FastllmCudaGraphLastError());
+            }
+            fflush(stdout);
+        };
+
+        void *capturedGraph = nullptr;
+        Qwen35GraphCaptureFailure captureFailure =
+            capturePreparedGraph(true, capturedGraph);
+        if (captureFailure != Qwen35GraphCaptureFailure::None) {
+            reportCaptureFailure(captureFailure, false);
+            Qwen35DestroyCudaGraph(state);
+            state.disabled = true;
+            runWithoutGraph();
+            return true;
+        }
+
+        int parallelMoeLayers = FastllmCudaGraphOptimizeQwen35Moe(capturedGraph);
+        if (parallelMoeLayers ==
+            FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS) {
+            FastllmCudaGraphDestroy(capturedGraph);
+            capturedGraph = nullptr;
+            captureFailure = capturePreparedGraph(false, capturedGraph);
+            if (captureFailure != Qwen35GraphCaptureFailure::None) {
+                reportCaptureFailure(captureFailure, true);
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                runWithoutGraph();
+                return true;
+            }
+            parallelMoeLayers = 0;
+        }
+        if (parallelMoeLayers < 0) {
+            printf("Warning: Qwen3.5 CUDA graph MoE parallelization failed on gpu %d: %s. Disable graph for this GPU.\n",
+                   gpuId, FastllmCudaGraphLastError());
+            fflush(stdout);
+            FastllmCudaGraphDestroy(capturedGraph);
             Qwen35DestroyCudaGraph(state);
             state.disabled = true;
             runWithoutGraph();
@@ -6742,7 +6843,8 @@ namespace fastllm {
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data moeFinal, sharedGate, sharedOutput;
         Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
-        Data gdnMerged, baMerged, qkvConvInput, z, b, a, g, conv, convOutput, coreAttnOut, coreTemp;
+        Data gdnMerged, baMerged, qkvConvInput, qkvConvInputPermuted;
+        Data z, b, a, g, conv, convOutput, convOutputPermuted, coreAttnOut, coreTemp;
         Data convInputWithCache;
         Data convToken0, convToken1, convOutput0, convOutput1;
         Data convRow0, convRow1, baRow0, baRow1;
@@ -6760,13 +6862,18 @@ namespace fastllm {
                 Qwen3CudaToDataType(cudaRunner, partial, hiddenStates.dataType);
             }
             if (tensorParallel) {
-                if (firstTensorParallelRank) {
-                    Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
-                } else {
-                    Qwen35CudaCopyTensor(cudaRunner, partial, hiddenStates);
+                if (!Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                        partial, hiddenStates, gpuId)) {
+                    if (firstTensorParallelRank) {
+                        Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
+                    } else {
+                        Qwen35CudaCopyTensor(
+                            cudaRunner, partial, hiddenStates);
+                    }
+                    FastllmNcclAllReduce(
+                        hiddenStates.cudaData, hiddenStates.cudaData,
+                        hiddenStates.Count(0), hiddenStates.dataType, gpuId);
                 }
-                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                     hiddenStates.Count(0), hiddenStates.dataType, gpuId);
             } else {
                 Qwen3CudaAddTo(cudaRunner, hiddenStates, partial);
             }
@@ -6837,7 +6944,7 @@ namespace fastllm {
                         *requireLocal(weight[oWeightName], oWeightName),
                         *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
                         attenLastOutput, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                 } else {
                     Qwen35ZeroCudaLike(attenLastOutput, hiddenStates, gpuId);
                     addPartialToResidualReduce(attenLastOutput);
@@ -7012,6 +7119,7 @@ namespace fastllm {
                     keepCombinedBaForBatchSpeculative &&
                     (int)seqLens.size() == batch;
                 int batchedSpeculativeTotalTokens = 0;
+                Data *qkvConvInputForConv = &qkvConvInput;
                 if (batchedSpeculativeSequence) {
                     int expectedCaptureSlots = 0;
                     int commonSeqLen = seqLens[0];
@@ -7035,7 +7143,9 @@ namespace fastllm {
                 } else if (batch > 1 && all1) {
                     qkvConvInput.Reshape({batch, qkvConvInput.dims.back(), 1});
                 } else {
-                    Qwen3CudaPermuteSelf(cudaRunner, qkvConvInput, {0, 2, 1});
+                    Qwen3CudaPermuteTo(cudaRunner, qkvConvInput, {0, 2, 1},
+                                       qkvConvInputPermuted);
+                    qkvConvInputForConv = &qkvConvInputPermuted;
                 }
                 z.Reshape({bsz, seqlen, localValueHeads, head_v_dim});
 
@@ -7065,7 +7175,7 @@ namespace fastllm {
                     }
                     bool fused =
                         FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
-                            requestPastKeys, qkvConvInput,
+                            requestPastKeys, *qkvConvInputForConv,
                             *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                             *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                             convOutput, tokenConvCaches, captureTokens);
@@ -7094,22 +7204,22 @@ namespace fastllm {
                     bool canTryFusedDecodeConvSilu =
                         pastKey.dataDevice == DataDevice::CUDA &&
                         pastKey.dataType == DataType::FLOAT16 &&
-                        qkvConvInput.dataDevice == DataDevice::CUDA &&
-                        qkvConvInput.dataType == DataType::FLOAT16 &&
+                        qkvConvInputForConv->dataDevice == DataDevice::CUDA &&
+                        qkvConvInputForConv->dataType == DataType::FLOAT16 &&
                         requireLocal(weight[conv1dWeightName], conv1dWeightName)->dataType == DataType::FLOAT32;
                     if (!canTryFusedDecodeConvSilu) {
-                        ShiftAppendSingleTokenLinearAttentionCache(pastKey, qkvConvInput);
+                        ShiftAppendSingleTokenLinearAttentionCache(pastKey, *qkvConvInputForConv);
                     }
                     if (canTryFusedDecodeConvSilu) {
                         fusedDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
-                            pastKey, qkvConvInput,
+                            pastKey, *qkvConvInputForConv,
                             *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                             *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                             convOutput);
                     }
                     if (!fusedDecodeConvSilu) {
                         if (canTryFusedDecodeConvSilu) {
-                            ShiftAppendSingleTokenLinearAttentionCache(pastKey, qkvConvInput);
+                            ShiftAppendSingleTokenLinearAttentionCache(pastKey, *qkvConvInputForConv);
                         }
                         Qwen35CudaConv1DPerChannel(cudaRunner, pastKey,
                                                    *requireLocal(weight[conv1dWeightName], conv1dWeightName),
@@ -7126,7 +7236,7 @@ namespace fastllm {
                     }
                     bool directBatchDecodeConvSilu =
                         FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(
-                            linearConvCaches, qkvConvInput,
+                            linearConvCaches, *qkvConvInputForConv,
                             *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                             *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                             convOutput);
@@ -7135,12 +7245,12 @@ namespace fastllm {
                         CatBatchFirstDim(linearConvCaches, batchConvCache);
                         bool fusedBatchDecodeConvSilu =
                             FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
-                                batchConvCache, qkvConvInput,
+                                batchConvCache, *qkvConvInputForConv,
                                 *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                 *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                                 convOutput);
                         if (!fusedBatchDecodeConvSilu) {
-                            ShiftAppendSingleTokenLinearAttentionCache(batchConvCache, qkvConvInput);
+                            ShiftAppendSingleTokenLinearAttentionCache(batchConvCache, *qkvConvInputForConv);
                             Qwen35CudaConv1DPerChannel(cudaRunner, batchConvCache,
                                                        *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                                        *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
@@ -7156,16 +7266,16 @@ namespace fastllm {
                     }
                 } else if (speculativeCaptureFirstTokenLinearState &&
                            batch == 1 && pastKey.dims.size() == 3 &&
-                           pastKey.dims[0] == 1 && pastKey.dims[1] == qkvConvInput.dims[1] &&
-                           pastKey.dims[2] == 4 && qkvConvInput.dims[2] > 0) {
+                           pastKey.dims[0] == 1 && pastKey.dims[1] == qkvConvInputForConv->dims[1] &&
+                           pastKey.dims[2] == 4 && qkvConvInputForConv->dims[2] > 0) {
                     bool fusedMultiTokenConvSilu = false;
                     bool canTryFusedMultiTokenConvSilu =
-                        qkvConvInput.dims[2] >= 1 &&
-                        qkvConvInput.dims[2] <= QWEN35_MTP_FAST_SEQ_MAX &&
+                        qkvConvInputForConv->dims[2] >= 1 &&
+                        qkvConvInputForConv->dims[2] <= QWEN35_MTP_FAST_SEQ_MAX &&
                         pastKey.dataDevice == DataDevice::CUDA &&
                         pastKey.dataType == DataType::FLOAT16 &&
-                        qkvConvInput.dataDevice == DataDevice::CUDA &&
-                        qkvConvInput.dataType == DataType::FLOAT16 &&
+                        qkvConvInputForConv->dataDevice == DataDevice::CUDA &&
+                        qkvConvInputForConv->dataType == DataType::FLOAT16 &&
                         requireLocal(weight[conv1dWeightName], conv1dWeightName)->dataType == DataType::FLOAT32;
                     if (canTryFusedMultiTokenConvSilu) {
                         int convCaptureTokens = std::min(
@@ -7177,7 +7287,7 @@ namespace fastllm {
                         }
                         fusedMultiTokenConvSilu =
                             FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
-                                pastKey, qkvConvInput,
+                                pastKey, *qkvConvInputForConv,
                                 *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                 *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
                                 convOutput, tokenConvCaches, convCaptureTokens);
@@ -7192,7 +7302,7 @@ namespace fastllm {
                         }
                     }
                     if (!fusedMultiTokenConvSilu) {
-                        Qwen3CudaCat(cudaRunner, pastKey, qkvConvInput, -1, convInputWithCache);
+                        Qwen3CudaCat(cudaRunner, pastKey, *qkvConvInputForConv, -1, convInputWithCache);
                         Qwen35CudaConv1DPerChannel(cudaRunner, convInputWithCache,
                                                    *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                                    *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
@@ -7222,26 +7332,27 @@ namespace fastllm {
                         Qwen35CudaSilu(cudaRunner, convOutput, convOutput);
                     }
                 } else {
-                    if (qkvConvInput.dims.back() >= 4) {
-                        Qwen3CudaSplit(cudaRunner, qkvConvInput, -1,
-                                       qkvConvInput.dims.back() - 4,
-                                       qkvConvInput.dims.back(), pastKey);
+                    if (qkvConvInputForConv->dims.back() >= 4) {
+                        Qwen3CudaSplit(cudaRunner, *qkvConvInputForConv, -1,
+                                       qkvConvInputForConv->dims.back() - 4,
+                                       qkvConvInputForConv->dims.back(), pastKey);
                         pastKey.expansionDims = pastKey.dims;
                     } else {
                         Data temp;
-                        Qwen35CudaMul(cudaRunner, qkvConvInput, 1.0f, temp);
-                        Qwen35CudaRepeat(cudaRunner, temp, -1, 4, qkvConvInput);
+                        Qwen35CudaMul(cudaRunner, *qkvConvInputForConv, 1.0f, temp);
+                        Qwen35CudaRepeat(cudaRunner, temp, -1, 4, *qkvConvInputForConv);
                     }
-                    Qwen35CudaConv1DPerChannel(cudaRunner, qkvConvInput,
+                    Qwen35CudaConv1DPerChannel(cudaRunner, *qkvConvInputForConv,
                                                *requireLocal(weight[conv1dWeightName], conv1dWeightName),
                                                *requireLocal(GetThreadTensorParallelBias(conv1dBiasName), conv1dBiasName),
-                                               qkvConvInput.dims[1],
+                                               qkvConvInputForConv->dims[1],
                                                requireLocal(weight[conv1dWeightName], conv1dWeightName)->dims[0],
                                                4, 1, 3, conv);
                     Qwen3CudaSplit(cudaRunner, conv, -1, 0, seqlen, convOutput);
                     Qwen35CudaSilu(cudaRunner, convOutput, convOutput);
                 }
 
+                Data *convOutputForRecurrent = &convOutput;
                 if (batchedSpeculativeSequence) {
                     // Request-local outputs are already [1, seq, channels]
                     // and concatenated in flattened request order.
@@ -7250,16 +7361,18 @@ namespace fastllm {
                 } else if (batch > 1 && all1) {
                     convOutput.Reshape({1, batch, convOutput.dims[1]});
                 } else {
-                    Qwen3CudaPermuteSelf(cudaRunner, convOutput, {0, 2, 1});
+                    Qwen3CudaPermuteTo(cudaRunner, convOutput, {0, 2, 1},
+                                       convOutputPermuted);
+                    convOutputForRecurrent = &convOutputPermuted;
                 }
                 bool convQkvSplitReady = false;
                 auto ensureConvQkvSplit = [&]() {
                     if (convQkvSplitReady) {
                         return;
                     }
-                    Qwen3CudaSplit(cudaRunner, convOutput, -1, 0, localKd, q);
-                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd, localKd * 2, k);
-                    Qwen3CudaSplit(cudaRunner, convOutput, -1, localKd * 2, localKd * 2 + localVd, v);
+                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, -1, 0, localKd, q);
+                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, -1, localKd, localKd * 2, k);
+                    Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent, -1, localKd * 2, localKd * 2 + localVd, v);
                     q.Reshape({q.dims[0], q.dims[1], localKeyHeads, head_k_dim});
                     k.Reshape({k.dims[0], k.dims[1], localKeyHeads, head_k_dim});
                     v.Reshape({v.dims[0], v.dims[1], localValueHeads, head_v_dim});
@@ -7269,8 +7382,8 @@ namespace fastllm {
                 bool fusedBatchSpeculativeSequence = false;
                 if (batchedSpeculativeSequence) {
                     int requestSeqLen = seqLens[0];
-                    convOutput.Reshape(
-                        {batch, requestSeqLen, convOutput.dims.back()});
+                    convOutputForRecurrent->Reshape(
+                        {batch, requestSeqLen, convOutputForRecurrent->dims.back()});
                     baMerged.Reshape(
                         {batch, requestSeqLen, baMerged.dims.back()});
                     std::vector<Data*> requestPastValues(batch);
@@ -7295,7 +7408,7 @@ namespace fastllm {
                     }
                     bool fused =
                         FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnapshots(
-                            convOutput, baMerged,
+                            *convOutputForRecurrent, baMerged,
                             *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                             *requireLocal(weight[aLogName], aLogName),
                             *requireLocal(weight[dtBiasName], dtBiasName),
@@ -7335,8 +7448,8 @@ namespace fastllm {
                     Data *dtBias = requireLocal(weight[dtBiasName], dtBiasName);
                     fusedRecurrentStates.resize(batch);
                     bool canUseFusedBatchRecurrent =
-                        convOutput.dataDevice == DataDevice::CUDA &&
-                        convOutput.dataType == DataType::FLOAT16 &&
+                        convOutputForRecurrent->dataDevice == DataDevice::CUDA &&
+                        convOutputForRecurrent->dataType == DataType::FLOAT16 &&
                         baMerged.dataDevice == DataDevice::CUDA &&
                         baMerged.dataType == DataType::FLOAT16 &&
                         baMerged.dims.size() > 0 &&
@@ -7378,13 +7491,13 @@ namespace fastllm {
                         float recurrentQScale = 1.0f / std::sqrt((float)head_k_dim);
                         if (recurrentStatesTransposed) {
                             FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposed(
-                                convOutput, baMerged, *linearNormWeight, *aLog, *dtBias,
+                                *convOutputForRecurrent, baMerged, *linearNormWeight, *aLog, *dtBias,
                                 fusedRecurrentStates, coreAttnOut,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
                                 rms_norm_eps, recurrentQScale);
                         } else {
                             FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
-                                convOutput, baMerged, *linearNormWeight, *aLog, *dtBias,
+                                *convOutputForRecurrent, baMerged, *linearNormWeight, *aLog, *dtBias,
                                 fusedRecurrentStates, coreAttnOut,
                                 localKeyHeads, localValueHeads, head_k_dim, head_v_dim,
                                 rms_norm_eps, recurrentQScale);
@@ -7557,8 +7670,10 @@ namespace fastllm {
                     bool needLinearStateSnapshots =
                         speculativeLinearStateCaptureSlots > 0;
                     if (keepCombinedBaForSmallDecode && !baMerged.dims.empty() &&
-                        convOutput.dims.size() >= 3 && convOutput.dims[0] == 1 &&
-                        convOutput.dims[1] == seqlen && convOutput.dims.back() == localQkvDim &&
+                        convOutputForRecurrent->dims.size() >= 3 &&
+                        convOutputForRecurrent->dims[0] == 1 &&
+                        convOutputForRecurrent->dims[1] == seqlen &&
+                        convOutputForRecurrent->dims.back() == localQkvDim &&
                         baMerged.dims.size() >= 3 && baMerged.dims[0] == 1 &&
                         baMerged.dims[1] == seqlen &&
                         baMerged.dims.back() == localValueHeads * 2 &&
@@ -7567,7 +7682,7 @@ namespace fastllm {
                             if (!needLinearStateSnapshots) {
                                 fusedSmallDecode =
                                     FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
-                                        convOutput, baMerged,
+                                        *convOutputForRecurrent, baMerged,
                                         *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                                         *requireLocal(weight[aLogName], aLogName),
                                         *requireLocal(weight[dtBiasName], dtBiasName),
@@ -7586,7 +7701,7 @@ namespace fastllm {
                                 }
                                 fusedSmallDecode =
                                     FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
-                                        convOutput, baMerged,
+                                        *convOutputForRecurrent, baMerged,
                                         *requireLocal(inv_scale_data, "linear_attn.inv_scale"),
                                         *requireLocal(weight[aLogName], aLogName),
                                         *requireLocal(weight[dtBiasName], dtBiasName),
@@ -7610,7 +7725,8 @@ namespace fastllm {
                             fusedSmallDecode = true;
                             for (int row = 0; row < seqlen; row++) {
                                 Data convRow, baRow, rowOut;
-                                Qwen3CudaSplit(cudaRunner, convOutput, 1, row, row + 1, convRow);
+                                Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent,
+                                               1, row, row + 1, convRow);
                                 Qwen3CudaSplit(cudaRunner, baMerged, 1, row, row + 1, baRow);
                                 bool rowOk =
                                     FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
@@ -7657,12 +7773,15 @@ namespace fastllm {
                     bool fusedTwoTokenDecode = false;
                     bool fusedConvBaTwoTokenDecode = false;
                     if (keepCombinedBaForTwoToken && !baMerged.dims.empty() &&
-                        convOutput.dims.size() >= 3 && convOutput.dims[0] == 1 &&
-                        convOutput.dims[1] == 2 && convOutput.dims.back() == localQkvDim &&
+                        convOutputForRecurrent->dims.size() >= 3 &&
+                        convOutputForRecurrent->dims[0] == 1 &&
+                        convOutputForRecurrent->dims[1] == 2 &&
+                        convOutputForRecurrent->dims.back() == localQkvDim &&
                         baMerged.dims.size() >= 3 && baMerged.dims[0] == 1 &&
                         baMerged.dims[1] == 2 && baMerged.dims.back() == localValueHeads * 2 &&
                         Qwen35EnsureCudaLinearAttnStateTransposed(pastValue)) {
-                        Qwen3CudaSplit(cudaRunner, convOutput, 1, 0, 1, convRow0);
+                        Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent,
+                                       1, 0, 1, convRow0);
                         Qwen3CudaSplit(cudaRunner, baMerged, 1, 0, 1, baRow0);
                         bool fusedFirstToken =
                             FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
@@ -7681,7 +7800,8 @@ namespace fastllm {
                                 markFirstTokenLinearCaptured(2);
                             }
                             SwapSingleTokenSeqHeadByReshape(coreAttnOut0);
-                            Qwen3CudaSplit(cudaRunner, convOutput, 1, 1, 2, convRow1);
+                            Qwen3CudaSplit(cudaRunner, *convOutputForRecurrent,
+                                           1, 1, 2, convRow1);
                             Qwen3CudaSplit(cudaRunner, baMerged, 1, 1, 2, baRow1);
                             bool fusedSecondToken =
                                 FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
@@ -7800,7 +7920,7 @@ namespace fastllm {
                     *requireLocal(GetThreadTensorParallelBias(outProjWeightName + ".tp_bias"),
                                   outProjWeightName + ".tp_bias"),
                     attenLastOutput, hiddenStates,
-                    tensorParallel, firstTensorParallelRank, gpuId);
+                    tensorParallel, firstTensorParallelRank, gpuId, true);
             }
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
@@ -7824,7 +7944,7 @@ namespace fastllm {
                         cudaRunner, swigluResult,
                         downWeight, downBias,
                         mlpPart, hiddenStates,
-                        tensorParallel, firstTensorParallelRank, gpuId);
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
                 }
                 continue;
             }
@@ -7871,15 +7991,20 @@ namespace fastllm {
             Qwen3CudaLinear(cudaRunner, attenInput,
                             *requireLocal(weight[gateWeightName], gateWeightName),
                             *GetEmptyData(), routerLogits, true);
-            Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
-            Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
             Data *localGateBias = nullptr;
             if (weight.weight.find(gateBiasName) != weight.weight.end()) {
                 localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
             }
-            Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
-                                  this->num_experts_per_tok, this->norm_topk_prob,
-                                  this->routed_scaling_factor, localGateBias);
+            if (!Qwen3CudaTryFusedSoftmaxSelectExpert(
+                    cudaRunner, routerLogits, expertIndex, expertScore,
+                    this->num_experts_per_tok, this->norm_topk_prob,
+                    this->routed_scaling_factor, localGateBias)) {
+                Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
+                Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
+                Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
+                                      this->num_experts_per_tok, this->norm_topk_prob,
+                                      this->routed_scaling_factor, localGateBias);
+            }
 
             bool layerMappedNonCudaMoe = Qwen35LayerUsesMappedNonCudaMoe(this, i);
             if (layerMappedNonCudaMoe) {
@@ -8053,7 +8178,8 @@ namespace fastllm {
         };
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
+        if (!CanUseGPUForward() ||
+            !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios)) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
             }
@@ -8597,6 +8723,7 @@ namespace fastllm {
                     threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
                     AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, threadTpLmHeadScheme, 0, true),
                                     "Qwen3.5 ForwardGPU failed to split lm_head.weight.\n");
+                    PrepareMtpDraftLmHeadWeights(devices);
 
                     threadTpPreparedDevices = devices;
                     threadTpPreparedRatios = ratios;
@@ -9969,6 +10096,8 @@ namespace fastllm {
             swap(dst.ggmlTensor, src.ggmlTensor);
             swap(dst.ggmlType, src.ggmlType);
             swap(dst.IsRepacked, src.IsRepacked);
+            swap(dst.disableGGUFRepack, src.disableGGUFRepack);
+            swap(dst.forceGGUFFp32Dequant, src.forceGGUFFp32Dequant);
             swap(dst.isPinned, src.isPinned);
             swap(dst.cpuIntDatas, src.cpuIntDatas);
         };
@@ -15747,6 +15876,78 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3_5Model::PrepareMtpDraftLmHeadWeights(
+            const std::vector<int> &devices) {
+#ifdef USE_CUDA
+        int previousDevice = FastllmCudaGetDevice();
+        auto restoreDevice = [&]() {
+            if (previousDevice >= 0) {
+                FastllmCudaSetDevice(previousDevice);
+            }
+        };
+        auto clearPrepared = [&]() {
+            for (auto &it : mtpDraftLmHeadWeights) {
+                FastllmCudaSetDevice(it.first);
+                delete it.second;
+            }
+            mtpDraftLmHeadWeights.clear();
+        };
+        clearPrepared();
+        if (devices.size() <= 1 || Qwen35MtpDisabledByEnv() ||
+            !Qwen35MtpFp8DraftHeadEnabled()) {
+            restoreDevice();
+            return;
+        }
+        auto lmHeadIt = weight.weight.find("lm_head.weight");
+        if (lmHeadIt == weight.weight.end() ||
+            !lmHeadIt->second.multiDeviceData) {
+            restoreDevice();
+            return;
+        }
+
+        size_t originalBytes = 0, quantizedBytes = 0;
+        for (int device : devices) {
+            auto localIt = lmHeadIt->second.multiDeviceDatas.find(device);
+            if (localIt == lmHeadIt->second.multiDeviceDatas.end() ||
+                localIt->second == nullptr ||
+                localIt->second->dataDevice != DataDevice::CUDA ||
+                localIt->second->cudaData == nullptr ||
+                localIt->second->dims.size() != 2 ||
+                localIt->second->dims[1] % 128 != 0 ||
+                (localIt->second->dataType != DataType::FLOAT16 &&
+                 localIt->second->dataType != DataType::BFLOAT16)) {
+                clearPrepared();
+                restoreDevice();
+                return;
+            }
+            Data *draftWeight = new Data(DataType::FP8_E4M3_BLOCK_128);
+            if (!FastllmCudaQuantizeLinearWeightFP8E4M3Block128(
+                    *localIt->second, *draftWeight)) {
+                delete draftWeight;
+                clearPrepared();
+                restoreDevice();
+                return;
+            }
+            draftWeight->name = localIt->second->name + ".mtp_draft_fp8";
+            draftWeight->weightType = WeightType::LINEAR;
+            draftWeight->isModelWeight = true;
+            draftWeight->tpLinearType = localIt->second->tpLinearType;
+            draftWeight->tpPackType = localIt->second->tpPackType;
+            originalBytes += localIt->second->GetBytes();
+            quantizedBytes += draftWeight->GetBytes();
+            mtpDraftLmHeadWeights[device] = draftWeight;
+        }
+        printf("[Qwen3.5 MTP] FP8 draft lm_head prepared on %zu GPUs "
+               "(source retained: %.2f GB, extra FP8 copy: %.2f GB).\n",
+               mtpDraftLmHeadWeights.size(), originalBytes / 1.0e9,
+               quantizedBytes / 1.0e9);
+        fflush(stdout);
+        restoreDevice();
+#else
+        (void)devices;
+#endif
+    }
+
     Data Qwen3_5Model::BuildMtpPositionIds(const Data &positionIds, int row, int delta) {
         return BuildMtpPositionIdsSlice(positionIds, row, row + 1, delta);
     }
@@ -15812,6 +16013,25 @@ namespace fastllm {
                         (int)positionIds.size() == batch &&
                         (int)sampleRows.size() == batch,
                         "Qwen3.5 batched MTP draft input size mismatch.\n");
+        if (batch == 1) {
+            AssertInFastLLM(caches[0] != nullptr &&
+                            targetHiddenStates[0] != nullptr &&
+                            positionIds[0] != nullptr &&
+                            !inputTokens[0].empty(),
+                            "Qwen3.5 single-request MTP draft got null input.\n");
+            Data singleHidden;
+            int draft = RunMtpGreedyDraft(
+                device, draftDevices, *caches[0], *targetHiddenStates[0],
+                inputTokens[0], *positionIds[0], sampleRows[0],
+                sampledHiddenStates != nullptr ? &singleHidden : nullptr,
+                false);
+            if (sampledHiddenStates != nullptr) {
+                sampledHiddenStates->clear();
+                sampledHiddenStates->resize(1);
+                (*sampledHiddenStates)[0].CopyFrom(singleHidden);
+            }
+            return std::vector<int>{draft};
+        }
         PrepareMtpWeightsForDevice(device, !tensorParallelDraft);
         AssertInFastLLM(HasMtpWeights(), "Qwen3.5 MTP weights are missing.\n");
 
@@ -16141,9 +16361,15 @@ namespace fastllm {
                             biasIt != lmHeadBias.multiDeviceDatas.end() &&
                             biasIt->second != nullptr,
                             "Qwen3.5 batched MTP TP draft missing local lm_head data.\n");
+            Data *draftLmHead = weightIt->second;
+            auto draftWeightIt = mtpDraftLmHeadWeights.find(localDevice);
+            if (draftWeightIt != mtpDraftLmHeadWeights.end() &&
+                draftWeightIt->second != nullptr) {
+                draftLmHead = draftWeightIt->second;
+            }
             FastllmCudaSetDevice(localDevice);
             Qwen3CudaDirectRunner cudaRunner(localDevice);
-            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *weightIt->second,
+            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *draftLmHead,
                             *biasIt->second, localLogits[r]);
             Qwen3CudaToDataType(cudaRunner, localLogits[r], DataType::FLOAT32);
             Data localBestId(DataType::INT32), localBestScore(DataType::FLOAT32);
@@ -16442,7 +16668,7 @@ namespace fastllm {
         std::vector<float> localBestScores(draftDevices.size(), -1.0e30f);
         std::vector<int> localBestReady(draftDevices.size(), 0);
         std::vector<std::exception_ptr> errors(draftDevices.size());
-        threadTpWorkerGroup.Run(draftDevices, [&](int r) {
+        threadTpWorkerGroup.RunWithCaller(draftDevices, [&](int r) {
             int localDevice = draftDevices[r];
             auto hiddenIt = replicatedHidden.multiDeviceDatas.find(localDevice);
             auto weightIt = lmHead.multiDeviceDatas.find(localDevice);
@@ -16454,9 +16680,15 @@ namespace fastllm {
                             biasIt != lmHeadBias.multiDeviceDatas.end() &&
                             biasIt->second != nullptr,
                             "Qwen3.5 MTP TP draft missing local lm_head data.\n");
+            Data *draftLmHead = weightIt->second;
+            auto draftWeightIt = mtpDraftLmHeadWeights.find(localDevice);
+            if (draftWeightIt != mtpDraftLmHeadWeights.end() &&
+                draftWeightIt->second != nullptr) {
+                draftLmHead = draftWeightIt->second;
+            }
             FastllmCudaSetDevice(localDevice);
             Qwen3CudaDirectRunner cudaRunner(localDevice);
-            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *weightIt->second,
+            Qwen3CudaLinear(cudaRunner, *hiddenIt->second, *draftLmHead,
                             *biasIt->second, localLogits[r]);
             Qwen3CudaToDataType(cudaRunner, localLogits[r], DataType::FLOAT32);
             Data localBestId(DataType::INT32), localBestScore(DataType::FLOAT32);

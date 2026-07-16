@@ -177,6 +177,7 @@ extern "C" {
         fastllm::GenerationConfig config;
         config.output_token_limit = max_length;
         config.output_token_least = min_length;
+        config.do_sample = do_sample;
         config.temperature = temperature;
         config.repeat_penalty = repeat_penalty;
         if (do_sample) {
@@ -346,7 +347,6 @@ extern "C" {
 
     DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
         models.locker.lock();
-        fastllm::SetCudaSharedExpert(true);
         int id = models.models.size();
         models.models[id] = fastllm::CreateLLMModelFromGGUFFile(path, oriPath);
         models.locker.unlock();
@@ -488,7 +488,9 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->use_new_engine
+            if (model->model_type == "glm_moe_dsa") {
+                model->SetDataType(fastllm::DataType::FLOAT32);
+            } else if (model->use_new_engine
                 || model->model_struct == "chatglm" 
                 || model->model_struct == "llama"
                 || model->model_struct == "qwen3_moe"
@@ -654,6 +656,25 @@ extern "C" {
     DLL_EXPORT bool can_fetch_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         return model->CanFetchResponse(handleId);
+    }
+
+    DLL_EXPORT bool get_response_statistics_llm_model(int modelId, int handleId,
+                                                       int *cachedInputTokens,
+                                                       int *missedInputTokens,
+                                                       int *outputTokens) {
+        auto model = models.GetModel(modelId);
+        int cached = 0, missed = 0, output = 0;
+        bool ret = model->GetResponseStatistics(handleId, cached, missed, output);
+        if (cachedInputTokens != nullptr) {
+            *cachedInputTokens = cached;
+        }
+        if (missedInputTokens != nullptr) {
+            *missedInputTokens = missed;
+        }
+        if (outputTokens != nullptr) {
+            *outputTokens = output;
+        }
+        return ret;
     }
 
     // 终止handleId的请求

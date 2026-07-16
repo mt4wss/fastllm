@@ -94,6 +94,8 @@ namespace fastllm {
 
         virtual void WarmUp(); // 预热
 
+        virtual bool CanUseGPUForward() const override;
+
         virtual void OnAutoWarmupFinished() override;
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
@@ -289,6 +291,7 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
@@ -336,6 +339,7 @@ namespace fastllm {
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
         int RunMtpGreedyDraft(int device, const std::vector<int> &devices,

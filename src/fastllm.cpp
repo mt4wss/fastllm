@@ -35,6 +35,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "fastllm-multicuda.cuh"
 #endif
 
 #ifdef PY_API
@@ -108,6 +109,24 @@ namespace fastllm {
                 return FastllmCudaMallocModelWeight(bytes);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
+        }
+
+        static void CheckCudaMallocForData(const Data &data, void *ptr, uint64_t bytes, const char *context) {
+            if (ptr != nullptr) {
+                return;
+            }
+            std::string msg = "Error: cuda malloc failed in " + std::string(context) +
+                              ". requestBytes = " + std::to_string(bytes) +
+                              ", dataType = " + GetDataTypeName(data.dataType) + ", dims = [";
+            for (int i = 0; i < (int)data.dims.size(); i++) {
+                msg += (i == 0 ? "" : ", ") + std::to_string(data.dims[i]);
+            }
+            msg += "]";
+            if (!data.name.empty()) {
+                msg += ", name = " + data.name;
+            }
+            msg += ".\n";
+            ErrorInFastLLM(msg);
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
@@ -900,6 +919,8 @@ namespace fastllm {
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
         this->ggmlType = ori.ggmlType;
         this->IsRepacked = ori.IsRepacked;
+        this->disableGGUFRepack = ori.disableGGUFRepack;
+        this->forceGGUFFp32Dequant = ori.forceGGUFFp32Dequant;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
         if (needRebuildGGUFTensor ||
@@ -1468,7 +1489,8 @@ namespace fastllm {
                 this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3) {
+        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -1501,6 +1523,7 @@ namespace fastllm {
         }
 
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1723,6 +1746,7 @@ namespace fastllm {
             return GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         }
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1739,6 +1763,7 @@ namespace fastllm {
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
@@ -1758,22 +1783,9 @@ namespace fastllm {
             }
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            if (this->directMemory) {
-                this->cudaData = FastllmCudaDirectMalloc(this->expansionBytes);
-            } else {
-                this->cudaData = FastllmCudaMalloc(this->expansionBytes);
-            }
+            this->cudaData = CudaMallocForData(*this, this->expansionBytes);
             this->cudaDataBorrowed = false;
-            if (this->cudaData == nullptr) {
-                std::string msg = "Error: cuda malloc failed in Data::MallocSpace. requestBytes = " +
-                                  std::to_string(this->expansionBytes) +
-                                  ", dataType = " + GetDataTypeName(this->dataType) + ", dims = [";
-                for (int i = 0; i < (int)this->dims.size(); i++) {
-                    msg += (i == 0 ? "" : ", ") + std::to_string(this->dims[i]);
-                }
-                msg += "].\n";
-                ErrorInFastLLM(msg);
-            }
+            CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
@@ -1942,6 +1954,21 @@ namespace fastllm {
     }
 
     Data::~Data() {
+#ifdef USE_CUDA
+        // Hash-route tables keep per-device CUDA replicas while the owning
+        // Data is alive. Retire them before either this object or its CPU
+        // allocation can be reused by a subsequently loaded model.
+        FastllmCudaReleaseDeepSeekV4RouteTableCache(this);
+
+        // Retire routed-expert caches owned by this Data before its address can
+        // be reused by a subsequently loaded model. These calls are no-ops for
+        // weights that were never used as cache keys.
+        if (this->dataType == DataType::NVFP4 && this->isModelWeight &&
+            this->directMemory) {
+            MultiCudaReleaseMoeWeightCaches(this);
+            FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+        }
+#endif
         if (isFake) {
             return;
         }
@@ -2248,6 +2275,19 @@ namespace fastllm {
 
     void Data::ToDevice(void *device, bool copyData) {
         BaseDevice *dev = (BaseDevice*)device;
+        if (dev->deviceType == "multicuda" && this->multiDeviceData) {
+            bool alreadyDistributed = !this->multiDeviceDatas.empty();
+            for (int deviceId : dev->deviceIds) {
+                auto it = this->multiDeviceDatas.find(deviceId);
+                if (it == this->multiDeviceDatas.end() || it->second == nullptr) {
+                    alreadyDistributed = false;
+                    break;
+                }
+            }
+            if (alreadyDistributed) {
+                return;
+            }
+        }
         if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
             this->ToDevice(DataDevice::CUDA, dev->deviceIds, copyData);
         } else {
@@ -2325,6 +2365,7 @@ namespace fastllm {
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);
                             this->cudaDataBorrowed = false;
+                            CheckCudaMallocForData(*this, this->cudaData, expansionBytes, "Data::ToDevice CPU->CUDA");
                         }
 
                         if (cpuData != nullptr) {
@@ -2363,6 +2404,7 @@ namespace fastllm {
                         if (this->cudaData == nullptr) {
                             this->cudaData = CudaMallocForData(*this, expansionBytes);
                             this->cudaDataBorrowed = false;
+                            CheckCudaMallocForData(*this, this->cudaData, expansionBytes, "Data::ToDevice CPU->CUDA");
                         }
                     }
                 }
@@ -2392,6 +2434,7 @@ namespace fastllm {
                     if (sourceDevice != destDevice) {
                                         FastllmCudaSetDevice(destDevice);
                                         void *newCudaData = CudaMallocForData(*this, expansionBytes);
+                                        CheckCudaMallocForData(*this, newCudaData, expansionBytes, "Data::ToDevice CUDA->CUDA");
                                         if (copyData) {
                                             FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
                                         }
@@ -2508,7 +2551,7 @@ namespace fastllm {
     }
 
     void Data::Repack() {
-        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT) {
+        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT || this->disableGGUFRepack) {
             return;
         }
         if (GetEnableAMX() && cpuInstructInfo.hasAMX) {
@@ -3661,7 +3704,8 @@ namespace fastllm {
 
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float sharedScale, Data &output, int layer, MoeGateType gateType) {
+                float sharedScale, Data &output, int layer, MoeGateType gateType,
+                bool expertParallel) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
@@ -3669,7 +3713,9 @@ namespace fastllm {
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
         }, {{"sharedScale", sharedScale}}, 
-                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}, {"gateType", (int)gateType}});
+                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
+                                         {"layer", layer}, {"gateType", (int)gateType},
+                                         {"expertParallel", expertParallel ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,

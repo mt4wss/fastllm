@@ -47,6 +47,7 @@ namespace fastllm {
 
         int preTokens = 0;
         int curTokens = 0;
+        int inputTokens = 0;
         std::map <std::string, int> intParams;
 
         int cacheLen = 0;
@@ -310,6 +311,9 @@ namespace fastllm {
 
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
+        virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
+                                           int &missedInputTokens, int &outputTokens);
+
         virtual void AbortResponse(int handleId); // 中断handleId的请求
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型 
@@ -325,6 +329,10 @@ namespace fastllm {
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
+
+        // 当前运行配置是否可以使用 ForwardGPU。
+        // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
+        virtual bool CanUseGPUForward() const;
 
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 

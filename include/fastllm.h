@@ -137,6 +137,7 @@ namespace fastllm {
         int input_token_length = 0;
         int last_n = 64; // 末尾last_n个token计入重复惩罚
         float repeat_penalty = 1.0f; // 重复惩罚系数，1.0代表不惩罚
+        bool do_sample = false; // false表示贪心解码，保留前端的采样语义
         int top_k = 1; // top_k采样
         float top_p = 1.0; // top_p采样
         float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
@@ -474,6 +475,8 @@ namespace fastllm {
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
         bool IsRepacked = false;
+        bool disableGGUFRepack = false;
+        bool forceGGUFFp32Dequant = false;
 
         std::vector <uint8_t*> numasData; // numa数据
         bool isPinned = false; // 是否使用pinned memory (page-locked)
@@ -839,7 +842,8 @@ namespace fastllm {
     };
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu);
+                float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
+                bool expertParallel = false);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,

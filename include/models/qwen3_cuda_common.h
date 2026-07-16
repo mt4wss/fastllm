@@ -409,6 +409,28 @@ namespace fastllm {
                    FloatDict(), IntDict());
     }
 
+    inline void Qwen3CudaPermuteTo(Qwen3CudaDirectRunner &runner,
+                                   const Data &input,
+                                   const std::vector<int> &axis,
+                                   Data &output) {
+        AssertInFastLLM(axis.size() == input.dims.size(),
+                        "Qwen3CudaPermuteTo got incompatible axis.\n");
+        std::vector<int> outputDims;
+        outputDims.reserve(axis.size());
+        for (int dim : axis) {
+            AssertInFastLLM(dim >= 0 && dim < (int)input.dims.size(),
+                            "Qwen3CudaPermuteTo got invalid axis.\n");
+            outputDims.push_back(input.dims[dim]);
+        }
+        Qwen3CudaPrepareLocalOutput(output, runner.DeviceId());
+        output.dataType = input.dataType;
+        output.UpdateUnitSize();
+        output.Resize(outputDims);
+        output.Allocate(false);
+        AssertInFastLLM(FastllmCudaPermuteTo(input, output, axis),
+                        "Qwen3CudaPermuteTo CUDA kernel failed.\n");
+    }
+
     inline void Qwen3CudaRopeEncoding(Qwen3CudaDirectRunner &runner,
                                       Data &input, const Data &positionIds,
                                       int rotaryDim, float ropeTheta, float ropeScale) {
@@ -425,11 +447,29 @@ namespace fastllm {
                    FloatDict{{"alpha", alpha}}, IntDict());
     }
 
+    inline bool Qwen3CudaTryTP2P2PAllReduceAddResidual(
+            Data &partial, Data &hiddenStates, int gpuId) {
+        AssertInFastLLM(partial.dataType == hiddenStates.dataType &&
+                        partial.Count(0) == hiddenStates.Count(0),
+                        "Qwen3CudaTryTP2P2PAllReduceAddResidual got "
+                        "incompatible tensors.\n");
+        return FastllmTryTP2P2PAllReduceAdd(
+            partial.cudaData, hiddenStates.cudaData,
+            hiddenStates.Count(0), (int)hiddenStates.dataType, gpuId);
+    }
+
     inline void Qwen3CudaSoftmax(Qwen3CudaDirectRunner &runner,
                                  const Data &input, Data &output, int axis) {
         runner.Run("SoftMax",
                    DataDict{{"input", (Data*)&input}, {"output", &output}},
                    FloatDict(), IntDict{{"axis", axis}}, {"output"});
+    }
+
+    inline void Qwen3CudaSigmoid(Qwen3CudaDirectRunner &runner,
+                                 const Data &input, Data &output) {
+        runner.Run("Sigmoid",
+                   DataDict{{"input", (Data*)&input}, {"output", &output}},
+                   FloatDict(), IntDict(), {"output"});
     }
 
     inline void Qwen3CudaSelectExpert(Qwen3CudaDirectRunner &runner,
@@ -444,6 +484,31 @@ namespace fastllm {
                    FloatDict{{"routeScale", routeScale}},
                    IntDict{{"topk", topk}, {"needNorm", needNorm ? 1 : 0}},
                    {"index", "score"});
+    }
+
+    inline bool Qwen3CudaTryFusedSoftmaxSelectExpert(
+            Qwen3CudaDirectRunner &runner, const Data &logits,
+            Data &index, Data &score, int topk, bool needNorm,
+            float routeScale, const Data *gateBias) {
+        if (logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 || topk != 8 ||
+            (logits.dataType != DataType::FLOAT16 &&
+             logits.dataType != DataType::BFLOAT16 &&
+             logits.dataType != DataType::FLOAT32)) {
+            return false;
+        }
+        if (gateBias != nullptr && !gateBias->dims.empty() &&
+            (gateBias->dataType != DataType::FLOAT32 || gateBias->Count(0) != 256)) {
+            return false;
+        }
+        DataDict datas = {{"logits", (Data*)&logits}, {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        runner.Run("FusedSoftmaxSelectExpert", datas,
+                   FloatDict{{"routeScale", routeScale}},
+                   IntDict{{"topk", topk}, {"needNorm", needNorm ? 1 : 0}},
+                   {"index", "score"});
+        return true;
     }
 
     inline void Qwen3CudaToDataType(Qwen3CudaDirectRunner &runner, Data &input, DataType dataType) {
@@ -466,14 +531,26 @@ namespace fastllm {
             Data &input, Data &weight, Data &bias,
             Data &middle, Data &hiddenStates,
             bool tensorParallel, bool firstTensorParallelRank,
-            int gpuId) {
+            int gpuId, bool enableTP2P2PAllReduce = false) {
         DataType residualType = hiddenStates.dataType;
         bool canAddDirectly = input.dataType == residualType;
+
+        if (tensorParallel && enableTP2P2PAllReduce &&
+            FastllmCanUseTP2P2PAllReduceAdd(
+                hiddenStates.Count(0), (int)residualType, gpuId)) {
+            Qwen3CudaLinear(runner, input, weight, bias, middle);
+            Qwen3CudaToDataType(runner, middle, residualType);
+            if (Qwen3CudaTryTP2P2PAllReduceAddResidual(
+                    middle, hiddenStates, gpuId)) {
+                return;
+            }
+        }
 
         if (tensorParallel) {
             if (firstTensorParallelRank) {
                 if (canAddDirectly) {
-                    Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias, &middle, &hiddenStates);
+                    Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias,
+                                            &middle, &hiddenStates);
                 } else {
                     Qwen3CudaLinear(runner, input, weight, bias, middle);
                     Qwen3CudaToDataType(runner, middle, residualType);
@@ -484,7 +561,8 @@ namespace fastllm {
                 Qwen3CudaToDataType(runner, hiddenStates, residualType);
             }
             FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
-                                 hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                                 hiddenStates.Count(0), hiddenStates.dataType,
+                                 gpuId);
             return;
         }
 

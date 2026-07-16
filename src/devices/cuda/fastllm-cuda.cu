@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,10 @@
 #include <cuda_fp8.h>
 #include "sampling.cuh"
 
+extern "C" bool FastllmNcclGraphPeerCopy(int dstDevice, void *dst,
+                                          int srcDevice, const void *src,
+                                          size_t bytes);
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <execinfo.h>
 #endif
@@ -33,6 +38,10 @@
 // 线程级 CUDA 错误标志：showError 报错时置位。CUDA graph 捕获路径在捕获体前清零、
 // 捕获体后检查，任何算子报错都能被感知并中止捕获，避免带着坏状态继续运行。
 static thread_local bool fastllmCudaThreadErrorFlag = false;
+// Whole-step capture spans the scheduler thread plus one persistent worker per
+// GPU.  A thread-local flag alone loses failures raised by worker-side cuBLAS,
+// NCCL, or custom kernels, so retain a capture-epoch aggregate as well.
+static std::atomic<bool> fastllmCudaGraphErrorFlag(false);
 
 void FastllmCudaClearThreadError() {
     fastllmCudaThreadErrorFlag = false;
@@ -40,16 +49,26 @@ void FastllmCudaClearThreadError() {
 
 void FastllmCudaSetThreadError() {
     fastllmCudaThreadErrorFlag = true;
+    fastllmCudaGraphErrorFlag.store(true, std::memory_order_release);
 }
 
 bool FastllmCudaGetThreadError() {
     return fastllmCudaThreadErrorFlag;
 }
 
+void FastllmCudaClearGraphError() {
+    fastllmCudaGraphErrorFlag.store(false, std::memory_order_release);
+}
+
+bool FastllmCudaGetGraphError() {
+    return fastllmCudaGraphErrorFlag.load(std::memory_order_acquire);
+}
+
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
     if (cudaSuccess != result) {
         fastllmCudaThreadErrorFlag = true;
+        fastllmCudaGraphErrorFlag.store(true, std::memory_order_release);
         printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
             message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
         fflush(stdout);
@@ -58,6 +77,130 @@ void showError(cudaError_t result, char const* const message, const char* const 
 
 static std::atomic<bool> fastllmCudaMallocDisabled(false);
 static std::mutex fastllmCudaMallocCheckMutex;
+
+// A graph keeps raw kernel arguments after host-side Data temporaries have been
+// destroyed. Track pool pointers returned by streams participating in the
+// whole-step capture. External allocator threads must not reuse those pointers
+// while capture finalization is deciding which idle blocks the graph owns.
+enum FastllmCudaGraphPoolPhase {
+    FASTLLM_CUDA_GRAPH_POOL_IDLE = 0,
+    FASTLLM_CUDA_GRAPH_POOL_CAPTURING = 1,
+    FASTLLM_CUDA_GRAPH_POOL_FINALIZING = 2,
+};
+
+struct FastllmCudaGraphCaptureIdentity {
+    int device = -1;
+    unsigned long long id = 0;
+    bool valid = false;
+};
+
+static std::mutex fastllmCudaGraphPoolMutex;
+static std::atomic<int> fastllmCudaGraphPoolPhase(
+    FASTLLM_CUDA_GRAPH_POOL_IDLE);
+static std::set<void*> fastllmCudaGraphPoolTouchedDuringCapture;
+static std::set<std::pair<int, unsigned long long>>
+    fastllmCudaGraphPoolCaptureIds;
+
+static FastllmCudaGraphCaptureIdentity
+FastllmCudaGraphCurrentCaptureIdentity() {
+    FastllmCudaGraphCaptureIdentity identity;
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) !=
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+        return identity;
+    }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    unsigned long long captureId = 0;
+    cudaError_t state = cudaStreamGetCaptureInfo(
+        cudaStreamPerThread, &status, &captureId);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        FastllmCudaSetThreadError();
+        return identity;
+    }
+    if (status == cudaStreamCaptureStatusNone ||
+        status == cudaStreamCaptureStatusInvalidated ||
+        cudaGetDevice(&identity.device) != cudaSuccess) {
+        return identity;
+    }
+    identity.id = captureId;
+    identity.valid = true;
+    return identity;
+}
+
+static void FastllmCudaGraphRegisterCurrentCapture() {
+    FastllmCudaGraphCaptureIdentity identity =
+        FastllmCudaGraphCurrentCaptureIdentity();
+    if (!identity.valid) {
+        FastllmCudaSetThreadError();
+        return;
+    }
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+        fastllmCudaGraphPoolCaptureIds.insert(
+            std::make_pair(identity.device, identity.id));
+    }
+}
+
+static bool FastllmCudaGraphCaptureIdentityRegisteredLocked(
+        const FastllmCudaGraphCaptureIdentity &identity) {
+    return identity.valid &&
+        fastllmCudaGraphPoolCaptureIds.find(
+            std::make_pair(identity.device, identity.id)) !=
+        fastllmCudaGraphPoolCaptureIds.end();
+}
+
+// Called while the owning device-pool lock is held. All pool transitions use
+// the same pool -> graph lock order, so finalization cannot race an allocation
+// or free of the pointer being classified.
+static bool FastllmCudaGraphPoolPointerReusableLocked(
+        void *ptr, const FastllmCudaGraphCaptureIdentity &identity) {
+    int phase = fastllmCudaGraphPoolPhase.load(std::memory_order_acquire);
+    if (phase == FASTLLM_CUDA_GRAPH_POOL_IDLE) {
+        return true;
+    }
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    if (fastllmCudaGraphPoolTouchedDuringCapture.find(ptr) ==
+            fastllmCudaGraphPoolTouchedDuringCapture.end()) {
+        return true;
+    }
+    return fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) ==
+               FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
+           FastllmCudaGraphCaptureIdentityRegisteredLocked(identity);
+}
+
+static bool FastllmCudaGraphPoolPointerProtectedLocked(void *ptr) {
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    return fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) !=
+               FASTLLM_CUDA_GRAPH_POOL_IDLE &&
+           fastllmCudaGraphPoolTouchedDuringCapture.find(ptr) !=
+               fastllmCudaGraphPoolTouchedDuringCapture.end();
+}
+
+static bool FastllmCudaGraphPoolBeforeFreeLocked(
+        void *ptr, const FastllmCudaGraphCaptureIdentity &identity) {
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
+        FastllmCudaGraphCaptureIdentityRegisteredLocked(identity)) {
+        fastllmCudaGraphPoolTouchedDuringCapture.insert(ptr);
+    }
+    return true;
+}
+
+static void FastllmCudaGraphPoolAfterAllocLocked(
+        void *ptr, const FastllmCudaGraphCaptureIdentity &identity) {
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) !=
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) ==
+            FASTLLM_CUDA_GRAPH_POOL_CAPTURING &&
+        FastllmCudaGraphCaptureIdentityRegisteredLocked(identity)) {
+        fastllmCudaGraphPoolTouchedDuringCapture.insert(ptr);
+    }
+}
 
 // 张量并行下 NCCL 集合通信异步发射在 cudaStreamPerThread 上且不立即同步。此时执行真实 cudaMalloc
 // 会持有 CUDA 驱动分配锁并隐式同步设备，与 NCCL 主机 proxy 线程争用驱动锁，形成跨 rank 死锁。
@@ -349,6 +492,11 @@ void ForceDeviceSync() {
     checkCudaErrors("Error: CUDA error when synchronizing device!", state);
 }
 
+void FastllmCudaSyncCurrentThreadStream() {
+    cudaError_t state = cudaStreamSynchronize(cudaStreamPerThread);
+    checkCudaErrors("Error: CUDA error when synchronizing the per-thread stream!", state);
+}
+
 void *FastllmCudaStreamCreate(bool nonBlocking) {
     cudaStream_t stream;
     unsigned int flags = nonBlocking ? cudaStreamNonBlocking : cudaStreamDefault;
@@ -384,6 +532,11 @@ void FastllmCudaEventRecord(void *event, void *stream) {
     checkCudaErrors("Error: CUDA error when recording event!", state);
 }
 
+void FastllmCudaEventRecordCurrentThread(void *event) {
+    cudaError_t state = cudaEventRecord((cudaEvent_t)event, cudaStreamPerThread);
+    checkCudaErrors("Error: CUDA error when recording event on the per-thread stream!", state);
+}
+
 void FastllmCudaEventSynchronize(void *event) {
     cudaError_t state = cudaEventSynchronize((cudaEvent_t)event);
     checkCudaErrors("Error: CUDA error when synchronizing event!", state);
@@ -392,6 +545,11 @@ void FastllmCudaEventSynchronize(void *event) {
 void FastllmCudaStreamWaitEvent(void *stream, void *event) {
     cudaError_t state = cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)event, 0);
     checkCudaErrors("Error: CUDA error when stream waiting event!", state);
+}
+
+void FastllmCudaCurrentThreadStreamWaitEvent(void *event) {
+    cudaError_t state = cudaStreamWaitEvent(cudaStreamPerThread, (cudaEvent_t)event, 0);
+    checkCudaErrors("Error: CUDA error when the per-thread stream is waiting for event!", state);
 }
 
 static thread_local std::string fastllmCudaGraphLastError;
@@ -407,7 +565,12 @@ static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
 
 bool FastllmCudaGraphBeginCapture() {
     cudaError_t state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
-    return FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
+    bool ok = FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
+    if (ok && fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
+                  FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+        FastllmCudaGraphRegisterCurrentCapture();
+    }
+    return ok;
 }
 
 // 检查当前线程的捕获是否已被 invalidate（捕获体内任何算子报错都会导致失效）。
@@ -421,6 +584,486 @@ bool FastllmCudaGraphCaptureInvalidated() {
         return true;
     }
     return captureStatus == cudaStreamCaptureStatusInvalidated;
+}
+
+namespace {
+    static thread_local bool fastllmCudaGraphQwen35MoeMarkersEnabled = true;
+
+    __global__ void FastllmCudaQwen35MoeForkMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    __global__ void FastllmCudaQwen35MoeSharedDoneMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    __global__ void FastllmCudaQwen35MoeRoutedBeginMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    __global__ void FastllmCudaQwen35MoeJoinMarkerKernel(int layer) {
+        (void)layer;
+    }
+
+    static bool FastllmCudaGraphIsCapturingCurrentThread() {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        return cudaStreamIsCapturing(cudaStreamPerThread, &status) == cudaSuccess &&
+               status == cudaStreamCaptureStatusActive;
+    }
+
+    static bool FastllmCudaGraphGetAdjacentNodes(cudaGraphNode_t node, bool dependents,
+                                                 std::vector<cudaGraphNode_t> &result) {
+        size_t count = 0;
+        cudaError_t state;
+#if CUDART_VERSION >= 12030
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &count)
+            : cudaGraphNodeGetDependencies(node, nullptr, nullptr, &count);
+#else
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, nullptr, &count)
+            : cudaGraphNodeGetDependencies(node, nullptr, &count);
+#endif
+        if (state != cudaSuccess) {
+            FastllmCudaGraphSetError(dependents ? "cudaGraphNodeGetDependentNodes(count)"
+                                                : "cudaGraphNodeGetDependencies(count)", state);
+            return false;
+        }
+        result.resize(count);
+        if (count == 0) {
+            return true;
+        }
+#if CUDART_VERSION >= 12030
+        std::vector<cudaGraphEdgeData> edgeData(count);
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, result.data(), edgeData.data(), &count)
+            : cudaGraphNodeGetDependencies(node, result.data(), edgeData.data(), &count);
+#else
+        state = dependents
+            ? cudaGraphNodeGetDependentNodes(node, result.data(), &count)
+            : cudaGraphNodeGetDependencies(node, result.data(), &count);
+#endif
+        if (state != cudaSuccess) {
+            FastllmCudaGraphSetError(dependents ? "cudaGraphNodeGetDependentNodes"
+                                                : "cudaGraphNodeGetDependencies", state);
+            return false;
+        }
+        result.resize(count);
+        return true;
+    }
+
+    static cudaError_t FastllmCudaGraphAddDefaultDependencies(
+            cudaGraph_t graph, const std::vector<cudaGraphNode_t> &from,
+            const std::vector<cudaGraphNode_t> &to) {
+        if (from.empty()) {
+            return cudaSuccess;
+        }
+#if CUDART_VERSION >= 12030
+        return cudaGraphAddDependencies(graph, from.data(), to.data(), nullptr, from.size());
+#else
+        return cudaGraphAddDependencies(graph, from.data(), to.data(), from.size());
+#endif
+    }
+
+    struct FastllmCudaQwen35MoeMarkerNodes {
+        cudaGraphNode_t fork = nullptr;
+        cudaGraphNode_t sharedDone = nullptr;
+        cudaGraphNode_t routedBegin = nullptr;
+        cudaGraphNode_t join = nullptr;
+    };
+}
+
+bool FastllmCudaGraphSetQwen35MoeMarkersEnabled(bool enabled) {
+    bool previous = fastllmCudaGraphQwen35MoeMarkersEnabled;
+    fastllmCudaGraphQwen35MoeMarkersEnabled = enabled;
+    return previous;
+}
+
+void FastllmCudaGraphMarkQwen35MoeFork(int layer) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeForkMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+void FastllmCudaGraphMarkQwen35MoeSharedDone(int layer) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeSharedDoneMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+void FastllmCudaGraphMarkQwen35MoeRoutedBegin(int layer) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeRoutedBeginMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+void FastllmCudaGraphMarkQwen35MoeJoin(int layer) {
+    if (fastllmCudaGraphQwen35MoeMarkersEnabled &&
+        FastllmCudaGraphIsCapturingCurrentThread()) {
+        FastllmCudaQwen35MoeJoinMarkerKernel<<<1, 1, 0, cudaStreamPerThread>>>(layer);
+    }
+}
+
+int FastllmCudaGraphOptimizeQwen35Moe(void *graph) {
+    if (graph == nullptr) {
+        fastllmCudaGraphLastError = "Qwen3.5 MoE graph optimizer received a null graph";
+        return -1;
+    }
+    cudaGraph_t cudaGraph = (cudaGraph_t)graph;
+    size_t nodeCount = 0;
+    cudaError_t state = cudaGraphGetNodes(cudaGraph, nullptr, &nodeCount);
+    if (!FastllmCudaGraphSetError("cudaGraphGetNodes(count)", state)) {
+        return -1;
+    }
+    std::vector<cudaGraphNode_t> nodes(nodeCount);
+    state = cudaGraphGetNodes(cudaGraph, nodes.data(), &nodeCount);
+    if (!FastllmCudaGraphSetError("cudaGraphGetNodes", state)) {
+        return -1;
+    }
+    nodes.resize(nodeCount);
+
+    // CUDA forbids destroying nodes in a graph containing allocation/free
+    // nodes. Detect that structural restriction before adding dependencies so
+    // the caller can safely discard this untouched graph and recapture without
+    // markers.
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        state = cudaGraphNodeGetType(node, &type);
+        if (!FastllmCudaGraphSetError("cudaGraphNodeGetType(memory preflight)", state)) {
+            return -1;
+        }
+#if CUDART_VERSION >= 11040
+        if (type == cudaGraphNodeTypeMemAlloc ||
+            type == cudaGraphNodeTypeMemFree) {
+            fastllmCudaGraphLastError.clear();
+            return FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS;
+        }
+#endif
+    }
+
+    std::map<int, FastllmCudaQwen35MoeMarkerNodes> markers;
+    size_t markerCount = 0;
+    for (cudaGraphNode_t node : nodes) {
+        cudaGraphNodeType type;
+        state = cudaGraphNodeGetType(node, &type);
+        if (!FastllmCudaGraphSetError("cudaGraphNodeGetType", state)) {
+            return -1;
+        }
+        if (type != cudaGraphNodeTypeKernel) {
+            continue;
+        }
+        cudaKernelNodeParams params = {};
+        state = cudaGraphKernelNodeGetParams(node, &params);
+        // NCCL and runtime-loaded module kernels can be captured into the same
+        // graph, but CUDA 13 does not always expose their function handles to
+        // cudaGraphKernelNodeGetParams.  They cannot be one of our statically
+        // linked marker kernels, so skip just those opaque nodes and clear the
+        // runtime's sticky error before inspecting the remaining graph.
+        if (state == cudaErrorInvalidDeviceFunction) {
+            cudaGetLastError();
+            continue;
+        }
+        if (!FastllmCudaGraphSetError("cudaGraphKernelNodeGetParams", state)) {
+            return -1;
+        }
+        cudaGraphNode_t FastllmCudaQwen35MoeMarkerNodes::*slot = nullptr;
+        if (params.func == (void*)FastllmCudaQwen35MoeForkMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::fork;
+        } else if (params.func == (void*)FastllmCudaQwen35MoeSharedDoneMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::sharedDone;
+        } else if (params.func == (void*)FastllmCudaQwen35MoeRoutedBeginMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::routedBegin;
+        } else if (params.func == (void*)FastllmCudaQwen35MoeJoinMarkerKernel) {
+            slot = &FastllmCudaQwen35MoeMarkerNodes::join;
+        }
+        if (slot == nullptr) {
+            continue;
+        }
+        if (params.kernelParams == nullptr || params.kernelParams[0] == nullptr) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker has no layer argument";
+            return -1;
+        }
+        int layer = *(int*)params.kernelParams[0];
+        auto &layerMarkers = markers[layer];
+        if (layerMarkers.*slot != nullptr) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph contains duplicate markers for layer " +
+                                        std::to_string(layer);
+            return -1;
+        }
+        layerMarkers.*slot = node;
+        markerCount++;
+    }
+
+    if (markerCount == 0) {
+        fastllmCudaGraphLastError.clear();
+        return 0;
+    }
+    if (markerCount != markers.size() * 4) {
+        fastllmCudaGraphLastError = "Qwen3.5 MoE graph has an incomplete marker set";
+        return -1;
+    }
+
+    std::set<std::pair<cudaGraphNode_t, cudaGraphNode_t> > desiredEdges;
+    std::vector<cudaGraphNode_t> markerNodes;
+    markerNodes.reserve(markerCount);
+    for (auto &it : markers) {
+        auto &m = it.second;
+        if (m.fork == nullptr || m.sharedDone == nullptr ||
+            m.routedBegin == nullptr || m.join == nullptr) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph is missing a marker for layer " +
+                                        std::to_string(it.first);
+            return -1;
+        }
+        std::vector<cudaGraphNode_t> forkDependencies, sharedRoots;
+        std::vector<cudaGraphNode_t> sharedTails, routedRoots;
+        std::vector<cudaGraphNode_t> routedTails, joinRoots;
+        if (!FastllmCudaGraphGetAdjacentNodes(m.fork, false, forkDependencies) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.fork, true, sharedRoots) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.sharedDone, false, sharedTails) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.routedBegin, true, routedRoots) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.join, false, routedTails) ||
+            !FastllmCudaGraphGetAdjacentNodes(m.join, true, joinRoots)) {
+            return -1;
+        }
+        if (forkDependencies.empty() || sharedRoots.empty() || sharedTails.empty() ||
+            routedRoots.empty() || routedTails.empty() || joinRoots.empty()) {
+            fastllmCudaGraphLastError = "Qwen3.5 MoE graph marker adjacency is empty for layer " +
+                                        std::to_string(it.first);
+            return -1;
+        }
+        for (cudaGraphNode_t dependency : forkDependencies) {
+            for (cudaGraphNode_t root : sharedRoots) {
+                desiredEdges.insert({dependency, root});
+            }
+            for (cudaGraphNode_t root : routedRoots) {
+                desiredEdges.insert({dependency, root});
+            }
+        }
+        for (cudaGraphNode_t tail : sharedTails) {
+            for (cudaGraphNode_t root : joinRoots) {
+                desiredEdges.insert({tail, root});
+            }
+        }
+        for (cudaGraphNode_t tail : routedTails) {
+            for (cudaGraphNode_t root : joinRoots) {
+                desiredEdges.insert({tail, root});
+            }
+        }
+        markerNodes.push_back(m.fork);
+        markerNodes.push_back(m.sharedDone);
+        markerNodes.push_back(m.routedBegin);
+        markerNodes.push_back(m.join);
+    }
+
+    std::vector<cudaGraphNode_t> from;
+    std::vector<cudaGraphNode_t> to;
+    from.reserve(desiredEdges.size());
+    to.reserve(desiredEdges.size());
+    for (auto &edge : desiredEdges) {
+        from.push_back(edge.first);
+        to.push_back(edge.second);
+    }
+    state = FastllmCudaGraphAddDefaultDependencies(cudaGraph, from, to);
+    if (!FastllmCudaGraphSetError("cudaGraphAddDependencies(Qwen3.5 MoE)", state)) {
+        return -1;
+    }
+    for (cudaGraphNode_t marker : markerNodes) {
+        state = cudaGraphDestroyNode(marker);
+        if (!FastllmCudaGraphSetError("cudaGraphDestroyNode(Qwen3.5 MoE marker)", state)) {
+            return -1;
+        }
+    }
+    fastllmCudaGraphLastError.clear();
+    return (int)markers.size();
+}
+
+namespace {
+    __global__ void FastllmCudaQwen35MoeSelfTestBranchKernel(int *output, int value) {
+        if (threadIdx.x == 0) {
+            *output = value;
+        }
+    }
+
+    __global__ void FastllmCudaQwen35MoeSelfTestJoinKernel(
+            const int *shared, const int *routed, int *output) {
+        if (threadIdx.x == 0) {
+            *output = *shared + *routed;
+        }
+    }
+}
+
+static bool FastllmCudaGraphQwen35MoeParallelSelfTest() {
+    int *shared = nullptr;
+    int *routed = nullptr;
+    int *output = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    auto cleanup = [&]() {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (shared != nullptr) cudaFree(shared);
+        if (routed != nullptr) cudaFree(routed);
+        if (output != nullptr) cudaFree(output);
+    };
+    if (cudaMalloc(&shared, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&routed, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&output, sizeof(int)) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    if (!FastllmCudaGraphBeginCapture()) {
+        cleanup();
+        return false;
+    }
+    cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
+    cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
+    cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+    FastllmCudaGraphMarkQwen35MoeFork(0);
+    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
+    FastllmCudaGraphMarkQwen35MoeSharedDone(0);
+    FastllmCudaGraphMarkQwen35MoeRoutedBegin(0);
+    FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(routed, 31);
+    FastllmCudaGraphMarkQwen35MoeJoin(0);
+    FastllmCudaQwen35MoeSelfTestJoinKernel<<<1, 1, 0, cudaStreamPerThread>>>(
+        shared, routed, output);
+    void *capturedGraph = nullptr;
+    if (!FastllmCudaGraphEndCapture(&capturedGraph) || capturedGraph == nullptr) {
+        cleanup();
+        return false;
+    }
+    graph = (cudaGraph_t)capturedGraph;
+    if (FastllmCudaGraphOptimizeQwen35Moe(graph) != 1 ||
+        cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
+        cudaGraphLaunch(exec, cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    int result = 0;
+    bool ok = cudaMemcpy(&result, output, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
+              result == 42;
+    cleanup();
+    return ok;
+}
+
+static bool FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest() {
+#if CUDART_VERSION < 11040
+    return true;
+#else
+    int device = 0;
+    int driverVersion = 0;
+    int memoryPoolsSupported = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDriverGetVersion(&driverVersion) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (driverVersion < 11040) {
+        return true;
+    }
+    if (cudaDeviceGetAttribute(&memoryPoolsSupported,
+                               cudaDevAttrMemoryPoolsSupported,
+                               device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (!memoryPoolsSupported) {
+        return true;
+    }
+
+    int *shared = nullptr;
+    int *routed = nullptr;
+    int *output = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    auto cleanup = [&]() {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (shared != nullptr) cudaFree(shared);
+        if (routed != nullptr) cudaFree(routed);
+        if (output != nullptr) cudaFree(output);
+    };
+    if (cudaMalloc(&shared, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&routed, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&output, sizeof(int)) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+
+    auto capture = [&](bool enableMarkers, cudaGraph_t &captured) {
+        bool previousMarkers =
+            FastllmCudaGraphSetQwen35MoeMarkersEnabled(enableMarkers);
+        void *temporary = nullptr;
+        void *capturedGraph = nullptr;
+        bool began = FastllmCudaGraphBeginCapture();
+        bool ok = began;
+        if (ok) {
+            ok = cudaMallocAsync(&temporary, 4096, cudaStreamPerThread) ==
+                     cudaSuccess;
+        }
+        if (ok) {
+            cudaMemsetAsync(shared, 0, sizeof(int), cudaStreamPerThread);
+            cudaMemsetAsync(routed, 0, sizeof(int), cudaStreamPerThread);
+            cudaMemsetAsync(output, 0, sizeof(int), cudaStreamPerThread);
+            cudaMemsetAsync(temporary, 0, 4096, cudaStreamPerThread);
+            FastllmCudaGraphMarkQwen35MoeFork(0);
+            FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(shared, 11);
+            FastllmCudaGraphMarkQwen35MoeSharedDone(0);
+            FastllmCudaGraphMarkQwen35MoeRoutedBegin(0);
+            FastllmCudaQwen35MoeSelfTestBranchKernel<<<1, 1, 0, cudaStreamPerThread>>>(routed, 31);
+            FastllmCudaGraphMarkQwen35MoeJoin(0);
+            FastllmCudaQwen35MoeSelfTestJoinKernel<<<1, 1, 0, cudaStreamPerThread>>>(
+                shared, routed, output);
+            ok = cudaFreeAsync(temporary, cudaStreamPerThread) == cudaSuccess;
+        }
+        bool ended = began && FastllmCudaGraphEndCapture(&capturedGraph);
+        FastllmCudaGraphSetQwen35MoeMarkersEnabled(previousMarkers);
+        if (!ok || !ended || capturedGraph == nullptr) {
+            if (capturedGraph != nullptr) {
+                FastllmCudaGraphDestroy(capturedGraph);
+            }
+            cudaGetLastError();
+            return false;
+        }
+        captured = (cudaGraph_t)capturedGraph;
+        return true;
+    };
+
+    // The first graph contains both markers and graph allocation/free nodes.
+    // The optimizer must reject it before mutating any dependencies.
+    if (!capture(true, graph) ||
+        FastllmCudaGraphOptimizeQwen35Moe(graph) !=
+            FASTLLM_CUDA_GRAPH_MOE_RECAPTURE_WITHOUT_MARKERS) {
+        cleanup();
+        return false;
+    }
+    cudaGraphDestroy(graph);
+    graph = nullptr;
+
+    // A markerless recapture preserves the original sequential MoE topology
+    // and remains a valid executable graph even with allocation/free nodes.
+    if (!capture(false, graph) ||
+        cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess ||
+        cudaGraphLaunch(exec, cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cleanup();
+        return false;
+    }
+    int result = 0;
+    bool ok = cudaMemcpy(&result, output, sizeof(int), cudaMemcpyDeviceToHost) ==
+                  cudaSuccess &&
+              result == 42;
+    cleanup();
+    return ok;
+#endif
+}
+
+bool FastllmCudaGraphQwen35MoeSelfTest() {
+    return FastllmCudaGraphQwen35MoeParallelSelfTest() &&
+           FastllmCudaGraphQwen35MoeAllocationFallbackSelfTest();
 }
 
 bool FastllmCudaGraphEndCapture(void **graph) {
@@ -439,6 +1082,90 @@ bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
         *exec = (void*)cudaExec;
     }
     return FastllmCudaGraphSetError("cudaGraphInstantiate", state);
+}
+
+bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
+        int rootDevice, int ranks,
+        const void *const *ids, const void *const *scores,
+        void *cudaGather, void *hostGather,
+        size_t rankBytes, size_t scoreBase, size_t totalBytes,
+        void **exec) {
+    if (exec != nullptr) {
+        *exec = nullptr;
+    }
+    if (rootDevice < 0 || ranks <= 0 || ids == nullptr || scores == nullptr ||
+        cudaGather == nullptr || hostGather == nullptr || rankBytes == 0 ||
+        totalBytes == 0 || exec == nullptr) {
+        return FastllmCudaGraphSetError(
+            "greedy gather graph arguments", cudaErrorInvalidValue);
+    }
+
+    cudaError_t state = cudaSetDevice(rootDevice);
+    if (state != cudaSuccess) {
+        return FastllmCudaGraphSetError(
+            "greedy gather graph cudaSetDevice", state);
+    }
+
+    cudaGraph_t graph = nullptr;
+    state = cudaGraphCreate(&graph, 0);
+    if (state != cudaSuccess) {
+        return FastllmCudaGraphSetError(
+            "greedy gather graph cudaGraphCreate", state);
+    }
+
+    std::vector<cudaGraphNode_t> copyNodes;
+    copyNodes.reserve((size_t)2 * ranks);
+    for (int rank = 0; rank < ranks && state == cudaSuccess; ++rank) {
+        if (ids[rank] == nullptr || scores[rank] == nullptr) {
+            state = cudaErrorInvalidValue;
+            break;
+        }
+        cudaGraphNode_t idNode = nullptr;
+        state = cudaGraphAddMemcpyNode1D(
+            &idNode, graph, nullptr, 0,
+            (uint8_t*)cudaGather + (size_t)rank * rankBytes,
+            ids[rank], rankBytes, cudaMemcpyDefault);
+        if (state == cudaSuccess) {
+            copyNodes.push_back(idNode);
+        }
+        cudaGraphNode_t scoreNode = nullptr;
+        if (state == cudaSuccess) {
+            state = cudaGraphAddMemcpyNode1D(
+                &scoreNode, graph, nullptr, 0,
+                (uint8_t*)cudaGather + scoreBase +
+                    (size_t)rank * rankBytes,
+                scores[rank], rankBytes, cudaMemcpyDefault);
+        }
+        if (state == cudaSuccess) {
+            copyNodes.push_back(scoreNode);
+        }
+    }
+    if (state != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return FastllmCudaGraphSetError(
+            "greedy gather graph cudaGraphAddMemcpyNode1D(peer)", state);
+    }
+
+    cudaGraphNode_t hostNode = nullptr;
+    state = cudaGraphAddMemcpyNode1D(
+        &hostNode, graph, copyNodes.data(), copyNodes.size(),
+        hostGather, cudaGather, totalBytes, cudaMemcpyDefault);
+    if (state != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return FastllmCudaGraphSetError(
+            "greedy gather graph cudaGraphAddMemcpyNode1D(host)", state);
+    }
+
+    cudaGraphExec_t cudaExec = nullptr;
+    state = cudaGraphInstantiate(&cudaExec, graph, nullptr, nullptr, 0);
+    cudaGraphDestroy(graph);
+    if (state != cudaSuccess) {
+        return FastllmCudaGraphSetError(
+            "greedy gather graph cudaGraphInstantiate", state);
+    }
+    *exec = (void*)cudaExec;
+    return FastllmCudaGraphSetError(
+        "greedy gather graph create", cudaSuccess);
 }
 
 bool FastllmCudaGraphLaunch(void *exec) {
@@ -475,6 +1202,18 @@ __global__ void FastllmCudaFloatEmbeddingKernel(float *input, T *weight, T *outp
     weight += (int64_t)token * embSize;
     for (int i = threadIdx.x; i < embSize; i+= THREAD_PER_BLOCK) {
         output[i] = weight[i];
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmCudaBFloat16EmbeddingToFloatKernel(
+        const float *input, const __nv_bfloat16 *weight, float *output,
+        int embSize) {
+    int token = (int)(input[blockIdx.x] + 1e-5f);
+    weight += (int64_t)token * embSize;
+    output += (int64_t)blockIdx.x * embSize;
+    for (int i = threadIdx.x; i < embSize; i += THREAD_PER_BLOCK) {
+        output[i] = __bfloat162float(weight[i]);
     }
 }
 
@@ -867,6 +1606,17 @@ __global__ void FastllmReduceKernel(half *output, half* input, int len, int thre
     }
 }
 
+__global__ void FastllmReduceKernel(__nv_bfloat16 *output, __nv_bfloat16 *input, int len, int threadNum) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float value = 0.0f;
+        for (int i = 0; i < threadNum; i++) {
+            value += __bfloat162float(input[idx + i * len]);
+        }
+        output[idx] = __float2bfloat16_rn(value);
+    }
+}
+
 __global__ void FastllmAddToKernel(float* a, float *b, float alpha, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1000,6 +1750,108 @@ __global__ void FastllmTransposeByRowKernel(uint8_t *dst, uint8_t *ori, int n, i
     for (int i = threadIdx.x; i < k; i += THREAD_PER_BLOCK) {
         curOutput[i] = curInput[i];
     }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmTransposeLastTwoByBatchKernel(
+        uint8_t *dst, const uint8_t *ori, int batch, int n, int m, int k) {
+    int batchIndex = blockIdx.x / (n * m);
+    int inner = blockIdx.x % (n * m);
+    int row = inner / m;
+    int col = inner % m;
+    const uint8_t *curInput = ori +
+        ((batchIndex * n + row) * m + col) * k;
+    uint8_t *curOutput = dst +
+        ((batchIndex * m + col) * n + row) * k;
+    for (int i = threadIdx.x; i < k; i += THREAD_PER_BLOCK) {
+        curOutput[i] = curInput[i];
+    }
+}
+
+// The Qwen3.5 MTP verify path transposes [1, 4, channels] to
+// [1, channels, 4], then performs the inverse transpose after conv1d.  Moving
+// four 16-bit values per thread keeps both the strided side and the packed side
+// coalesced without launching one CUDA block per scalar element.
+__global__ void FastllmTransposeN4HalfKernel(
+        uint16_t *dst, const uint16_t *ori, int batch, int m) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * m;
+    if (index >= total) {
+        return;
+    }
+    int batchIndex = index / m;
+    int col = index - batchIndex * m;
+    const uint16_t *input = ori + batchIndex * 4 * m + col;
+    uint2 value;
+    value.x = (uint32_t)input[0] | ((uint32_t)input[m] << 16);
+    value.y = (uint32_t)input[2 * m] | ((uint32_t)input[3 * m] << 16);
+    ((uint2*)dst)[index] = value;
+}
+
+__global__ void FastllmTransposeM4HalfKernel(
+        uint16_t *dst, const uint16_t *ori, int batch, int n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * n;
+    if (index >= total) {
+        return;
+    }
+    int batchIndex = index / n;
+    int row = index - batchIndex * n;
+    uint2 value = ((const uint2*)ori)[index];
+    uint16_t value0 = (uint16_t)value.x;
+    uint16_t value1 = (uint16_t)(value.x >> 16);
+    uint16_t value2 = (uint16_t)value.y;
+    uint16_t value3 = (uint16_t)(value.y >> 16);
+    uint16_t *output = dst + batchIndex * 4 * n + row;
+    output[0] = value0;
+    output[n] = value1;
+    output[2 * n] = value2;
+    output[3 * n] = value3;
+}
+
+template <typename T>
+__global__ void FastllmTransposeLastTwoElementKernel(
+        T *dst, const T *ori, int n, int m, int len) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= len) {
+        return;
+    }
+    int batchIndex = index / (n * m);
+    int inner = index - batchIndex * n * m;
+    int row = inner / m;
+    int col = inner - row * m;
+    dst[(batchIndex * m + col) * n + row] = ori[index];
+}
+
+static bool FastllmLaunchTransposeLastTwo(
+        void *dst, const void *ori, int batch, int n, int m,
+        int unitSize, cudaStream_t stream) {
+    int len = batch * n * m;
+    int blocks = (len + 255) / 256;
+    if (unitSize == 2 && n == 4) {
+        int packedBlocks = (batch * m + 255) / 256;
+        FastllmTransposeN4HalfKernel<<<packedBlocks, 256, 0, stream>>>(
+            (uint16_t*)dst, (const uint16_t*)ori, batch, m);
+    } else if (unitSize == 2 && m == 4) {
+        int packedBlocks = (batch * n + 255) / 256;
+        FastllmTransposeM4HalfKernel<<<packedBlocks, 256, 0, stream>>>(
+            (uint16_t*)dst, (const uint16_t*)ori, batch, n);
+    } else if (unitSize == 4) {
+        FastllmTransposeLastTwoElementKernel<uint32_t>
+            <<<blocks, 256, 0, stream>>>(
+                (uint32_t*)dst, (const uint32_t*)ori, n, m, len);
+    } else if (unitSize == 2) {
+        FastllmTransposeLastTwoElementKernel<uint16_t>
+            <<<blocks, 256, 0, stream>>>(
+                (uint16_t*)dst, (const uint16_t*)ori, n, m, len);
+    } else if (unitSize == 1) {
+        FastllmTransposeLastTwoElementKernel<uint8_t>
+            <<<blocks, 256, 0, stream>>>(
+                (uint8_t*)dst, (const uint8_t*)ori, n, m, len);
+    } else {
+        return false;
+    }
+    return true;
 }
 
 template <typename T>
@@ -1515,6 +2367,43 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
     }
 }
 
+// The legacy hidden=128 launch uses two warps.  One physical warp can evaluate
+// both reductions independently and combine the two old warp sums in the exact
+// same final addition, avoiding block-wide shared-memory barriers.
+__global__ __launch_bounds__(32) void FastllmRMSNormHalf128ExactKernel(
+        const half *input, const float *weight, half *output, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    input += (size_t)row * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+    float2 normalized0, normalized1;
+    normalized0.x = value0.x * scale * __ldg(weight + lane * 2);
+    normalized0.y = value0.y * scale * __ldg(weight + lane * 2 + 1);
+    normalized1.x = value1.x * scale * __ldg(weight + (lane + 32) * 2);
+    normalized1.y = value1.y * scale * __ldg(weight + (lane + 32) * 2 + 1);
+    output2[lane] = __float22half2_rn(normalized0);
+    output2[lane + 32] = __float22half2_rn(normalized1);
+}
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, __nv_bfloat16 *output, int outer, int channels, float eps) {
     int o = blockIdx.x;
@@ -1847,11 +2736,12 @@ struct CudaMemoryBuffer {
     void *data;
     size_t size;
     bool busy;
+    int graphPins;
 
-    CudaMemoryBuffer () {}
+    CudaMemoryBuffer () : data(nullptr), size(0), busy(false), graphPins(0) {}
 
     CudaMemoryBuffer (void *data, size_t size, bool busy) :
-            data(data), size(size), busy(busy) {}
+            data(data), size(size), busy(busy), graphPins(0) {}
 };
 std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
 std::map<int, int> cudaBuffersMinId; // 最小的空闲id
@@ -1938,6 +2828,53 @@ static std::vector<FastllmCudaMemPoolView> FastllmSnapshotCudaMemPoolViews() {
         views.push_back(view);
     }
     return views;
+}
+
+static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMemoryBuffer> &bigBuffers) {
+    size_t released = 0;
+    std::vector<CudaMemoryBuffer> keep;
+    keep.reserve(bigBuffers.size());
+    cudaError_t state = cudaSetDevice(id);
+    if (cudaSuccess != state) {
+        checkCudaErrors("Error: CUDA error when set device before release idle memory!", state);
+        return 0;
+    }
+    if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
+        cudaDeviceSynchronize();
+    }
+    for (auto &buffer : bigBuffers) {
+        if (buffer.busy) {
+            keep.push_back(buffer);
+            continue;
+        }
+        state = cudaFree(buffer.data);
+        if (cudaSuccess == state) {
+            released += buffer.size;
+        } else {
+            printf("Error: CUDA error when release idle pooled memory on device %d!", id);
+            checkCudaErrors("", state);
+            keep.push_back(buffer);
+        }
+    }
+    bigBuffers.swap(keep);
+    return released;
+}
+
+static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
+        void **ret, size_t size, int id, FastllmCudaMemPoolView &view, const char *file, int line) {
+    if (ret != nullptr) {
+        *ret = nullptr;
+    }
+    cudaError_t state = FastllmCudaCheckedMalloc(ret, size, file, line);
+    if (cudaSuccess == state || fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        return state;
+    }
+    cudaGetLastError();
+    size_t released = FastllmCudaReleaseIdleBigBuffersLocked(id, *view.bigBuffers);
+    if (released == 0) {
+        return state;
+    }
+    return FastllmCudaCheckedMalloc(ret, size, file, line);
 }
 
 static size_t fastllmCudaMemPoolAllocated = 0;
@@ -2266,8 +3203,13 @@ static void CudaMemDebugRemove(void *ptr) {
 #endif // CUDA_MEM_DEBUG
 
 void * FastllmCudaDirectMalloc(size_t size) {
-    void * ret;
-    cudaError_t state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    void * ret = nullptr;
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    checkCudaErrors("Error: CUDA error when find device!", state);
+    FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    std::lock_guard<std::mutex> lock(*view.lock);
+    state = FastllmCudaCheckedMallocWithIdlePoolRetry(&ret, size, id, view, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
@@ -2389,7 +3331,8 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         std::vector<CudaMemoryBuffer> busyBuffers;
         busyBuffers.reserve(bigBuffers.size());
         for (auto &buffer : bigBuffers) {
-            if (buffer.busy) {
+            if (buffer.busy || buffer.graphPins > 0 ||
+                FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
                 state = cudaFree(buffer.data);
@@ -2408,7 +3351,8 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         std::vector<CudaMemoryBuffer> busyBuffers;
         busyBuffers.reserve(cudaBuffers.size());
         for (auto &buffer : cudaBuffers) {
-            if (buffer.busy) {
+            if (buffer.busy || buffer.graphPins > 0 ||
+                FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
                 state = cudaFree(buffer.data);
@@ -2431,18 +3375,159 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(size_t size, void **ret, in
     return state == cudaSuccess;
 }
 
+bool FastllmCudaGraphMemoryPoolBegin() {
+    FastllmCudaClearGraphError();
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) !=
+            FASTLLM_CUDA_GRAPH_POOL_IDLE) {
+        return false;
+    }
+    fastllmCudaGraphPoolTouchedDuringCapture.clear();
+    fastllmCudaGraphPoolCaptureIds.clear();
+    fastllmCudaGraphPoolPhase.store(
+        FASTLLM_CUDA_GRAPH_POOL_CAPTURING, std::memory_order_release);
+    return true;
+}
+
+bool FastllmCudaGraphMemoryPoolEnd(std::vector<void*> &reservedPointers) {
+    reservedPointers.clear();
+    std::set<void*> remaining;
+    {
+        std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+        if (fastllmCudaGraphPoolPhase.load(std::memory_order_relaxed) !=
+                FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {
+            return false;
+        }
+        fastllmCudaGraphPoolPhase.store(
+            FASTLLM_CUDA_GRAPH_POOL_FINALIZING, std::memory_order_release);
+        remaining = fastllmCudaGraphPoolTouchedDuringCapture;
+    }
+
+    // Pin every captured pool address while holding the same device-pool lock
+    // used by malloc/free. A block may simultaneously be busy on behalf of a
+    // persistent Data/workspace; graphPins is an independent ownership count,
+    // so either owner may release first without exposing the address early.
+    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        for (auto &buffer : *view.smallBuffers) {
+            auto it = remaining.find(buffer.data);
+            if (it == remaining.end()) {
+                continue;
+            }
+            remaining.erase(it);
+            buffer.graphPins++;
+            reservedPointers.push_back(buffer.data);
+        }
+        for (auto &buffer : *view.bigBuffers) {
+            auto it = remaining.find(buffer.data);
+            if (it == remaining.end()) {
+                continue;
+            }
+            remaining.erase(it);
+            buffer.graphPins++;
+            reservedPointers.push_back(buffer.data);
+        }
+        *view.noBusy = 0;
+        *view.minId = (int)view.smallBuffers->size();
+        for (int i = 0; i < (int)view.smallBuffers->size(); ++i) {
+            const CudaMemoryBuffer &buffer = (*view.smallBuffers)[i];
+            if (!buffer.busy && buffer.graphPins == 0) {
+                *view.noBusy += buffer.size;
+                *view.minId = std::min(*view.minId, i);
+            }
+        }
+    }
+
+    bool ok = remaining.empty();
+    {
+        std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+        fastllmCudaGraphPoolTouchedDuringCapture.clear();
+        fastllmCudaGraphPoolCaptureIds.clear();
+        fastllmCudaGraphPoolPhase.store(
+            FASTLLM_CUDA_GRAPH_POOL_IDLE, std::memory_order_release);
+    }
+    if (!ok) {
+        std::vector<void*> rollback = reservedPointers;
+        reservedPointers.clear();
+        FastllmCudaGraphMemoryPoolRelease(rollback);
+    }
+    return ok;
+}
+
+void FastllmCudaGraphMemoryPoolAbort() {
+    std::lock_guard<std::mutex> guard(fastllmCudaGraphPoolMutex);
+    fastllmCudaGraphPoolTouchedDuringCapture.clear();
+    fastllmCudaGraphPoolCaptureIds.clear();
+    fastllmCudaGraphPoolPhase.store(
+        FASTLLM_CUDA_GRAPH_POOL_IDLE, std::memory_order_release);
+}
+
+void FastllmCudaGraphMemoryPoolRelease(const std::vector<void*> &reservedPointers) {
+    std::set<void*> remaining(reservedPointers.begin(), reservedPointers.end());
+    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        for (int i = 0; i < (int)view.smallBuffers->size(); ++i) {
+            CudaMemoryBuffer &buffer = (*view.smallBuffers)[i];
+            auto it = remaining.find(buffer.data);
+            if (it == remaining.end()) {
+                continue;
+            }
+            if (buffer.graphPins > 0) {
+                buffer.graphPins--;
+                if (buffer.graphPins == 0 && !buffer.busy) {
+                    *view.minId = std::min(*view.minId, i);
+                }
+            } else {
+                FastllmCudaSetThreadError();
+            }
+            remaining.erase(it);
+        }
+        for (auto &buffer : *view.bigBuffers) {
+            auto it = remaining.find(buffer.data);
+            if (it == remaining.end()) {
+                continue;
+            }
+            if (buffer.graphPins > 0) {
+                buffer.graphPins--;
+            } else {
+                FastllmCudaSetThreadError();
+            }
+            remaining.erase(it);
+        }
+        *view.noBusy = 0;
+        *view.minId = (int)view.smallBuffers->size();
+        for (int i = 0; i < (int)view.smallBuffers->size(); ++i) {
+            const CudaMemoryBuffer &buffer = (*view.smallBuffers)[i];
+            if (!buffer.busy && buffer.graphPins == 0) {
+                *view.noBusy += buffer.size;
+                *view.minId = std::min(*view.minId, i);
+            }
+        }
+    }
+    if (!remaining.empty()) {
+        FastllmCudaSetThreadError();
+    }
+}
+
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
     checkCudaErrors("Error: CUDA error when find device!", state);
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
+    FastllmCudaGraphCaptureIdentity captureIdentity =
+        FastllmCudaGraphCurrentCaptureIdentity();
     std::lock_guard<std::mutex> lock(*view.lock);
     if (size > 1024 * 1024) {
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
+            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                FastllmCudaGraphPoolPointerReusableLocked(
+                    bigBuffers[i].data, captureIdentity) &&
+                FastllmCudaCanReusePooledBigBuffer(bigBuffers[i].size, size)) {
                 if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                     selId = i;
                 }
@@ -2450,6 +3535,8 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+            FastllmCudaGraphPoolAfterAllocLocked(
+                bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
@@ -2457,7 +3544,10 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
             for (int i = 0; i < bigBuffers.size(); i++) {
-                if (!bigBuffers[i].busy && bigBuffers[i].size >= size) {
+                if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                    bigBuffers[i].size >= size &&
+                    FastllmCudaGraphPoolPointerReusableLocked(
+                        bigBuffers[i].data, captureIdentity)) {
                     if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                         selId = i;
                     }
@@ -2465,6 +3555,8 @@ void * FastllmCudaMalloc(size_t size) {
             }
             if (selId != -1) {
                 bigBuffers[selId].busy = true;
+                FastllmCudaGraphPoolAfterAllocLocked(
+                    bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
@@ -2472,7 +3564,7 @@ void * FastllmCudaMalloc(size_t size) {
             }
         }
 
-        void * ret;
+        void * ret = nullptr;
         if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
             FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
         }
@@ -2491,6 +3583,7 @@ void * FastllmCudaMalloc(size_t size) {
             return nullptr;
         }
         bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+        FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
         CudaMemDebugRecord(ret, size);
 #endif
@@ -2498,10 +3591,17 @@ void * FastllmCudaMalloc(size_t size) {
     }
     auto &cudaBuffers = *view.smallBuffers;
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
-        if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
+        if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
+            cudaBuffers[i].graphPins == 0 &&
+            FastllmCudaGraphPoolPointerReusableLocked(
+                cudaBuffers[i].data, captureIdentity)) {
             cudaBuffers[i].busy = true;
+            FastllmCudaGraphPoolAfterAllocLocked(
+                cudaBuffers[i].data, captureIdentity);
             *view.noBusy -= cudaBuffers[i].size;
-            while (*view.minId < cudaBuffers.size() && cudaBuffers[*view.minId].busy) {
+            while (*view.minId < cudaBuffers.size() &&
+                   (cudaBuffers[*view.minId].busy ||
+                    cudaBuffers[*view.minId].graphPins > 0)) {
                 (*view.minId)++;
             }
 #ifdef CUDA_MEM_DEBUG
@@ -2514,7 +3614,10 @@ void * FastllmCudaMalloc(size_t size) {
         auto &bigBuffers = *view.bigBuffers;
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && bigBuffers[i].size >= size) {
+            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                bigBuffers[i].size >= size &&
+                FastllmCudaGraphPoolPointerReusableLocked(
+                    bigBuffers[i].data, captureIdentity)) {
                 if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                     selId = i;
                 }
@@ -2522,13 +3625,15 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+            FastllmCudaGraphPoolAfterAllocLocked(
+                bigBuffers[selId].data, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
             CudaMemDebugRecord(bigBuffers[selId].data, size);
 #endif
             return bigBuffers[selId].data;
         }
     }
-    void * ret;
+    void * ret = nullptr;
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         FastllmCudaPrintPoolRejectStateLocked(id, size, view.bigBuffers, view.smallBuffers);
     }
@@ -2547,6 +3652,7 @@ void * FastllmCudaMalloc(size_t size) {
         return nullptr;
     }
     cudaBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+    FastllmCudaGraphPoolAfterAllocLocked(ret, captureIdentity);
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRecord(ret, size);
 #endif
@@ -2569,6 +3675,20 @@ void FastllmCudaForceFree(void *ret) {
         auto &cudaBuffers = *view.smallBuffers;
         for (int i = 0; i < (int)cudaBuffers.size(); i++) {
             if (cudaBuffers[i].data == ret) {
+                if (cudaBuffers[i].graphPins > 0 ||
+                    FastllmCudaGraphPoolPointerProtectedLocked(ret)) {
+                    if (cudaBuffers[i].busy) {
+                        cudaBuffers[i].busy = false;
+                        if (cudaBuffers[i].graphPins == 0) {
+                            *view.noBusy += cudaBuffers[i].size;
+                            *view.minId = std::min(*view.minId, i);
+                        }
+                    }
+#ifdef CUDA_MEM_DEBUG
+                    CudaMemDebugRemove(ret);
+#endif
+                    return;
+                }
                 state = cudaSetDevice(view.device);
                 state = cudaFree(cudaBuffers[i].data);
                 if (cudaSuccess != state) {
@@ -2578,7 +3698,7 @@ void FastllmCudaForceFree(void *ret) {
                 *view.noBusy = 0;
                 *view.minId = (int)cudaBuffers.size();
                 for (int j = 0; j < (int)cudaBuffers.size(); j++) {
-                    if (!cudaBuffers[j].busy) {
+                    if (!cudaBuffers[j].busy && cudaBuffers[j].graphPins == 0) {
                         *view.noBusy += cudaBuffers[j].size;
                         *view.minId = std::min(*view.minId, j);
                     }
@@ -2594,6 +3714,14 @@ void FastllmCudaForceFree(void *ret) {
         auto &bigBuffers = *view.bigBuffers;
         for (int i = 0; i < (int)bigBuffers.size(); i++) {
             if (bigBuffers[i].data == ret) {
+                if (bigBuffers[i].graphPins > 0 ||
+                    FastllmCudaGraphPoolPointerProtectedLocked(ret)) {
+                    bigBuffers[i].busy = false;
+#ifdef CUDA_MEM_DEBUG
+                    CudaMemDebugRemove(ret);
+#endif
+                    return;
+                }
                 state = cudaSetDevice(view.device);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state) {
@@ -2625,6 +3753,8 @@ void FastllmCudaFree(void *ret) {
         return;
     }
     int oriId = FastllmCudaGetDevice();
+    FastllmCudaGraphCaptureIdentity captureIdentity =
+        FastllmCudaGraphCurrentCaptureIdentity();
 
     // 优先只查当前 rank 的本地池。归还池内指针只修改 busy 标记，
     // 不调用 CUDA API。若本地未命中，再在不持锁时查询指针真实设备，
@@ -2635,9 +3765,17 @@ void FastllmCudaFree(void *ret) {
         auto &cudaBuffers = *view.smallBuffers;
         for (int i = 0; i < cudaBuffers.size(); i++) {
             if (cudaBuffers[i].data == ret) {
-                *view.noBusy += cudaBuffers[i].size;
-                cudaBuffers[i].busy = false;
-                *view.minId = std::min(*view.minId, i);
+                if (!FastllmCudaGraphPoolBeforeFreeLocked(
+                        ret, captureIdentity)) {
+                    return true;
+                }
+                if (cudaBuffers[i].busy) {
+                    cudaBuffers[i].busy = false;
+                    if (cudaBuffers[i].graphPins == 0) {
+                        *view.noBusy += cudaBuffers[i].size;
+                        *view.minId = std::min(*view.minId, i);
+                    }
+                }
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
 #endif
@@ -2647,6 +3785,10 @@ void FastllmCudaFree(void *ret) {
         auto &bigBuffers = *view.bigBuffers;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].data == ret) {
+                if (!FastllmCudaGraphPoolBeforeFreeLocked(
+                        ret, captureIdentity)) {
+                    return true;
+                }
                 bigBuffers[i].busy = false;
 #ifdef CUDA_MEM_DEBUG
                 CudaMemDebugRemove(ret);
@@ -2705,6 +3847,17 @@ void FastllmCudaFree(void *ret) {
     }
 
     // 未在任何池中找到：直接释放。此处不持有任何池锁，避免跨设备阻塞。
+    if (FastllmCudaGraphPoolPointerProtectedLocked(ret)) {
+        return;
+    }
+    if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) !=
+            FASTLLM_CUDA_GRAPH_POOL_IDLE) {
+        // Whole-step capture only supports allocations owned by FastLLM's
+        // tracked pool. Freeing an untracked pointer would invalidate a graph
+        // that may retain it, so reject the capture instead.
+        FastllmCudaSetThreadError();
+        return;
+    }
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
@@ -2729,13 +3882,13 @@ void FastllmCudaFree(void *ret) {
 }
 
 void FastllmCudaMallocBigBuffer(size_t size) {
-    void * ret;
+    void * ret = nullptr;
     int id = -1;
     cudaGetDevice(&id);
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     std::lock_guard<std::mutex> lock(*view.lock);
     auto &bigBuffers = *view.bigBuffers;
-    auto state = FastllmCudaCheckedMalloc(&ret, size, __FILE__, __LINE__);
+    auto state = FastllmCudaCheckedMallocWithIdlePoolRetry(&ret, size, id, view, __FILE__, __LINE__);
     if (cudaSuccess != state) {
         printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
         checkCudaErrors("", state);
@@ -2764,7 +3917,7 @@ void FastllmCudaClearBigBuffer() {
         long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用  
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy) {
+            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
             }
         }
@@ -2778,7 +3931,10 @@ void FastllmCudaClearBigBuffer() {
             littleMemIds.insert(v[i].second);
         }
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (!bigBuffers[i].busy && littleMemIds.find(i) == littleMemIds.end()) {
+            if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
+                littleMemIds.find(i) == littleMemIds.end() &&
+                !FastllmCudaGraphPoolPointerProtectedLocked(
+                    bigBuffers[i].data)) {
                 state = cudaSetDevice(view.device);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state)
@@ -2819,6 +3975,24 @@ void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
     checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
     //cudaDeviceSynchronize();
+}
+
+bool FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(
+        void *dst, const void *src, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
+                           cudaStreamPerThread) == cudaSuccess;
+}
+
+bool FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+        void *dst, const void *src, size_t size) {
+    if (size == 0 || dst == src) {
+        return true;
+    }
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
+                           cudaStreamPerThread) == cudaSuccess;
 }
 
 void *FastllmCudaHostMalloc(size_t size) {
@@ -2874,12 +4048,41 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
     if (size == 0 || dst == src) {
         return;
     }
+    if (dst == nullptr || src == nullptr) {
+        char buffer[512];
+        snprintf(buffer, sizeof(buffer),
+                 "Error: CUDA copy Between GPUs got null pointer. dstId = %d, srcId = %d, dst = %p, src = %p, size = %lu.\n",
+                 dstId, srcId, dst, src, size);
+        fastllm::ErrorInFastLLM(std::string(buffer));
+        return;
+    }
     int oriId = FastllmCudaGetDevice();
     int canPeerAccess = 0;
     cudaError_t state = cudaDeviceCanAccessPeer(&canPeerAccess, dstId, srcId);
     if (state != cudaSuccess) {
         cudaGetLastError();
         canPeerAccess = 0;
+    }
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    cudaError_t switchState = cudaSetDevice(dstId);
+    if (switchState == cudaSuccess) {
+        cudaError_t captureState = cudaStreamIsCapturing(cudaStreamPerThread, &captureStatus);
+        if (captureState != cudaSuccess) {
+            cudaGetLastError();
+            captureStatus = cudaStreamCaptureStatusNone;
+        }
+    }
+    cudaSetDevice(oriId);
+
+    if (captureStatus != cudaStreamCaptureStatusNone) {
+        // Record a send node on the source graph and a matching receive node on
+        // the destination graph.  Unlike a destination-side peer-read kernel,
+        // this dependency is generation-safe across repeated graph replays.
+        if (!FastllmNcclGraphPeerCopy(dstId, dst, srcId, src, size)) {
+            FastllmCudaSetThreadError();
+        }
+        cudaSetDevice(oriId);
+        return;
     }
     const char *failedStage = "cudaMemcpyPeer";
     if (canPeerAccess) {
@@ -2921,6 +4124,19 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         DeviceSync();
     }
     FastllmCudaSetDevice(oriId);
+}
+
+bool FastllmCudaMemcpyPeerAsyncCurrentThread(
+        int dstId, void *dst, int srcId, const void *src, size_t size) {
+    if (size == 0 || (dstId == srcId && dst == src)) {
+        return true;
+    }
+    if (dstId == srcId) {
+        return FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+            dst, src, size);
+    }
+    return cudaMemcpyPeerAsync(dst, dstId, src, srcId, size,
+                               cudaStreamPerThread) == cudaSuccess;
 }
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
@@ -3800,6 +5016,55 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+static bool LaunchFastllmRMSNormFloat16(
+        const half *input, const float *weight, half *output,
+        int outer, int channels, float eps, int threadCount) {
+    if (channels == 128 && threadCount == 32) {
+        FastllmRMSNormHalf128ExactKernel<<<outer, 32>>>(
+            input, weight, output, eps);
+        return true;
+    }
+    if (threadCount != 0) {
+        return false;
+    }
+    if (channels < 512) {
+        FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
+            (half*)input, (float*)weight, output, outer, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormKernelInner1<512><<<outer, 512>>>(
+            (half*)input, (float*)weight, output, outer, channels, eps);
+    } else {
+        FastllmRMSNormKernelInner1<1024><<<outer, 1024>>>(
+            (half*)input, (float*)weight, output, outer, channels, eps);
+    }
+    return true;
+}
+
+bool FastllmCudaRMSNormFloat16WithThreadCount(
+        const fastllm::Data &input, fastllm::Data &weight,
+        fastllm::Data &output, float eps, int threadCount) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA ||
+        input.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        input.dims.empty() || input.dims != output.dims ||
+        input.strides.empty() || output.strides.empty() ||
+        input.strides.back() != 1 || output.strides.back() != 1 ||
+        weight.dims.size() != 1 || weight.dims[0] != input.dims.back() ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        weight.cudaData == nullptr) {
+        return false;
+    }
+    int axis = (int)input.dims.size() - 1;
+    int outer = input.Count(0) / input.Count(axis);
+    int channels = input.dims[axis];
+    return LaunchFastllmRMSNormFloat16(
+        (const half*)input.cudaData, (const float*)weight.cudaData,
+        (half*)output.cudaData, outer, channels, eps, threadCount);
+}
+
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
@@ -3824,16 +5089,9 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
                                                                  channels, eps);
         }
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        if (channels < 512) {
-            FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                             channels, eps);
-        } else if (channels < 4096) {
-            FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                               channels, eps);
-        } else {
-            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                                 channels, eps);
-        }
+        LaunchFastllmRMSNormFloat16(
+            (half*)cudaInput, (float*)weight.cudaData, (half*)cudaOutput,
+            outer, channels, eps, channels == 128 ? 32 : 0);
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
         if (channels < 512) {
             FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
@@ -3951,8 +5209,94 @@ __global__ void FastllmRMSNormSiluMulHalfKernel(const half *input, const float *
     }
 }
 
-bool FastllmCudaRMSNormSiluMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
-                                      const fastllm::Data &gateInput, fastllm::Data &output, float eps) {
+// Apply the same exact two-reduction mapping to the fused recurrent gate path,
+// while keeping both input and gate values in registers for in-place safety.
+__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128ExactKernel(
+        const half *input, const float *weight, const half *gateInput,
+        half *output, float eps) {
+    constexpr int CHANNELS = 128;
+    int row = blockIdx.x;
+    int lane = threadIdx.x;
+    input += (size_t)row * CHANNELS;
+    gateInput += (size_t)row * CHANNELS;
+    output += (size_t)row * CHANNELS;
+    const half2 *input2 = reinterpret_cast<const half2 *>(input);
+    const half2 *gate2 = reinterpret_cast<const half2 *>(gateInput);
+
+    float2 value0 = __half22float2(input2[lane]);
+    float2 value1 = __half22float2(input2[lane + 32]);
+    float sum0 = value0.x * value0.x + value0.y * value0.y;
+    float sum1 = value1.x * value1.x + value1.y * value1.y;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    }
+    float scale = 0.0f;
+    if (lane == 0) {
+        scale = rsqrtf((sum0 + sum1) / CHANNELS + eps);
+    }
+    scale = __shfl_sync(0xffffffffu, scale, 0);
+
+    float2 inputValues[2] = {value0, value1};
+    half2 gateValues[2] = {gate2[lane], gate2[lane + 32]};
+    half2 *output2 = reinterpret_cast<half2 *>(output);
+#pragma unroll
+    for (int part = 0; part < 2; part++) {
+        int index = lane + part * 32;
+        float2 value = inputValues[part];
+        half gate0In = __low2half(gateValues[part]);
+        half gate1In = __high2half(gateValues[part]);
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 = __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 = __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 = __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 = __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+        half rms0 = __float2half_rn(value.x * scale * __ldg(weight + index * 2));
+        half rms1 = __float2half_rn(value.y * scale * __ldg(weight + index * 2 + 1));
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 = __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 = __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output2[index] = __halves2half2(out0, out1);
+    }
+}
+
+static bool LaunchFastllmRMSNormSiluMulFloat16(
+        const half *input, const float *weight, const half *gateInput,
+        half *output, int outer, int channels, float eps, int threadCount) {
+    if (channels == 128 && threadCount == 32) {
+        FastllmRMSNormSiluMulHalf128ExactKernel<<<outer, 32>>>(
+            input, weight, gateInput, output, eps);
+        return true;
+    }
+    if (threadCount != 0) {
+        return false;
+    }
+    if (channels < 512) {
+        FastllmRMSNormSiluMulHalfKernel<64><<<outer, 64>>>(
+            input, weight, gateInput, output, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormSiluMulHalfKernel<512><<<outer, 512>>>(
+            input, weight, gateInput, output, channels, eps);
+    } else {
+        FastllmRMSNormSiluMulHalfKernel<1024><<<outer, 1024>>>(
+            input, weight, gateInput, output, channels, eps);
+    }
+    return true;
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &gateInput, fastllm::Data &output,
+        float eps, int threadCount) {
     if (input.dataDevice != fastllm::DataDevice::CUDA || gateInput.dataDevice != fastllm::DataDevice::CUDA ||
         output.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA) {
         return false;
@@ -3975,15 +5319,21 @@ bool FastllmCudaRMSNormSiluMulFloat16(const fastllm::Data &input, fastllm::Data 
     const half *cudaGateInput = (const half *) gateInput.cudaData;
     half *cudaOutput = (half *) output.cudaData;
 
-    if (channels < 512) {
-        FastllmRMSNormSiluMulHalfKernel<64><<<outer, 64>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
-    } else if (channels < 4096) {
-        FastllmRMSNormSiluMulHalfKernel<512><<<outer, 512>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
-    } else {
-        FastllmRMSNormSiluMulHalfKernel<1024><<<outer, 1024>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
+    if (!LaunchFastllmRMSNormSiluMulFloat16(
+            cudaInput, cudaWeight, cudaGateInput, cudaOutput,
+            outer, channels, eps, threadCount)) {
+        return false;
     }
     checkCudaErrors("Error: CUDA error in FastllmCudaRMSNormSiluMulFloat16.", cudaGetLastError());
     return true;
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &gateInput, fastllm::Data &output, float eps) {
+    return FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
+        input, weight, gateInput, output, eps,
+        !input.dims.empty() && input.dims.back() == 128 ? 32 : 0);
 }
 
 template <int THREAD_PER_BLOCK>
@@ -4585,6 +5935,393 @@ bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk
     return true;
 }
 
+__device__ __forceinline__ float FastllmRouterLogitToFloat(float value) {
+    return value;
+}
+
+__device__ __forceinline__ float FastllmRouterLogitToFloat(half value) {
+    return __half2float(value);
+}
+
+__device__ __forceinline__ float FastllmRouterLogitToFloat(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+struct FastllmRouterCandidate {
+    float key;
+    int id;
+};
+
+__device__ __forceinline__ bool FastllmRouterCandidateBetter(
+        const FastllmRouterCandidate &a, const FastllmRouterCandidate &b) {
+    if (a.id < 0) {
+        return false;
+    }
+    if (b.id < 0) {
+        return true;
+    }
+    return a.key != b.key ? a.key > b.key : a.id < b.id;
+}
+
+__device__ __forceinline__ void FastllmRouterCandidateCompareSwap(
+        FastllmRouterCandidate &a, FastllmRouterCandidate &b) {
+    if (FastllmRouterCandidateBetter(b, a)) {
+        FastllmRouterCandidate temp = a;
+        a = b;
+        b = temp;
+    }
+}
+
+// Qwen3.5 batch-1 decode specialization. The router has exactly 256 experts and
+// selects top-8. Softmax probabilities are kept in shared memory, so the
+// intermediate FP32 tensor never reaches global memory. Ranking deliberately
+// uses probability + correction bias while output scores use the unbiased
+// probabilities, matching SelectExpert's existing semantics.
+template <typename T>
+__global__ void FastllmFusedSoftmaxSelectExpert256Top8Kernel(
+        const T *logits, const float *bias, int32_t *index, float *score,
+        int tokens, int hasBias, int needNorm, float routeScale) {
+    constexpr int THREADS = 64;
+    constexpr int EXPERTS = 256;
+    constexpr int TOPK = 8;
+    constexpr int CANDIDATES = TOPK + 1;
+    constexpr float NEG_INF = -1.0e30f;
+
+    __shared__ float reduceData[THREADS];
+    __shared__ float probabilities[EXPERTS];
+    __shared__ float maxValue;
+    __shared__ float sumValue;
+    __shared__ float selectKeys[THREADS][TOPK];
+    __shared__ float selectIds[THREADS][TOPK];
+    __shared__ float warpTopKeys[2][CANDIDATES];
+    __shared__ int warpTopIds[2][CANDIDATES];
+    __shared__ float standardTopKeys[CANDIDATES];
+    __shared__ int standardTopIds[CANDIDATES];
+    __shared__ int useLegacyMerge;
+
+    int token = blockIdx.x;
+    if (token >= tokens) {
+        return;
+    }
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    const T *tokenLogits = logits + (size_t)token * EXPERTS;
+
+    // Use all 256 threads for the expensive exponential while preserving the
+    // old 64-thread softmax reduction tree exactly.  Each of the first 64
+    // threads still combines experts tid + {0, 64, 128, 192} in the original
+    // order, so scores and close correction-bias boundaries remain unchanged.
+    probabilities[tid] = FastllmRouterLogitToFloat(tokenLogits[tid]);
+    __syncthreads();
+
+    float localMax = NEG_INF;
+    if (tid < THREADS) {
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = tid + part * THREADS;
+            localMax = fmaxf(localMax, probabilities[expert]);
+        }
+        reduceData[tid] = localMax;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float reducedMax = fmaxf(localMax, reduceData[lane + 32]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, reducedMax, offset);
+            if (lane < offset) {
+                reducedMax = fmaxf(reducedMax, other);
+            }
+        }
+        if (lane == 0) {
+            maxValue = reducedMax;
+        }
+    }
+    __syncthreads();
+
+    probabilities[tid] = expf(probabilities[tid] - maxValue);
+    __syncthreads();
+
+    float localSum = 0.0f;
+    if (tid < THREADS) {
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            localSum += probabilities[tid + part * THREADS];
+        }
+        reduceData[tid] = localSum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float reducedSum = localSum + reduceData[lane + 32];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffffu, reducedSum, offset);
+            if (lane < offset) {
+                reducedSum += other;
+            }
+        }
+        if (lane == 0) {
+            sumValue = fabsf(reducedSum) < 1.0e-6f ? 1.0e-4f : reducedSum;
+        }
+    }
+    __syncthreads();
+
+    probabilities[tid] /= sumValue;
+    __syncthreads();
+
+    FastllmRouterCandidate local[4];
+    if (tid < THREADS) {
+#pragma unroll
+        for (int part = 0; part < 4; part++) {
+            int expert = tid + part * THREADS;
+            local[part].key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+            local[part].id = expert;
+        }
+
+        FastllmRouterCandidateCompareSwap(local[0], local[1]);
+        FastllmRouterCandidateCompareSwap(local[2], local[3]);
+        FastllmRouterCandidateCompareSwap(local[0], local[2]);
+        FastllmRouterCandidateCompareSwap(local[1], local[3]);
+        FastllmRouterCandidateCompareSwap(local[1], local[2]);
+
+        unsigned int warpMask = 0xffffffffu;
+        int cursor = 0;
+#pragma unroll
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate best = cursor < 4 ?
+                local[cursor] : FastllmRouterCandidate{NEG_INF, -1};
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                FastllmRouterCandidate other;
+                other.key = __shfl_down_sync(warpMask, best.key, offset);
+                other.id = __shfl_down_sync(warpMask, best.id, offset);
+                if (lane + offset < 32 && FastllmRouterCandidateBetter(other, best)) {
+                    best = other;
+                }
+            }
+            int winner = __shfl_sync(warpMask, best.id, 0);
+            if (lane == 0) {
+                warpTopKeys[warp][rank] = best.key;
+                warpTopIds[warp][rank] = best.id;
+            }
+            if (cursor < 4 && local[cursor].id == winner) {
+                cursor++;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int positions[2] = {0, 0};
+#pragma unroll
+        for (int rank = 0; rank < CANDIDATES; rank++) {
+            FastllmRouterCandidate first = positions[0] < CANDIDATES ?
+                FastllmRouterCandidate{warpTopKeys[0][positions[0]], warpTopIds[0][positions[0]]} :
+                FastllmRouterCandidate{NEG_INF, -1};
+            FastllmRouterCandidate second = positions[1] < CANDIDATES ?
+                FastllmRouterCandidate{warpTopKeys[1][positions[1]], warpTopIds[1][positions[1]]} :
+                FastllmRouterCandidate{NEG_INF, -1};
+            bool takeFirst = FastllmRouterCandidateBetter(first, second);
+            FastllmRouterCandidate chosen = takeFirst ? first : second;
+            positions[takeFirst ? 0 : 1]++;
+            standardTopKeys[rank] = chosen.key;
+            standardTopIds[rank] = chosen.id;
+        }
+
+        bool ambiguous = false;
+#pragma unroll
+        for (int i = 1; i < TOPK; i++) {
+#pragma unroll
+            for (int j = 0; j < i; j++) {
+                ambiguous |= standardTopKeys[i] == standardTopKeys[j];
+            }
+        }
+        useLegacyMerge = ambiguous || standardTopKeys[TOPK] == standardTopKeys[TOPK - 1];
+    }
+    __syncthreads();
+
+    if (useLegacyMerge) {
+        if (tid < THREADS) {
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                selectKeys[tid][rank] = -1.0e100;
+                selectIds[tid][rank] = -1.0f;
+            }
+#pragma unroll
+            for (int part = 0; part < 4; part++) {
+                int expert = tid + part * THREADS;
+                float key = probabilities[expert] + (hasBias ? bias[expert] : 0.0f);
+#pragma unroll
+                for (int rank = 0; rank < TOPK; rank++) {
+                    if (key > selectKeys[tid][rank]) {
+#pragma unroll
+                        for (int shift = TOPK - 1; shift > rank; shift--) {
+                            selectKeys[tid][shift] = selectKeys[tid][shift - 1];
+                            selectIds[tid][shift] = selectIds[tid][shift - 1];
+                        }
+                        selectKeys[tid][rank] = key;
+                        selectIds[tid][rank] = (float)expert;
+                        break;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (tid < 32) {
+            int pos0 = 0;
+            int pos1 = 0;
+            while (pos0 + pos1 < TOPK) {
+                if (selectKeys[tid][pos0] > selectKeys[tid + 32][pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            for (int pos = TOPK - 1; pos >= 0; pos--) {
+                if (pos1 < 0 ||
+                    (pos0 >= 0 && selectKeys[tid][pos0] < selectKeys[tid + 32][pos1])) {
+                    selectKeys[tid][pos] = selectKeys[tid][pos0];
+                    selectIds[tid][pos] = selectIds[tid][pos0];
+                    pos0--;
+                } else {
+                    selectKeys[tid][pos] = selectKeys[tid + 32][pos1];
+                    selectIds[tid][pos] = selectIds[tid + 32][pos1];
+                    pos1--;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    int pos0 = 0;
+                    int pos1 = 0;
+                    while (pos0 + pos1 < TOPK) {
+                        if (selectKeys[tid][pos0] > selectKeys[tid + stride][pos1]) {
+                            pos0++;
+                        } else {
+                            pos1++;
+                        }
+                    }
+                    pos0--;
+                    pos1--;
+                    for (int pos = TOPK - 1; pos >= 0; pos--) {
+                        if (pos1 < 0 ||
+                            (pos0 >= 0 && selectKeys[tid][pos0] < selectKeys[tid + stride][pos1])) {
+                            selectKeys[tid][pos] = selectKeys[tid][pos0];
+                            selectIds[tid][pos] = selectIds[tid][pos0];
+                            pos0--;
+                        } else {
+                            selectKeys[tid][pos] = selectKeys[tid + stride][pos1];
+                            selectIds[tid][pos] = selectIds[tid + stride][pos1];
+                            pos1--;
+                        }
+                    }
+                }
+                __syncwarp(FULL_WARP_MASK);
+            }
+
+            if (lane == 0) {
+                float selectedSum = 1.0f;
+                if (needNorm) {
+                    selectedSum = 0.0f;
+#pragma unroll
+                    for (int rank = 0; rank < TOPK; rank++) {
+                        selectedSum += probabilities[(int)selectIds[0][rank]];
+                    }
+                }
+                int32_t *tokenIndex = index + (size_t)token * TOPK;
+                float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+                for (int rank = 0; rank < TOPK; rank++) {
+                    int expert = (int)selectIds[0][rank];
+                    tokenIndex[rank] = expert;
+                    tokenScore[rank] = probabilities[expert] / selectedSum * routeScale;
+                }
+            }
+        }
+    } else if (tid == 0) {
+        float selectedSum = 1.0f;
+        if (needNorm) {
+            selectedSum = 0.0f;
+#pragma unroll
+            for (int rank = 0; rank < TOPK; rank++) {
+                selectedSum += probabilities[standardTopIds[rank]];
+            }
+        }
+        int32_t *tokenIndex = index + (size_t)token * TOPK;
+        float *tokenScore = score + (size_t)token * TOPK;
+#pragma unroll
+        for (int rank = 0; rank < TOPK; rank++) {
+            int expert = standardTopIds[rank];
+            tokenIndex[rank] = expert;
+            tokenScore[rank] = probabilities[expert] / selectedSum * routeScale;
+        }
+    }
+}
+
+bool FastllmCudaFusedSoftmaxSelectExpert(
+        const fastllm::Data &logits, const fastllm::Data *gateBias,
+        fastllm::Data &index, fastllm::Data &score,
+        int topk, bool needNorm, float routeScale) {
+    if (topk != 8 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
+        (logits.dataType != fastllm::DataType::FLOAT16 &&
+         logits.dataType != fastllm::DataType::BFLOAT16 &&
+         logits.dataType != fastllm::DataType::FLOAT32)) {
+        return false;
+    }
+    bool hasBias = gateBias != nullptr && !gateBias->dims.empty();
+    if (hasBias && (gateBias->dataType != fastllm::DataType::FLOAT32 || gateBias->Count(0) != 256)) {
+        return false;
+    }
+
+    const void *cudaLogits = FastllmCudaPrepareInput(logits);
+    const float *cudaBias = hasBias ? (const float*)FastllmCudaPrepareInput(*gateBias) : nullptr;
+    int32_t *cudaIndex = (int32_t*)FastllmCudaPrepareOutput(index);
+    float *cudaScore = (float*)FastllmCudaPrepareOutput(score);
+    if (cudaLogits == nullptr || cudaIndex == nullptr || cudaScore == nullptr || (hasBias && cudaBias == nullptr)) {
+        FastllmCudaFinishInput(logits, (void*)cudaLogits);
+        if (hasBias) {
+            FastllmCudaFinishInput(*gateBias, (void*)cudaBias);
+        }
+        return false;
+    }
+
+    int tokens = logits.Count(0) / 256;
+    if (logits.dataType == fastllm::DataType::FLOAT16) {
+        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
+            (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+            tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+    } else if (logits.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
+            (const __nv_bfloat16*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+            tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+    } else {
+        FastllmFusedSoftmaxSelectExpert256Top8Kernel<<<tokens, 256>>>(
+            (const float*)cudaLogits, cudaBias, cudaIndex, cudaScore,
+            tokens, hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+    }
+
+    cudaError_t state = cudaGetLastError();
+    bool success = state == cudaSuccess;
+    if (!success) {
+        checkCudaErrors("Error: fused softmax SelectExpert launch failed!", state);
+    }
+    FastllmCudaFinishInput(logits, (void*)cudaLogits);
+    if (hasBias) {
+        FastllmCudaFinishInput(*gateBias, (void*)cudaBias);
+    }
+    FastllmCudaFinishOutput(index, cudaIndex);
+    FastllmCudaFinishOutput(score, cudaScore);
+    return success;
+}
+
 // CUDA kernel for SelectExpert
 template <int THREAD_PER_BLOCK, int MAXK>
 __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *index, float *score, 
@@ -4763,6 +6500,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     size_t tempBytes = (size_t)len * input.unitSize;
     bool permuteFastPath =
         axis == std::vector <int> {1, 0, 2} ||
+        axis == std::vector <int> {0, 2, 1} ||
         axis == std::vector <int> {2, 0, 1, 3} ||
         axis == std::vector <int> {1, 2, 0, 3} ||
         (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1);
@@ -4804,6 +6542,18 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
+    } else if (axis == std::vector <int> {0, 2, 1}) {
+        int batch = input.dims[0];
+        int n = input.dims[1];
+        int m = input.dims[2];
+        if (!FastllmLaunchTransposeLastTwo(
+                input.cudaData, tempData, batch, n, m,
+                input.unitSize, 0)) {
+            FastllmTransposeLastTwoByBatchKernel<256><<<batch * n * m, 256>>>(
+                (uint8_t*)input.cudaData, (uint8_t*)tempData,
+                batch, n, m, input.unitSize);
+        }
+        input.Resize(new_dims);
     } else if (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1) {
         int n = input.dims[1];
         int m = input.dims[2];
@@ -4844,6 +6594,43 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     DeviceSync();
     FastllmReleaseCudaTempBuffer(tempData, tempOwn);
     return true;
+}
+
+bool FastllmCudaPermuteTo(const fastllm::Data &input, fastllm::Data &output,
+                          const std::vector<int> &axis) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA ||
+        input.cudaData == nullptr || output.cudaData == nullptr ||
+        axis.size() != input.dims.size() ||
+        input.dataType != output.dataType ||
+        input.Count(0) != output.Count(0)) {
+        return false;
+    }
+
+    if (axis == std::vector<int>{0, 2, 1} && input.dims.size() == 3) {
+        int batch = input.dims[0];
+        int n = input.dims[1];
+        int m = input.dims[2];
+        if (!FastllmLaunchTransposeLastTwo(
+                output.cudaData, input.cudaData, batch, n, m,
+                input.unitSize, cudaStreamPerThread)) {
+            return false;
+        }
+    } else if (axis == std::vector<int>{0, 2, 1, 3} &&
+               input.dims.size() == 4) {
+        int batch = input.dims[0];
+        int n = input.dims[1];
+        int m = input.dims[2];
+        int rowBytes = input.dims[3] * input.unitSize;
+        FastllmTransposeLastTwoByBatchKernel<256><<<batch * n * m, 256,
+                                                   0, cudaStreamPerThread>>>(
+            (uint8_t*)output.cudaData, (const uint8_t*)input.cudaData,
+            batch, n, m, rowBytes);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmFloatToHalf(void *a, void *b, int len) {
@@ -4904,16 +6691,10 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
         half *weightData = (half *) weight.cudaData;
         FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
     } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
-        std::vector <float> cpuInputData = std::vector <float> (inputLen, 0.0f);
-        FastllmCudaCopyFromDeviceToHost(cpuInputData.data(), inputData, cpuInputData.size() * sizeof(float));
         float *outputData = (float *) dstOutputData;
-        uint16_t *weightData = (uint16_t *) weight.cudaData;
-        for (int i = 0; i < inputLen; i++) {
-            int token = (int) (cpuInputData[i] + 1e-9);
-            for (int j = 0; j < embSize; j++) {
-                FastllmBF16ToFloat(outputData + i * embSize, weightData + token * embSize, embSize);
-            }
-        }
+        __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
+        FastllmCudaBFloat16EmbeddingToFloatKernel<128><<<inputLen, 128>>>(
+            inputData, weightData, outputData, embSize);
     } else {
         
     }
@@ -4955,7 +6736,7 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     float beta = 0;
     auto fastllmCublasHandle = getFastllmCublasHandle();
-    cublasStatus_t status;
+    cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
 
     if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT32) {
         status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -4975,21 +6756,70 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
                 &h_beta,
                 (half*)cudaOutput, k, k * n, batch);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
-        half *tempInput0 = (half*)FastllmCudaMalloc(input0.Count(0) * sizeof(half));
-        half *tempOutput = (half*)FastllmCudaMalloc(output.Count(0) * sizeof(half));
-        FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
+        auto runHalfGemm = [&]() {
+            size_t tempInput0Bytes = input0.Count(0) * sizeof(half);
+            size_t tempOutputBytes = output.Count(0) * sizeof(half);
+            size_t tempInput0AlignedBytes = FastllmCudaAlignBytes(tempInput0Bytes, 256);
+            size_t needBytes = tempInput0AlignedBytes + tempOutputBytes;
+            size_t workspaceBytes = 0;
+            bool workspaceOwn = false;
+            uint8_t *workspace = (uint8_t*)FastllmBorrowCudaTempBuffer(needBytes, &workspaceBytes, &workspaceOwn);
+            bool useWorkspace = workspace != nullptr && workspaceBytes >= needBytes;
+            half *tempInput0 = nullptr;
+            half *tempOutput = nullptr;
+            if (useWorkspace) {
+                tempInput0 = (half*)workspace;
+                tempOutput = (half*)(workspace + tempInput0AlignedBytes);
+            } else {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+                tempInput0 = (half*)FastllmCudaMalloc(tempInput0Bytes);
+                tempOutput = (half*)FastllmCudaMalloc(tempOutputBytes);
+                if (tempInput0 == nullptr || tempOutput == nullptr) {
+                    FastllmCudaFree(tempInput0);
+                    FastllmCudaFree(tempOutput);
+                    return CUBLAS_STATUS_ALLOC_FAILED;
+                }
+            }
+            FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
 
-        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
-        status = cublasHgemmStridedBatched(fastllmCublasHandle,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                k, n, m, &h_alpha,
-                (half*)cudaInput1, input1Stride, input1Spatial,
-                (half*)tempInput0, input0Stride, input0Spatial,
-                &h_beta,
-                (half*)tempOutput, k, k * n, batch);
-        FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
-        FastllmCudaFree(tempInput0);
-        FastllmCudaFree(tempOutput);
+            half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+            cublasStatus_t halfStatus = cublasHgemmStridedBatched(fastllmCublasHandle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    k, n, m, &h_alpha,
+                    (half*)cudaInput1, input1Stride, input1Spatial,
+                    (half*)tempInput0, input0Stride, input0Spatial,
+                    &h_beta,
+                    (half*)tempOutput, k, k * n, batch);
+            if (halfStatus == CUBLAS_STATUS_SUCCESS) {
+                FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+            }
+            if (useWorkspace) {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+            } else {
+                FastllmCudaFree(tempInput0);
+                FastllmCudaFree(tempOutput);
+            }
+            return halfStatus;
+        };
+
+        size_t tempInput1Bytes = input1.Count(0) * sizeof(float);
+        size_t workspaceBytes = 0;
+        bool workspaceOwn = false;
+        float *tempInput1 = (float*)FastllmBorrowCudaTempBuffer(tempInput1Bytes, &workspaceBytes, &workspaceOwn);
+        if (tempInput1 != nullptr && workspaceBytes >= tempInput1Bytes) {
+            FastllmHalfToFloat(cudaInput1, tempInput1, input1.Count(0));
+            status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    k, n, m, &alpha,
+                    tempInput1, input1Stride, input1Spatial,
+                    cudaInput0, input0Stride, input0Spatial,
+                    &beta,
+                    cudaOutput, k, k * n, batch);
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+        } else {
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+            status = runHalfGemm();
+        }
     }
 
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -5015,7 +6845,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     float beta = 0;
     auto fastllmCublasHandle = getFastllmCublasHandle();
-    cublasStatus_t status;
+    cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
 
     if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT32) {
         status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -5035,21 +6865,70 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                         &h_beta,
                                         (half*)cudaOutput, k, k * n, batch);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
-        half *tempInput0 = (half*)FastllmCudaMalloc(input0.Count(0) * sizeof(half));
-        half *tempOutput = (half*)FastllmCudaMalloc(output.Count(0) * sizeof(half));
-        FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
+        auto runHalfGemm = [&]() {
+            size_t tempInput0Bytes = input0.Count(0) * sizeof(half);
+            size_t tempOutputBytes = output.Count(0) * sizeof(half);
+            size_t tempInput0AlignedBytes = FastllmCudaAlignBytes(tempInput0Bytes, 256);
+            size_t needBytes = tempInput0AlignedBytes + tempOutputBytes;
+            size_t workspaceBytes = 0;
+            bool workspaceOwn = false;
+            uint8_t *workspace = (uint8_t*)FastllmBorrowCudaTempBuffer(needBytes, &workspaceBytes, &workspaceOwn);
+            bool useWorkspace = workspace != nullptr && workspaceBytes >= needBytes;
+            half *tempInput0 = nullptr;
+            half *tempOutput = nullptr;
+            if (useWorkspace) {
+                tempInput0 = (half*)workspace;
+                tempOutput = (half*)(workspace + tempInput0AlignedBytes);
+            } else {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+                tempInput0 = (half*)FastllmCudaMalloc(tempInput0Bytes);
+                tempOutput = (half*)FastllmCudaMalloc(tempOutputBytes);
+                if (tempInput0 == nullptr || tempOutput == nullptr) {
+                    FastllmCudaFree(tempInput0);
+                    FastllmCudaFree(tempOutput);
+                    return CUBLAS_STATUS_ALLOC_FAILED;
+                }
+            }
+            FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
 
-        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
-        status = cublasHgemmStridedBatched(fastllmCublasHandle,
-                                        CUBLAS_OP_T, CUBLAS_OP_N,
-                                        k, n, m, &h_alpha,
-                                        (half*)cudaInput1, input1Stride, input1Spatial,
-                                        (half*)tempInput0, input0Stride, input0Spatial,
-                                        &h_beta,
-                                        (half*)tempOutput, k, k * n, batch);
-        FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
-        FastllmCudaFree(tempInput0);
-        FastllmCudaFree(tempOutput);
+            half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+            cublasStatus_t halfStatus = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                            CUBLAS_OP_T, CUBLAS_OP_N,
+                                            k, n, m, &h_alpha,
+                                            (half*)cudaInput1, input1Stride, input1Spatial,
+                                            (half*)tempInput0, input0Stride, input0Spatial,
+                                            &h_beta,
+                                            (half*)tempOutput, k, k * n, batch);
+            if (halfStatus == CUBLAS_STATUS_SUCCESS) {
+                FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+            }
+            if (useWorkspace) {
+                FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+            } else {
+                FastllmCudaFree(tempInput0);
+                FastllmCudaFree(tempOutput);
+            }
+            return halfStatus;
+        };
+
+        size_t tempInput1Bytes = input1.Count(0) * sizeof(float);
+        size_t workspaceBytes = 0;
+        bool workspaceOwn = false;
+        float *tempInput1 = (float*)FastllmBorrowCudaTempBuffer(tempInput1Bytes, &workspaceBytes, &workspaceOwn);
+        if (tempInput1 != nullptr && workspaceBytes >= tempInput1Bytes) {
+            FastllmHalfToFloat(cudaInput1, tempInput1, input1.Count(0));
+            status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                            CUBLAS_OP_T, CUBLAS_OP_N,
+                                            k, n, m, &alpha,
+                                            tempInput1, input1Stride, input1Spatial,
+                                            cudaInput0, input0Stride, input0Spatial,
+                                            &beta,
+                                            cudaOutput, k, k * n, batch);
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+        } else {
+            FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
+            status = runHalfGemm();
+        }
     }
 
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -7972,6 +9851,8 @@ void FastllmReduce(uint8_t *output, uint8_t* partOutput, int len, int threadNum,
         FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>> ((float*)output, (float*)partOutput, len, threadNum);
     } else if (dataType == fastllm::DataType::FLOAT16) {
         FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>> ((half*)output, (half*)partOutput, len, threadNum);
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>> ((__nv_bfloat16*)output, (__nv_bfloat16*)partOutput, len, threadNum);
     }
 }
 
@@ -8004,6 +9885,7 @@ int GetPointerDeviceId(void *ptr) {
         }
     } else {
         printf("Error: %s\n", cudaGetErrorString(err));
+        cudaGetLastError();
         return -1;
     }
 }
@@ -8028,6 +9910,14 @@ __global__ void FastllmCudaResetLogitsOfEOS(int batch, int stride, float *logits
 }
 void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector<int> res_lens, 
     const std::vector<int> eos_nums, const std::vector<int> eos_ids) {
+    int originalDevice = FastllmCudaGetDevice();
+    // Sampling logits may be a view whose dataDeviceIds is empty or stale.  The
+    // allocation itself is the authoritative source for the launch device.
+    int logitsDevice = GetPointerDeviceId(logits->cudaData);
+    if (logitsDevice < 0) {
+        logitsDevice = logits->dataDeviceIds.empty() ? originalDevice : logits->dataDeviceIds[0];
+    }
+    FastllmCudaSetDevice(logitsDevice);
     cudaError_t state = cudaSuccess;
     int *cuda_res_lens = (int*)FastllmCudaMalloc(sizeof(int) * res_lens.size());
     state = cudaMemcpyAsync(cuda_res_lens, res_lens.data(), sizeof(int) * res_lens.size(), cudaMemcpyHostToDevice, 0);
@@ -8040,6 +9930,7 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     FastllmCudaFree(cuda_res_lens);
     FastllmCudaFree(cuda_eos_nums);
     FastllmCudaFree(cuda_eos_ids);
+    FastllmCudaSetDevice(originalDevice);
     return;
 }
 
@@ -8055,6 +9946,18 @@ __global__ void FastllmCudaResetLogitsOfEOSAll(int total, int eos_num, int strid
 
 void FastllmResetLogitsOfEOSAll(int batch, fastllm::Data *logits, const std::vector<int> &eos_ids) {
     if (batch <= 0 || eos_ids.empty()) {
+        return;
+    }
+    int originalDevice = FastllmCudaGetDevice();
+    // Sampling logits may be a view whose dataDeviceIds is empty or stale.  The
+    // allocation itself is the authoritative source for the launch device.
+    int logitsDevice = GetPointerDeviceId(logits->cudaData);
+    if (logitsDevice < 0) {
+        logitsDevice = logits->dataDeviceIds.empty() ? originalDevice : logits->dataDeviceIds[0];
+    }
+    cudaError_t switchState = cudaSetDevice(logitsDevice);
+    checkCudaErrors("Error: CUDA error when switching to logits device!", switchState);
+    if (switchState != cudaSuccess) {
         return;
     }
     struct ResetEosAllCache {
@@ -8081,7 +9984,10 @@ void FastllmResetLogitsOfEOSAll(int batch, fastllm::Data *logits, const std::vec
     int total = batch * (int)eos_ids.size();
     FastllmCudaResetLogitsOfEOSAll <<< (total + 255) / 256, 256 >>> (
         total, (int)eos_ids.size(), logits->Count(0) / batch, (float*)logits->cudaData, cache.cuda_eos_ids);
-    checkCudaErrors("Error: CUDA error when reset logits of EOS all!", cudaGetLastError());
+    cudaError_t launchState = cudaGetLastError();
+    checkCudaErrors("Error: CUDA error when reset logits of EOS all!", launchState);
+    cudaError_t restoreState = cudaSetDevice(originalDevice);
+    checkCudaErrors("Error: CUDA error when restoring device after reset logits of EOS all!", restoreState);
 }
 
 template <typename T>
@@ -9190,7 +11096,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaHalfKernel(
     }
 }
 
-template <int TILE_V>
+template <int TILE_V, bool EXACT_NORM_128>
 __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel(
     half **last_recurrent_states,
     const half *convOutput,
@@ -9229,65 +11135,123 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
     float *scales = warp_k + 2;
     float *ba_values = scales + 2;
 
-    if (tid < 64) {
-        int norm_warp = tid >> 5;
-        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-        half2 qh = q_h2[tid];
-        half2 kh = k_h2[tid];
-        float2 qf = __half22float2(qh);
-        float2 kf = __half22float2(kh);
-        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
-        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
-            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
-        }
-        if (lane_id == 0) {
-            warp_q[norm_warp] = q_sum2;
-            warp_k[norm_warp] = k_sum2;
-        }
-    }
-    __syncthreads();
+    if constexpr (EXACT_NORM_128) {
+        // The legacy path reduces half2[0..31] and half2[32..63] in two
+        // independent warps, then adds the two warp sums.  One warp can keep
+        // those two reduction trees separate, preserve the exact final add,
+        // reuse the q/k loads, and eliminate two block-wide barriers.
+        if (warp_id == 0) {
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            float2 q0 = __half22float2(q_h2[lane_id]);
+            float2 q1 = __half22float2(q_h2[lane_id + 32]);
+            float2 k0 = __half22float2(k_h2[lane_id]);
+            float2 k1 = __half22float2(k_h2[lane_id + 32]);
+            float qSum0 = q0.x * q0.x + q0.y * q0.y;
+            float qSum1 = q1.x * q1.x + q1.y * q1.y;
+            float kSum0 = k0.x * k0.x + k0.y * k0.y;
+            float kSum1 = k1.x * k1.x + k1.y * k1.y;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                qSum0 += __shfl_down_sync(0xffffffffu, qSum0, offset);
+                qSum1 += __shfl_down_sync(0xffffffffu, qSum1, offset);
+                kSum0 += __shfl_down_sync(0xffffffffu, kSum0, offset);
+                kSum1 += __shfl_down_sync(0xffffffffu, kSum1, offset);
+            }
+            float qNormScale = 0.0f;
+            float kNormScale = 0.0f;
+            if (lane_id == 0) {
+                qNormScale = rsqrtf((qSum0 + qSum1) / 128.0f + eps);
+                kNormScale = rsqrtf((kSum0 + kSum1) / 128.0f + eps);
+            }
+            qNormScale = __shfl_sync(0xffffffffu, qNormScale, 0);
+            kNormScale = __shfl_sync(0xffffffffu, kNormScale, 0);
 
-    if (tid < 32) {
-        float q_val = tid < 2 ? warp_q[tid] : 0.0f;
-        float k_val = tid < 2 ? warp_k[tid] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
-            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+            int index0 = lane_id * 2;
+            int index1 = (lane_id + 32) * 2;
+            float w00 = __ldg(normWeight + index0);
+            float w01 = __ldg(normWeight + index0 + 1);
+            float w10 = __ldg(normWeight + index1);
+            float w11 = __ldg(normWeight + index1 + 1);
+            q_norm[index0] = q0.x * qNormScale * w00;
+            q_norm[index0 + 1] = q0.y * qNormScale * w01;
+            q_norm[index1] = q1.x * qNormScale * w10;
+            q_norm[index1 + 1] = q1.y * qNormScale * w11;
+            k_norm[index0] = k0.x * kNormScale * w00;
+            k_norm[index0 + 1] = k0.y * kNormScale * w01;
+            k_norm[index1] = k1.x * kNormScale * w10;
+            k_norm[index1 + 1] = k1.y * kNormScale * w11;
         }
+        if (tid == 32) {
+            const half *baRow = ba + (size_t)batch_idx * (numVHeads * 2);
+            float bRaw = __half2float(baRow[head_idx]);
+            float aRaw = __half2float(baRow[numVHeads + head_idx]);
+            float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
+            ba_values[0] = 1.0f / (1.0f + __expf(-bRaw));
+            ba_values[1] = __expf(gRaw);
+        }
+        __syncthreads();
+    } else {
+        if (tid < 64) {
+            int norm_warp = tid >> 5;
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[tid];
+            half2 kh = k_h2[tid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+            float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+                k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+            }
+            if (lane_id == 0) {
+                warp_q[norm_warp] = q_sum2;
+                warp_k[norm_warp] = k_sum2;
+            }
+        }
+        __syncthreads();
+
+        if (tid < 32) {
+            float q_val = tid < 2 ? warp_q[tid] : 0.0f;
+            float k_val = tid < 2 ? warp_k[tid] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+                k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+            }
+            if (tid == 0) {
+                scales[0] = rsqrtf(q_val / headKDim + eps);
+                scales[1] = rsqrtf(k_val / headKDim + eps);
+            }
+        }
+        __syncthreads();
+
+        if (tid < 64) {
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[tid];
+            half2 kh = k_h2[tid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float w0 = __ldg(&normWeight[tid * 2]);
+            float w1 = __ldg(&normWeight[tid * 2 + 1]);
+            q_norm[tid * 2] = qf.x * scales[0] * w0;
+            q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
+            k_norm[tid * 2] = kf.x * scales[1] * w0;
+            k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
+        }
+
         if (tid == 0) {
-            scales[0] = rsqrtf(q_val / headKDim + eps);
-            scales[1] = rsqrtf(k_val / headKDim + eps);
+            const half *baRow = ba + (size_t)batch_idx * (numVHeads * 2);
+            float bRaw = __half2float(baRow[head_idx]);
+            float aRaw = __half2float(baRow[numVHeads + head_idx]);
+            float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
+            ba_values[0] = 1.0f / (1.0f + __expf(-bRaw));
+            ba_values[1] = __expf(gRaw);
         }
+        __syncthreads();
     }
-    __syncthreads();
-
-    if (tid < 64) {
-        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-        half2 qh = q_h2[tid];
-        half2 kh = k_h2[tid];
-        float2 qf = __half22float2(qh);
-        float2 kf = __half22float2(kh);
-        float w0 = __ldg(&normWeight[tid * 2]);
-        float w1 = __ldg(&normWeight[tid * 2 + 1]);
-        q_norm[tid * 2] = qf.x * scales[0] * w0;
-        q_norm[tid * 2 + 1] = qf.y * scales[0] * w1;
-        k_norm[tid * 2] = kf.x * scales[1] * w0;
-        k_norm[tid * 2 + 1] = kf.y * scales[1] * w1;
-    }
-
-    if (tid == 0) {
-        const half *baRow = ba + (size_t)batch_idx * (numVHeads * 2);
-        float bRaw = __half2float(baRow[head_idx]);
-        float aRaw = __half2float(baRow[numVHeads + head_idx]);
-        float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
-        ba_values[0] = 1.0f / (1.0f + __expf(-bRaw));
-        ba_values[1] = __expf(gRaw);
-    }
-    __syncthreads();
 
     int v_col = v_base + warp_id;
     if (warp_id >= TILE_V || v_col >= headVDim) {
@@ -9323,6 +11287,38 @@ __global__ void FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpK
     if (lane_id == 0) {
         core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
     }
+}
+
+static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarp(
+    half **lastRecurrentStates, const half *convOutput, const half *ba,
+    const float *normWeight, const float *aLog, const float *dtBias,
+    half *coreAttnOut,
+    int batch, int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale,
+    half *statePool, const int *slotIds, int stateStride,
+    int tileV, bool exactNorm128) {
+    if (headKDim != 128 || tileV != 8) {
+        return false;
+    }
+    constexpr int tile = 8;
+    constexpr int threads = tile * 32;
+    size_t sharedBytes = (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 grid(batch, numVHeads, (headVDim + tile - 1) / tile);
+
+#define FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(TILE, EXACT) \
+    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<TILE, EXACT> \
+        <<<grid, threads, sharedBytes>>>( \
+            lastRecurrentStates, convOutput, ba, normWeight, aLog, dtBias, \
+            coreAttnOut, batch, numKHeads, numVHeads, headKDim, headVDim, \
+            eps, qScale, statePool, slotIds, stateStride)
+
+    if (exactNorm128) {
+        FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(8, true);
+    } else {
+        FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA(8, false);
+    }
+#undef FASTLLM_LAUNCH_RECURRENT_FROM_CONV_BA
+    return true;
 }
 
 template <int TILE_V>
@@ -9603,12 +11599,7 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
     core_attn_out.Resize({batch, numVHeads, 1, headVDim});
     core_attn_out.Allocate(false);
 
-    constexpr int tileV = 8;
-    int threadsPerBlock = tileV * 32;
-    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
-    dim3 gridDim(batch, numVHeads, (headVDim + tileV - 1) / tileV);
-
-    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+    LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarp(
         (half**)cudaStatePointers,
         (const half*)convOutput.cudaData,
         (const half*)ba.cudaData,
@@ -9617,19 +11608,21 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers(
         (const float*)dtBias.cudaData,
         (half*)core_attn_out.cudaData,
         batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        nullptr, nullptr, 0
+        nullptr, nullptr, 0, 8,
+        batch == 1 && numKHeads == 8 && numVHeads == 16 &&
+            headKDim == 128 && headVDim == 128
     );
 
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedDevicePointers.", cudaGetLastError());
     return true;
 }
 
-bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+static bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16Impl(
     fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
     fastllm::Data &aLog, fastllm::Data &dtBias,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
     int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale) {
+    float eps, float qScale, int tileV, bool exactNorm128) {
     if (convOutput.dataDevice != fastllm::DataDevice::CUDA ||
         ba.dataDevice != fastllm::DataDevice::CUDA ||
         normWeight.dataDevice != fastllm::DataDevice::CUDA ||
@@ -9670,12 +11663,7 @@ bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
     core_attn_out.Resize({1, numVHeads, 1, headVDim});
     core_attn_out.Allocate(false);
 
-    constexpr int tileV = 8;
-    int threadsPerBlock = tileV * 32;
-    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
-    dim3 gridDim(1, numVHeads, (headVDim + tileV - 1) / tileV);
-
-    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+    if (!LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarp(
         nullptr,
         (const half*)convOutput.cudaData,
         (const half*)ba.cudaData,
@@ -9684,11 +11672,40 @@ bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
         (const float*)dtBias.cudaData,
         (half*)core_attn_out.cudaData,
         1, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        (half*)last_recurrent_state.cudaData, nullptr, 0
-    );
+        (half*)last_recurrent_state.cudaData, nullptr, 0, tileV, exactNorm128)) {
+        return false;
+    }
 
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16.", cudaGetLastError());
     return true;
+}
+
+bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16WithConfig(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale, int tileV, bool exactNorm128) {
+    return FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16Impl(
+        convOutput, ba, normWeight, aLog, dtBias,
+        last_recurrent_state, core_attn_out,
+        numKHeads, numVHeads, headKDim, headVDim,
+        eps, qScale, tileV, exactNorm128);
+}
+
+bool FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale) {
+    return FastllmRecurrentGatedDeltaRuleFromConvBaTransposedFloat16Impl(
+        convOutput, ba, normWeight, aLog, dtBias,
+        last_recurrent_state, core_attn_out,
+        numKHeads, numVHeads, headKDim, headVDim,
+        eps, qScale, 8,
+        numKHeads == 8 && numVHeads == 16 &&
+            headKDim == 128 && headVDim == 128);
 }
 
 bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16(
@@ -10053,13 +12070,9 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
     core_attn_out.Resize({batch, numVHeads, 1, headVDim});
     core_attn_out.Allocate(false);
 
-    constexpr int tileV = 8;
-    int threadsPerBlock = tileV * 32;
-    size_t sharedMemSize = (2 * (size_t)headKDim + 8) * sizeof(float);
-    dim3 gridDim(batch, numVHeads, (headVDim + tileV - 1) / tileV);
     int stateStride = numVHeads * headVDim * headKDim;
 
-    FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
+    LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWarp(
         nullptr,
         (const half*)convOutput.cudaData,
         (const half*)ba.cudaData,
@@ -10068,7 +12081,9 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
         (const float*)dtBias.cudaData,
         (half*)core_attn_out.cudaData,
         batch, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        (half*)cudaStatePool, (const int*)cudaSlotIds, stateStride
+        (half*)cudaStatePool, (const int*)cudaSlotIds, stateStride, 8,
+        batch == 1 && numKHeads == 8 && numVHeads == 16 &&
+            headKDim == 128 && headVDim == 128
     );
 
     checkCudaErrors("Error: CUDA error in FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots.", cudaGetLastError());
