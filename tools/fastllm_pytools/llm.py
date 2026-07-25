@@ -1,4 +1,5 @@
 import ctypes
+import concurrent.futures
 import math
 import os
 import glob
@@ -12,6 +13,7 @@ import importlib.metadata as importlib_metadata
 import logging
 import site
 import sys
+from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
@@ -255,6 +257,61 @@ else:
         print("Load fastllm failed. (Try update glibc)")
         exit(0)
 
+_MODEL_LOAD_PROGRESS_CALLBACK_TYPE = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_char_p,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_model_load_progress_callback_ref = None
+_model_load_progress_handler = None
+
+if hasattr(fastllm_lib, "set_model_load_progress_callback"):
+    fastllm_lib.set_model_load_progress_callback.argtypes = [ctypes.c_void_p]
+    fastllm_lib.set_model_load_progress_callback.restype = None
+
+def _dispatch_model_load_progress(stage, current, total, completed_bytes, total_bytes):
+    handler = _model_load_progress_handler
+    if handler is None:
+        return
+    try:
+        handler(
+            stage.decode("utf-8", errors="replace") if stage else "",
+            int(current),
+            int(total),
+            int(completed_bytes),
+            int(total_bytes),
+        )
+    except Exception:
+        logging.exception("Model load progress callback failed")
+
+def set_model_load_progress_callback(callback):
+    global _model_load_progress_callback_ref
+    global _model_load_progress_handler
+
+    native_setter = getattr(fastllm_lib, "set_model_load_progress_callback", None)
+    if callback is None:
+        if native_setter is not None:
+            native_setter(None)
+        _model_load_progress_handler = None
+        _model_load_progress_callback_ref = None
+        return
+
+    _model_load_progress_handler = callback
+    _model_load_progress_callback_ref = _MODEL_LOAD_PROGRESS_CALLBACK_TYPE(
+        _dispatch_model_load_progress
+    )
+    if native_setter is not None:
+        native_setter(ctypes.cast(_model_load_progress_callback_ref, ctypes.c_void_p))
+
+def report_model_load_progress(stage, current = 0, total = 0,
+                               completed_bytes = 0, total_bytes = 0):
+    handler = _model_load_progress_handler
+    if handler is not None:
+        handler(stage, current, total, completed_bytes, total_bytes)
+
 fastllm_lib.has_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.has_device.restype = ctypes.c_bool
 
@@ -354,6 +411,15 @@ fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
 fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+
+fastllm_lib.get_max_batch_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_max_batch_llm_model.restype = ctypes.c_int
+
+fastllm_lib.set_max_context_length_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_max_context_length_llm_model.restype = ctypes.c_int
+
+fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
@@ -1077,7 +1143,14 @@ class model:
         else:
             if len(path) > 5 and path[-5:].lower() == ".gguf":
                 # GGUF 文件
-                self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
+                if ori_model_path and os.path.isdir(ori_model_path):
+                    report_model_load_progress("tokenizer", 0, 1)
+                    try:
+                        self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
+                    finally:
+                        report_model_load_progress("tokenizer", 1, 1)
+                else:
+                    self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
                 self.model = fastllm_lib.create_llm_model_from_gguf(path.encode(), ori_model_path.encode())
                 # 配置目录：优先用 ori_model_path（若存在且为目录），否则用 GGUF 文件所在目录
                 if ori_model_path and os.path.isdir(ori_model_path):
@@ -1091,7 +1164,11 @@ class model:
             elif os.path.isdir(path):
                 # HuggingFace 格式目录
                 if tokenizer_type != "fastllm":
-                    self.hf_tokenizer = try_load_hf_tokenizer(path)
+                    report_model_load_progress("tokenizer", 0, 1)
+                    try:
+                        self.hf_tokenizer = try_load_hf_tokenizer(path)
+                    finally:
+                        report_model_load_progress("tokenizer", 1, 1)
                     if chat_template != "":
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
@@ -1148,6 +1225,14 @@ class model:
 
         # 为了减少重复申请释放buffer对象而使用的线程局部存储区对象池
         self.thread_local_obj = threading.local()
+        self.text_input_token_cache_lock = threading.Lock()
+        self.text_input_token_cache = OrderedDict()
+        self.text_input_token_inflight = {}
+        try:
+            self.text_input_token_cache_limit = max(
+                0, int(os.getenv("FASTLLM_TEXT_TOKEN_CACHE_SIZE", "128")))
+        except ValueError:
+            self.text_input_token_cache_limit = 128
         #self.thread_local_obj.tokenizer_encode_string__output_buffer = None
         #self.thread_local_obj.tokenizer_decode_token__output_buffer = None
 
@@ -1496,7 +1581,7 @@ class model:
                     enable_thinking = enable_thinking,
                 )
                 return len(native_inputs["input_ids"])
-            if architecture == "Qwen3_5ForConditionalGeneration":
+            if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                 qwen_conversation = normalize_qwen35_conversation(
                     copy.deepcopy(conversation),
                     len(multimodal_images),
@@ -1543,18 +1628,81 @@ class model:
         except:
             architecture = ""
         if self._has_hf_chat_template():
-            input_ids = apply_hf_chat_template(self.hf_tokenizer,
-                                               self.trans_conversation(conversation),
-                                               add_generation_prompt = add_generation_prompt,
-                                               tokenize = True,
-                                               enable_thinking = enable_thinking)
+            template_conversation = self.trans_conversation(
+                copy.deepcopy(conversation))
+            cache_key = None
+            if self.text_input_token_cache_limit > 0:
+                try:
+                    cache_key = json.dumps(
+                        [template_conversation, add_generation_prompt,
+                         enable_thinking],
+                        ensure_ascii = False,
+                        sort_keys = True,
+                        separators = (",", ":"))
+                except (TypeError, ValueError):
+                    cache_key = None
+
+            owner = True
+            pending = None
+            input_ids = None
+            if cache_key is not None:
+                with self.text_input_token_cache_lock:
+                    cached = self.text_input_token_cache.get(cache_key)
+                    if cached is not None:
+                        self.text_input_token_cache.move_to_end(cache_key)
+                        input_ids = list(cached)
+                    else:
+                        pending = self.text_input_token_inflight.get(cache_key)
+                        if pending is None:
+                            pending = concurrent.futures.Future()
+                            self.text_input_token_inflight[cache_key] = pending
+                        else:
+                            owner = False
+
+            if input_ids is None and not owner:
+                input_ids = list(pending.result())
+            elif input_ids is None:
+                try:
+                    input_ids = apply_hf_chat_template(
+                        self.hf_tokenizer,
+                        template_conversation,
+                        add_generation_prompt = add_generation_prompt,
+                        tokenize = True,
+                        enable_thinking = enable_thinking)
+                except BaseException as error:
+                    if cache_key is not None:
+                        with self.text_input_token_cache_lock:
+                            self.text_input_token_inflight.pop(cache_key, None)
+                            pending.set_exception(error)
+                    raise
+                if cache_key is not None:
+                    cached_input_ids = tuple(input_ids)
+                    with self.text_input_token_cache_lock:
+                        self.text_input_token_cache[cache_key] = cached_input_ids
+                        self.text_input_token_cache.move_to_end(cache_key)
+                        while (len(self.text_input_token_cache) >
+                               self.text_input_token_cache_limit):
+                            self.text_input_token_cache.popitem(last = False)
+                        self.text_input_token_inflight.pop(cache_key, None)
+                        pending.set_result(cached_input_ids)
+            # The OpenAI server asks for the prompt token count immediately
+            # before launching the same request.  Keep that exact tokenization
+            # for the launch path instead of rendering and tokenizing the chat
+            # template a second time.  launch_stream_response validates and
+            # consumes this one-shot cache before using it.
+            self.thread_local_obj.pending_text_input_token_cache = {
+                "conversation": copy.deepcopy(template_conversation),
+                "add_generation_prompt": add_generation_prompt,
+                "enable_thinking": enable_thinking,
+                "input_ids": list(input_ids),
+            }
             return len(input_ids)
         else:
             if self._is_deepseek_v4() and not self.force_chat_template:
                 from ftllm.encoding_dsv4 import encode_messages
                 thinking_mode = "thinking" if enable_thinking else "chat"
                 prompt = encode_messages(conversation, thinking_mode=thinking_mode)
-            elif architecture == "Qwen3_5ForConditionalGeneration":
+            elif architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                 prompt = build_qwen35_prompt(
                     tokenizer = None,
                     conversation = copy.deepcopy(conversation),
@@ -1834,6 +1982,9 @@ class model:
                         tool_call_constraint: Optional[Dict[str, Any]] = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        pending_text_input_token_cache = getattr(
+            self.thread_local_obj, "pending_text_input_token_cache", None)
+        self.thread_local_obj.pending_text_input_token_cache = None
         self._apply_tool_call_constraint_to_native(tool_call_constraint)
         conversation = None
         if (isinstance(query, List)):
@@ -1928,7 +2079,7 @@ class model:
                     False, stop_token_len, stop_token_list
                 )
                 return handle
-            elif (architecture == "Qwen3_5ForConditionalGeneration"):
+            elif architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                 tokenizer = self.hf_tokenizer
                 qwen_conversation = None
                 if (conversation != None and len(conversation) != 0):
@@ -2028,7 +2179,16 @@ class model:
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
                 prompt = ""
-                if (conversation != None and len(conversation) != 0):
+                can_reuse_token_count = (
+                    conversation is not None and len(conversation) != 0 and
+                    not tools and not self.save_history and
+                    pending_text_input_token_cache is not None and
+                    pending_text_input_token_cache.get("conversation") == conversation and
+                    pending_text_input_token_cache.get("add_generation_prompt") == add_generation_prompt and
+                    pending_text_input_token_cache.get("enable_thinking") == enable_thinking)
+                if can_reuse_token_count:
+                    input = pending_text_input_token_cache["input_ids"]
+                elif (conversation != None and len(conversation) != 0):
                     prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
                                                     add_generation_prompt = add_generation_prompt,
                                                     tokenize = False,
@@ -2037,10 +2197,11 @@ class model:
                                                     thinking_alias = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
-                if (self.save_history):
-                    input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
-                else:
-                    input = encode_hf_prompt(tokenizer, prompt)
+                if not can_reuse_token_count:
+                    if (self.save_history):
+                        input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
+                    else:
+                        input = encode_hf_prompt(tokenizer, prompt)
                 #print("prompt", prompt[:100])
                 #print("input", input[:100])
 
@@ -2059,7 +2220,7 @@ class model:
             except:
                 architecture = ""
             if (conversation != None and len(conversation) != 0):
-                if architecture == "Qwen3_5ForConditionalGeneration":
+                if architecture in ("Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"):
                     prompt = build_qwen35_prompt(
                         tokenizer = None,
                         conversation = copy.deepcopy(conversation),
@@ -2424,6 +2585,18 @@ class model:
     
     def set_max_batch(self, batch: int):
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
+
+    def get_max_batch(self):
+        """Return the effective runtime batch limit after warmup."""
+        return fastllm_lib.get_max_batch_llm_model(self.model)
+
+    def set_max_context_length(self, length: int):
+        """限制单会话输入与输出合计的最大 token 数。"""
+        return fastllm_lib.set_max_context_length_llm_model(self.model, length)
+
+    def get_kv_cache_token_limit(self):
+        """返回所有并发会话共享的 KV Cache token 总容量。"""
+        return fastllm_lib.get_kv_cache_token_limit_llm_model(self.model)
 
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""

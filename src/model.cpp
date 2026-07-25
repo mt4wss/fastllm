@@ -336,7 +336,8 @@ namespace fastllm {
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
              model->model_type != "minimax_m2" &&
-             model->model_type != "deepseek_v4") ||
+             model->model_type != "deepseek_v4" &&
+             model->model_struct != "qwen3_5") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
             (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
@@ -1258,6 +1259,23 @@ namespace fastllm {
             return originalDataType;
         }
         return tensorDataType;
+    }
+
+    static bool ResolveAwqUnquantizedDataType(const std::string &sourceDataType,
+                                              DataType &dataType) {
+        if (dataType != DataType::DATA_AUTO_LINEAR && dataType != DataType::DATA_AUTO_CONV) {
+            return false;
+        }
+        if (sourceDataType == "F32") {
+            dataType = DataType::FLOAT32;
+        } else if (sourceDataType == "F16") {
+            dataType = DataType::FLOAT16;
+        } else if (sourceDataType == "BF16") {
+            dataType = DataType::BFLOAT16;
+        } else {
+            return false;
+        }
+        return true;
     }
 
     static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
@@ -2237,11 +2255,13 @@ namespace fastllm {
             }
 
             // 2. 读取分词
+            ReportModelLoadProgress("tokenizer", 0, 1);
             if (false) {
                 LoadLLMTokenizerFromHFToModel(path, model);
             } else {
                 DealLLMTokenizerFromHFToModel(path, model);
             }
+            ReportModelLoadProgress("tokenizer", 1, 1);
         } else {
             // Load params from gguf
             printf("general.architecture = %s\n", arch.c_str());
@@ -2349,13 +2369,23 @@ namespace fastllm {
                 printf("Load chatTemplate = %s\n", model->weight.tokenizer.chatTemplate.c_str());
             }
 
+            const auto &tokenItems = params["tokenizer.ggml.tokens"].array_items();
+            int tokenTotal = (int)tokenItems.size();
+            ReportModelLoadProgress("tokenizer", 0, std::max(1, tokenTotal));
             int idx = 0;
-            for (auto &it : params["tokenizer.ggml.tokens"].array_items()) {
+            for (auto &it : tokenItems) {
                 if (idx < 10) {
                     // printf("%s: %d\n", it.string_value().c_str(), idx);
                 }
                 model->weight.AddTokenizerWord(it.string_value(), idx, 1.0f);
                 idx++;
+                if (idx == tokenTotal ||
+                    idx * 100 / std::max(1, tokenTotal) != (idx - 1) * 100 / std::max(1, tokenTotal)) {
+                    ReportModelLoadProgress("tokenizer", idx, tokenTotal);
+                }
+            }
+            if (tokenTotal == 0) {
+                ReportModelLoadProgress("tokenizer", 1, 1);
             }
 
             model->weight.tokenizer.byteAsChar = true;
@@ -2375,9 +2405,11 @@ namespace fastllm {
         std::set <std::string> allWeightNames; // 所有创建了的weight name
         std::set <std::string> allFinishNames; // 转换好的weight name
 
+        ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
         }
+        uint64_t totalLoadBytes = 0;
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             std::string &weightName = readGGUFTasks[i].name;
             if (IsGGUFTaskBeyondMainLayers(weightName, ggufMainLayerCount)) {
@@ -2388,8 +2420,10 @@ namespace fastllm {
             model->weight.AddEmptyWeight(weightName, {1}, DataType::FLOAT32);
             readGGUFTasks[i].weight = &model->weight.weight[weightName];
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
+            totalLoadBytes += ggml_nbytes(&readGGUFTasks[i].tensor);
         }
         model->OnWeightsCreated(allWeightNames);
+        ReportModelLoadProgress("weights_prepare", 1, 1);
         std::stable_sort(tensors.begin(), tensors.end(),
                          [&](const std::string &a, const std::string &b) {
                              return model->GetWeightLoadPriority(a, {}) <
@@ -2400,6 +2434,12 @@ namespace fastllm {
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
         std::mutex locker;
         int cnt = 0;
+        uint64_t completedLoadBytes = 0;
+        ReportModelLoadProgress("weights_load", 0, std::max<size_t>(1, tensors.size()),
+                                0, totalLoadBytes);
+        if (tensors.empty()) {
+            ReportModelLoadProgress("weights_load", 1, 1);
+        }
 
         totalBytes = tensors.size();
         std::vector <std::pair <int, int> > parts;
@@ -2430,8 +2470,10 @@ namespace fastllm {
                 new std::thread([&](int st, int end) {
                     for (int i = st; i < end; i++) {
                         auto &weightName = tensors[i];
+                        uint64_t tensorBytes = 0;
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
+                            tensorBytes = ggml_nbytes(&task->tensor);
                             if (IsDiskMoeWeight(model, weightName) &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
@@ -2637,9 +2679,18 @@ namespace fastllm {
 
                         if (tensors.size() != 0) {
                             locker.lock();
-                            printf("Loading %d \r", (++cnt) * 100 / (int)tensors.size());
+                            int current = ++cnt;
+                            completedLoadBytes += tensorBytes;
+                            uint64_t currentBytes = completedLoadBytes;
+                            printf("Loading %d \r", current * 100 / (int)tensors.size());
                             fflush(stdout);
                             locker.unlock();
+                            if (current == (int)tensors.size() ||
+                                current * 100 / (int)tensors.size() !=
+                                    (current - 1) * 100 / (int)tensors.size()) {
+                                ReportModelLoadProgress("weights_load", current, tensors.size(),
+                                                        currentBytes, totalLoadBytes);
+                            }
                         }
                     }
                 }, parts[i].first, parts[i].second)
@@ -2760,6 +2811,7 @@ namespace fastllm {
                 if (linearDataType != DataType::INT4_GROUP || groupCnt != awqGroupCnt) {
                     printf("WARNING: It is recommended to use \"--dtype int4g%d\" for this AWQ models.\n", awqGroupCnt);
                 }
+                printf("[Fastllm] AWQ: keep unquantized floating-point tensors in source dtype.\n");
             }
         }
         basellm *model = CreateModelWithType(modelType);
@@ -2806,7 +2858,9 @@ namespace fastllm {
 
         // 3. 读取分词
         if (!skipTokenizer) {
+            ReportModelLoadProgress("tokenizer", 0, 1);
             LoadLLMTokenizerFromHFToModel(path, model);
+            ReportModelLoadProgress("tokenizer", 1, 1);
         } else {
             DealLLMTokenizerFromHFToModel(path, model);
         }
@@ -2821,15 +2875,41 @@ namespace fastllm {
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
 
-        // 如果有需要，为moe设置特定的量化参数
-        if (model->moeLinears.size() > 0 && useMoeDataType) {
+        // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
+        // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
+        // 全局线性量化类型；否则会按普通 I32 参数加载。
+        bool awqArmCpuMoeInt8Fallback = false;
+        if (model->moeLinears.size() > 0 && (useMoeDataType || isAwqModel)) {
             for (auto &it : tensorMap) {
                 for (auto &weight : it.second) {
                     if (model->moeLinears.find(weight.first) != model->moeLinears.end()) {
-                        weight.second = moeDataType;
+                        if (useMoeDataType) {
+                            weight.second = moeDataType;
+                        } else if (dtypeConfigString.empty()) {
+#if defined(__aarch64__)
+                            std::string selectedDevice = GetMoeWeightSelectedDevice(model, weight.first);
+                            if (isAwqModel && model->model_struct == "qwen3_5" &&
+                                (DeviceNameMatchesType(selectedDevice, "cpu") ||
+                                 DeviceNameMatchesType(selectedDevice, "numa"))) {
+                                // The ARM CPU INT4_GROUP path is numerically stable in isolated
+                                // linears, but Qwen3.5 AWQ MoE diverges after many recurrent layers.
+                                // Keep this model-specific workaround from changing unrelated AWQ
+                                // MoE families. An explicit --moe_dtype still wins.
+                                weight.second = DataType::INT8;
+                                awqArmCpuMoeInt8Fallback = true;
+                                continue;
+                            }
+#endif
+                            weight.second = linearDataType;
+                        } else {
+                            weight.second = DataType::DATA_AUTO_LINEAR;
+                        }
                     }
                 }
             }
+        }
+        if (awqArmCpuMoeInt8Fallback) {
+            printf("[Fastllm] Qwen3.5 AWQ ARM CPU: load MoE expert weights as INT8 for stable inference.\n");
         }
 
         std::vector <std::pair <std::string, std::string> > dtypeRules;
@@ -2851,11 +2931,18 @@ namespace fastllm {
         std::set <std::string> allWeightNames; // 所有创建了的weight name
         std::set <std::string> allFinishNames; // 转换好的weight name
 
+        int prepareTotal = std::max(1, (int)tensors.size());
+        ReportModelLoadProgress("weights_prepare", 0, prepareTotal);
         for (auto &tensorName : tensors) {
             auto &tensor = safeTensors.itmeDict[tensorName];
             if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName)) {
-                printf("Load %d \r", (++cur) * 100 / (int)safeTensors.itmeDict.size());
+                int current = ++cur;
+                printf("Load %d \r", current * 100 / prepareTotal);
                 fflush(stdout);
+                if (current == prepareTotal ||
+                    current * 100 / prepareTotal != (current - 1) * 100 / prepareTotal) {
+                    ReportModelLoadProgress("weights_prepare", current, prepareTotal);
+                }
                 continue;
             }
             auto oriDataType = DataType::FLOAT32;
@@ -2873,6 +2960,10 @@ namespace fastllm {
                         dataType = DataType::FLOAT16;
                     }
                     ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
+                }
+
+                if (isAwqModel) {
+                    ResolveAwqUnquantizedDataType(tensor.dtype, dataType);
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
@@ -2911,8 +3002,16 @@ namespace fastllm {
             }
 
             totalBytes += tensor.bytes;
-            printf("Load %d \r", (++cur) * 100 / (int)safeTensors.itmeDict.size());
+            int current = ++cur;
+            printf("Load %d \r", current * 100 / prepareTotal);
             fflush(stdout);
+            if (current == prepareTotal ||
+                current * 100 / prepareTotal != (current - 1) * 100 / prepareTotal) {
+                ReportModelLoadProgress("weights_prepare", current, prepareTotal);
+            }
+        }
+        if (tensors.empty()) {
+            ReportModelLoadProgress("weights_prepare", 1, 1);
         }
         model->OnWeightsCreated(allWeightNames);
         std::stable_sort(tensors.begin(), tensors.end(),
@@ -2927,12 +3026,22 @@ namespace fastllm {
         std::mutex locker;
         int cnt = 0;
         int loadProgressTotal = std::max(1, (int)tensorMap.size());
-        auto printLoadingProgress = [&]() {
+        uint64_t completedLoadBytes = 0;
+        uint64_t totalLoadBytes = 0;
+        auto printLoadingProgress = [&](uint64_t tensorBytes) {
             locker.lock();
-            int progress = std::min(100, (++cnt) * 100 / loadProgressTotal);
+            int current = ++cnt;
+            completedLoadBytes += tensorBytes;
+            uint64_t currentBytes = completedLoadBytes;
+            int progress = std::min(100, current * 100 / loadProgressTotal);
             printf("Loading %d \r", progress);
             fflush(stdout);
             locker.unlock();
+            if (current == loadProgressTotal ||
+                current * 100 / loadProgressTotal != (current - 1) * 100 / loadProgressTotal) {
+                ReportModelLoadProgress("weights_load", current, loadProgressTotal,
+                                        currentBytes, totalLoadBytes);
+            }
         };
 
         std::vector <std::string> serialTensors, parallelTensors;
@@ -2948,8 +3057,16 @@ namespace fastllm {
         tensors.swap(parallelTensors);
         loadProgressTotal = std::max(1, (int)serialTensors.size() + (int)tensors.size());
         totalBytes = 0;
+        for (auto &tensorName : serialTensors) {
+            totalLoadBytes += safeTensors.itmeDict[tensorName].bytes;
+        }
         for (auto &tensorName : tensors) {
             totalBytes += safeTensors.itmeDict[tensorName].bytes;
+            totalLoadBytes += safeTensors.itmeDict[tensorName].bytes;
+        }
+        ReportModelLoadProgress("weights_load", 0, loadProgressTotal, 0, totalLoadBytes);
+        if (serialTensors.empty() && tensors.empty()) {
+            ReportModelLoadProgress("weights_load", 1, 1);
         }
 
         std::vector <std::pair <int, int> > parts;
@@ -2999,12 +3116,12 @@ namespace fastllm {
         auto loadSafeTensorRange = [&](int st, int end) {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = (*activeTensors)[i];
+                        auto &tensor = safeTensors.itmeDict[tensorName];
                         if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
-                            printLoadingProgress();
+                            printLoadingProgress(tensor.bytes);
                             continue;
                         }
-                        auto &tensor = safeTensors.itmeDict[tensorName];
                         std::string scaleTensorName = "";
                         std::string qzeroTensorName = "";
 
@@ -3014,7 +3131,14 @@ namespace fastllm {
                             auto dataType = it.second;
                             int ggmlType = -1;
 
-                            int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
+                            bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
+                            // With no explicit --moe_dtype, AWQ experts inherit the global
+                            // INT4_GROUP type and must also inherit the source AWQ group size.
+                            // The Python API's unused moeGroupCnt default is 128, which would
+                            // otherwise reinterpret group-32 expert weights as group-128.
+                            int curGroupCnt = isMoeLinear
+                                    ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
+                                    : groupCnt;
 
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
@@ -3025,6 +3149,9 @@ namespace fastllm {
                                 }
                                 printf("\n");
 */
+                            }
+                            if (isAwqModel) {
+                                ResolveAwqUnquantizedDataType(tensor.dtype, dataType);
                             }
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
@@ -3076,7 +3203,7 @@ namespace fastllm {
                                 AssertInFastLLM(safeTensors.itmeDict.find(scaleTensorName) != safeTensors.itmeDict.end() &&
                                                 safeTensors.itmeDict.find(qzeroTensorName) != safeTensors.itmeDict.end(),
                                                 "Tensor error: can't find AWQ scalse / qzeros.");
-                                if (dataType == INT4_GROUP && groupCnt == awqGroupCnt) {
+                                if (dataType == INT4_GROUP && curGroupCnt == awqGroupCnt) {
                                     oriDataType = INT4_GROUP;
                                 }
                             }
@@ -3408,7 +3535,7 @@ namespace fastllm {
                             }
                         }
 
-                        printLoadingProgress();
+                        printLoadingProgress(tensor.bytes);
                     }
         };
 

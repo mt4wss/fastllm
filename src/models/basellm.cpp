@@ -10,7 +10,9 @@
 #include <climits>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <set>
+#include <tuple>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -432,9 +434,17 @@ namespace fastllm {
 
     void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
         pastKeyValues.clear();
+        // A request owns two cache descriptors per transformer block.  Without
+        // reserving here, vector growth repeatedly copy-constructs every Data
+        // descriptor already inserted.  Qwen3.5 has enough blocks for that
+        // O(blocks^2) setup work to serialize a burst of HTTP requests and
+        // split one batch into multiple prefills before any GPU work starts.
+        pastKeyValues.reserve(blocks);
         for (int i = 0; i < blocks; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(kvCacheDataType),
-                                                   Data(kvCacheDataType)));
+            pastKeyValues.emplace_back(
+                std::piecewise_construct,
+                std::forward_as_tuple(kvCacheDataType),
+                std::forward_as_tuple(kvCacheDataType));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
@@ -739,7 +749,7 @@ namespace fastllm {
         locker.unlock();
     }
 
-    basellm::~basellm() {
+    void basellm::ShutdownRuntime() {
         {
             std::lock_guard<std::mutex> guard(dictLocker);
             this->isFree = true;
@@ -767,7 +777,10 @@ namespace fastllm {
             }
             responseContextDict.dicts.clear();
         }
+    }
 
+    basellm::~basellm() {
+        ShutdownRuntime();
         this->weight.ReleaseWeight();
     }
 
@@ -1186,6 +1199,8 @@ namespace fastllm {
         maxBatch = NormalizeMaxBatchByModelCapability(model, maxBatch);
 
         int prefillChunkSize = model->GetChunkedPrefillSize();
+        int batchedPrefillTokenLimit = std::max(
+            prefillChunkSize, model->GetBatchedPrefillTokenLimit());
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
@@ -1229,9 +1244,59 @@ namespace fastllm {
             return model->GetPagedKVCacheManager(model->kvCacheId, true);
         };
 
+        // Attention layers allocate pages in lockstep.  Most decode steps are
+        // not page-boundary steps, so probing one representative cache per
+        // request avoids walking every layer and every TP-local cache just to
+        // produce an empty page-needs map.
+        std::function<int(Data&)> probeDecodePageNeed = [&](Data &cache) -> int {
+            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                bool foundPagedLocal = false;
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second == nullptr) {
+                        continue;
+                    }
+                    int localNeed = probeDecodePageNeed(*it.second);
+                    if (localNeed > 0) {
+                        return 1;
+                    }
+                    foundPagedLocal |= localNeed == 0;
+                }
+                if (foundPagedLocal) {
+                    return 0;
+                }
+            }
+            if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr ||
+                cache.pagedKVCacheData->type !=
+                    PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
+                return -1;
+            }
+            return cache.pageIndex.empty() || cache.lastPageLen >= cache.pageLen;
+        };
+
         auto collectDecodePageNeeds =
                 [&](const std::vector<ResponseContext*> &contexts) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
+            bool representativeCachesKnown = true;
+            for (auto *ctx : contexts) {
+                if (ctx == nullptr || model->kvCacheId < 0 ||
+                    model->kvCacheId >= (int)ctx->pastKeyValues.size()) {
+                    representativeCachesKnown = false;
+                    break;
+                }
+                int need = probeDecodePageNeed(
+                    ctx->pastKeyValues[model->kvCacheId].first);
+                if (need > 0) {
+                    representativeCachesKnown = false;
+                    break;
+                }
+                if (need < 0) {
+                    representativeCachesKnown = false;
+                    break;
+                }
+            }
+            if (representativeCachesKnown) {
+                return needs;
+            }
             std::function<void(Data&)> addCacheNeed = [&](Data &cache) {
                 if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                     bool usedLocal = false;
@@ -1400,8 +1465,28 @@ namespace fastllm {
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
-        const bool canUseFastDecodeInput = (model->model_type == "qwen3");
+        const bool canUseFastDecodeInput =
+            model->model_type == "qwen3" || model->model_type == "qwen3_5";
         const bool printProfile = GetFastllmEnv().printProfile;
+        int idlePrefillBatchWaitUs =
+            useGPUForward && maxBatch > 1 && model->model_type == "qwen3_5" ?
+            50000 : 0;
+        int idlePrefillBatchQuietUs = idlePrefillBatchWaitUs > 0 ? 20000 : 0;
+        if (useGPUForward && maxBatch > 1) {
+            const char *waitEnv = std::getenv("FASTLLM_IDLE_PREFILL_BATCH_WAIT_US");
+            if (waitEnv != nullptr) {
+                idlePrefillBatchWaitUs = std::max(0, std::atoi(waitEnv));
+            }
+            const char *quietEnv = std::getenv("FASTLLM_IDLE_PREFILL_BATCH_QUIET_US");
+            if (quietEnv != nullptr) {
+                idlePrefillBatchQuietUs = std::max(0, std::atoi(quietEnv));
+            }
+            idlePrefillBatchQuietUs = std::min(idlePrefillBatchQuietUs,
+                                               idlePrefillBatchWaitUs);
+        }
+        std::chrono::steady_clock::time_point idlePrefillBatchDeadline;
+        std::chrono::steady_clock::time_point idlePrefillBatchHardDeadline;
+        size_t idlePrefillBatchObservedSize = 0;
         while (true) {
             if (model->isFree) {
                 break;
@@ -1485,6 +1570,41 @@ namespace fastllm {
                 }
                 return a.handle < b.handle;
             });
+
+            // When the GPU is completely idle, the first HTTP request can wake
+            // this loop and take dictLocker before the sibling requests in the
+            // same burst have registered.  That turns one uniform batched
+            // prefill into a small prefill followed by a second large prefill.
+            // Give only the idle/no-active case a short, bounded collection
+            // window.  HTTP request preparation can span several milliseconds,
+            // so finish after a short quiet period instead of measuring only
+            // from the first request.  The hard deadline bounds single-request
+            // latency even when requests keep trickling in.  Once decode has
+            // started we never delay an iteration.
+            if (idlePrefillBatchWaitUs > 0 && currentActivate == 0 && hasPrefill &&
+                (int)orders.size() < maxBatch) {
+                auto now = std::chrono::steady_clock::now();
+                if (idlePrefillBatchHardDeadline == std::chrono::steady_clock::time_point()) {
+                    idlePrefillBatchHardDeadline =
+                        now + std::chrono::microseconds(idlePrefillBatchWaitUs);
+                    idlePrefillBatchObservedSize = orders.size();
+                    idlePrefillBatchDeadline = std::min(
+                        idlePrefillBatchHardDeadline,
+                        now + std::chrono::microseconds(idlePrefillBatchQuietUs));
+                } else if (orders.size() > idlePrefillBatchObservedSize) {
+                    idlePrefillBatchObservedSize = orders.size();
+                    idlePrefillBatchDeadline = std::min(
+                        idlePrefillBatchHardDeadline,
+                        now + std::chrono::microseconds(idlePrefillBatchQuietUs));
+                }
+                if (now < idlePrefillBatchDeadline) {
+                    model->dictCV.wait_until(dictLocker, idlePrefillBatchDeadline);
+                    continue;
+                }
+            }
+            idlePrefillBatchDeadline = std::chrono::steady_clock::time_point();
+            idlePrefillBatchHardDeadline = std::chrono::steady_clock::time_point();
+            idlePrefillBatchObservedSize = 0;
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -1727,7 +1847,11 @@ namespace fastllm {
                             }
                         }
 
-                        if (currentActivate + (int)seqLens.size() >= maxBatch) {
+                        // currentActivate already includes every pending
+                        // prefill selected earlier in this pass.  Adding
+                        // seqLens.size() again halves the usable capacity on
+                        // every pass (32 -> 16 -> 8 -> 4 ...).
+                        if (currentActivate >= maxBatch) {
                             continue;
                         }
 
@@ -1766,7 +1890,7 @@ namespace fastllm {
                                 continue;
                             }
                         } else {
-                            if (prefillTokenCount + thisLen > prefillChunkSize && seqLens.size() > 0) {
+                            if (prefillTokenCount + thisLen > batchedPrefillTokenLimit && seqLens.size() > 0) {
                                 continue;
                             }
                         }
@@ -1873,11 +1997,33 @@ namespace fastllm {
                     while (hasPagedManagerShortage(pageNeeds)) {
                         // 空闲分页不够，从本轮decode批次中选择上下文最长的请求驱逐
                         int maxLen = -1, evictIdx = -1;
+                        std::function<int(const Data&)> getCacheLen =
+                                [&](const Data &cache) -> int {
+                            int len = 0;
+                            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                                for (auto &it : cache.multiDeviceDatas) {
+                                    if (it.second != nullptr) {
+                                        len = std::max(len, getCacheLen(*it.second));
+                                    }
+                                }
+                                if (len > 0) {
+                                    return len;
+                                }
+                            }
+                            if (cache.isPagedKVCache && !cache.pageIndex.empty()) {
+                                return ((int)cache.pageIndex.size() - 1) * cache.pageLen +
+                                       cache.lastPageLen;
+                            }
+                            if (cache.expansionDims.size() > 1) {
+                                return cache.expansionDims[1];
+                            }
+                            return cache.dims.size() > 1 ? cache.dims[1] : 0;
+                        };
                         for (int i = 0; i < (int)handles.size(); i++) {
                             auto &ctx = *tokenContexts[i];
                             auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
-                            if (kvFirst.pageIndex.size() > 0) {
-                                int curLen = (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
+                            int curLen = getCacheLen(kvFirst);
+                            if (curLen > 0) {
                                 if (curLen > maxLen) {
                                     maxLen = curLen;
                                     evictIdx = i;
@@ -2967,6 +3113,10 @@ namespace fastllm {
         return this->defaultChunkedPrefillSize;
     }
 
+    int basellm::GetBatchedPrefillTokenLimit() {
+        return this->GetChunkedPrefillSize();
+    }
+
     void basellm::SetDataType(DataType dataType) {
         if (dataType == DataType::FLOAT32) {
 
@@ -3031,10 +3181,14 @@ namespace fastllm {
     }
 
     void basellm::SetMoeAtype(DataType type) {
-        if (type == DataType::FLOAT32 || type == DataType::FLOAT16 || type == DataType::BFLOAT16) {
+        if (type == DataType::DATA_AUTO_NONE) {
+            this->moeAtype = DataType::FLOAT32;
+            this->useCustomMoeAtype = false;
+        } else if (type == DataType::FLOAT32 || type == DataType::FLOAT16 || type == DataType::BFLOAT16) {
             this->moeAtype = type;
+            this->useCustomMoeAtype = true;
         } else {
-            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be float32, float16 or bfloat16");
+            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be auto, float32, float16 or bfloat16");
         }
     }
 
@@ -3171,8 +3325,22 @@ namespace fastllm {
         return 0;
     }
 
-    static int GetTokenGrowingCacheLen(const basellm *model, std::vector <std::pair <Data*, Data*> > &pastKeyValues) {
-        auto tryGetLen = [&](int idx) {
+    static int GetTokenGrowingCacheLen(
+            const basellm *model,
+            const std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+            int requestIndex,
+            int batch) {
+        int cacheBegin = 0;
+        int cacheEnd = (int)pastKeyValues.size();
+        bool flattenedByRequest = batch > 0 && model->block_cnt > 0 &&
+            (int)pastKeyValues.size() == batch * model->block_cnt;
+        if (flattenedByRequest) {
+            cacheBegin = requestIndex * model->block_cnt;
+            cacheEnd = cacheBegin + model->block_cnt;
+        }
+
+        auto tryGetLen = [&](int layerIndex) {
+            int idx = flattenedByRequest ? cacheBegin + layerIndex : layerIndex;
             if (idx < 0 || idx >= (int)pastKeyValues.size()) {
                 return 0;
             }
@@ -3195,13 +3363,32 @@ namespace fastllm {
         if (len > 0) {
             return len;
         }
-        for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+        int layerCount = flattenedByRequest ? model->block_cnt : cacheEnd - cacheBegin;
+        for (int i = 0; i < layerCount; i++) {
             len = tryGetLen(i);
             if (len > 0) {
                 return len;
             }
         }
         return 0;
+    }
+
+    std::vector<int> basellm::GetMinOutputResetLengths(
+            int batch,
+            const std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs) const {
+        std::vector<int> resetLengths(batch, 0);
+        for (int b = 0; b < batch; b++) {
+            const GenerationConfig &config = generationConfigs[b];
+            if (config.output_token_least <= 0) {
+                continue;
+            }
+            int cacheLen = GetTokenGrowingCacheLen(
+                this, pastKeyValues, b, batch);
+            resetLengths[b] = config.output_token_least - cacheLen +
+                config.input_token_length;
+        }
+        return resetLengths;
     }
 
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues,
@@ -3248,17 +3435,15 @@ namespace fastllm {
 
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs) {
-        bool hasMinOutputLength = false;
-        for (int b = 0; b < batch; b++) {
-            if (generationConfigs[b].output_token_least > 0) {
-                hasMinOutputLength = true;
-                break;
-            }
+        std::vector<int> resetLengths = GetMinOutputResetLengths(
+            batch, pastKeyValues, generationConfigs);
+        bool needReset = false;
+        for (int remaining : resetLengths) {
+            needReset |= remaining > 0;
         }
-        if (!hasMinOutputLength) {
+        if (!needReset) {
             return;
         }
-        int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             auto buildEosIds = [&](const GenerationConfig &config) {
@@ -3272,12 +3457,11 @@ namespace fastllm {
                 }
                 return ids;
             };
-            bool need_reset = false, all_need_reset = true, same_eos_ids = true;
+            bool all_need_reset = true, same_eos_ids = true;
             std::vector<int> common_eos_ids;
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                bool curNeedReset = config.output_token_least - cacheLen + config.input_token_length > 0;
-                need_reset |= curNeedReset;
+                bool curNeedReset = resetLengths[b] > 0;
                 all_need_reset &= curNeedReset;
                 std::vector<int> cur_eos_ids = buildEosIds(config);
                 if (b == 0) {
@@ -3286,28 +3470,25 @@ namespace fastllm {
                     same_eos_ids = false;
                 }
             }
-            if (need_reset) {
-                ToDataType(*logits, DataType::FLOAT32);
-                if (all_need_reset && same_eos_ids) {
-                    FastllmResetLogitsOfEOSAll(batch, logits, common_eos_ids);
-                } else {
-                    std::vector<int> res_lens, eos_nums, eos_ids;
-                    for (int b = 0; b < batch; b++) {
-                        auto &config = generationConfigs[b];
-                        res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
-                        std::vector<int> cur_eos_ids = buildEosIds(config);
-                        eos_nums.push_back((int)cur_eos_ids.size());
-                        eos_ids.insert(eos_ids.end(), cur_eos_ids.begin(), cur_eos_ids.end());
-                    }
-                    FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+            ToDataType(*logits, DataType::FLOAT32);
+            if (all_need_reset && same_eos_ids) {
+                FastllmResetLogitsOfEOSAll(batch, logits, common_eos_ids);
+            } else {
+                std::vector<int> eos_nums, eos_ids;
+                for (int b = 0; b < batch; b++) {
+                    auto &config = generationConfigs[b];
+                    std::vector<int> cur_eos_ids = buildEosIds(config);
+                    eos_nums.push_back((int)cur_eos_ids.size());
+                    eos_ids.insert(eos_ids.end(), cur_eos_ids.begin(), cur_eos_ids.end());
                 }
+                FastllmResetLogitsOfEOS(batch, logits, resetLengths, eos_nums, eos_ids);
             }
 #endif
         } else {
+            ToDataType(*logits, DataType::FLOAT32);
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                if (config.output_token_least > cacheLen - config.input_token_length) {
-                    ToDataType(*logits, DataType::FLOAT32);
+                if (resetLengths[b] > 0) {
                     float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
                     logit[this->eos_token_id] = 0;
                     for (auto id: this->eos_token_ids)
@@ -3321,14 +3502,21 @@ namespace fastllm {
     }
 
     void basellm::AutoWarmup() {
+        ReportModelLoadProgress("warmup", 0, 1);
         if (GetFastllmEnv().skipWarmup) {
+            ReportModelLoadProgress("warmup", 1, 1);
             return;
         }
         struct AutoWarmupFinishGuard {
             basellm *model;
-            AutoWarmupFinishGuard(basellm *model) : model(model) {}
+            int uncaughtExceptions;
+            AutoWarmupFinishGuard(basellm *model)
+                : model(model), uncaughtExceptions(std::uncaught_exceptions()) {}
             ~AutoWarmupFinishGuard() {
                 model->OnAutoWarmupFinished();
+                if (std::uncaught_exceptions() == uncaughtExceptions) {
+                    ReportModelLoadProgress("warmup", 1, 1);
+                }
 #ifdef USE_CUDA
                 // warmup 结束后切回异步集合通信：此时内存池已热，稳态前向基本不再触发真实 cudaMalloc，
                 // 异步发射安全且能恢复通信/计算重叠的吞吐。warmup 及之前(权重加载)保持同步以防死锁。
@@ -3496,20 +3684,62 @@ namespace fastllm {
         this->kvCacheId = 0;
         elementsInKVCachePerToken = 0;
         bool foundTokenGrowingCache = false;
+        bool hasCudaTokenGrowingCache = false;
         std::vector <long long> layerElementsPerToken(block_cnt, 0);
         int tokenGrowingLayerCount = 0, linearLayerCount = 0;
         long long linearFixedBytes = 0;
+#ifdef USE_CUDA
+        std::map<int, long long> deviceLinearFixedBytes;
+        auto accountCudaLinearFixedBytes = [&](const Data &cache) {
+            bool accountedLocalShard = false;
+            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    Data *local = it.second;
+                    if (local == nullptr || local->dataDevice != DataDevice::CUDA ||
+                        local->dims.empty()) {
+                        continue;
+                    }
+                    deviceLinearFixedBytes[it.first] += local->GetBytes();
+                    accountedLocalShard = true;
+                }
+            }
+            if (!accountedLocalShard && cache.dataDevice == DataDevice::CUDA &&
+                !cache.dims.empty()) {
+                int id = cache.dataDeviceIds.empty() ? 0 : cache.dataDeviceIds[0];
+                deviceLinearFixedBytes[id] += cache.GetBytes();
+            }
+        };
+#endif
         for (int i = 0; i < block_cnt; i++) {
             auto &pastKey = pastKeyValuesStorage[i].first;
             auto &pastValue = pastKeyValuesStorage[i].second;
             if (pastKey.isLinearAttention || pastValue.isLinearAttention) {
                 linearLayerCount++;
                 linearFixedBytes += pastKey.GetBytes() + pastValue.GetBytes();
+#ifdef USE_CUDA
+                accountCudaLinearFixedBytes(pastKey);
+                accountCudaLinearFixedBytes(pastValue);
+#endif
                 continue;
             }
             if (pastKey.dims.size() < 3 || pastValue.dims.size() < 3) {
                 continue;
             }
+#ifdef USE_CUDA
+            auto cacheUsesCuda = [](const Data &cache) {
+                if (cache.dataDevice == DataDevice::CUDA) {
+                    return true;
+                }
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr && it.second->dataDevice == DataDevice::CUDA) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            hasCudaTokenGrowingCache = hasCudaTokenGrowingCache ||
+                                       cacheUsesCuda(pastKey) || cacheUsesCuda(pastValue);
+#endif
             tokenGrowingLayerCount++;
             if (!foundTokenGrowingCache) {
                 this->kvCacheId = i;
@@ -3527,9 +3757,15 @@ namespace fastllm {
             bytesPerToken = GetDataBytes(this->kvCacheDataType, 1, elementsInKVCachePerToken);
         }
         if (autoCalcPages) {
-            printf("[Fastllm] AutoWarmup stats: tokenGrowingLayers=%d, linearLayers=%d, linearFixedCache=%.2f MB, kvBytesPerToken=%.2f KB, firstKVLayer=%d.\n",
+            printf("[Fastllm] AutoWarmup stats: tokenGrowingLayers=%d, linearLayers=%d, linearFixedCacheGlobal=%.2f MB, kvBytesPerToken=%.2f KB, firstKVLayer=%d.\n",
                    tokenGrowingLayerCount, linearLayerCount, linearFixedBytes / 1e6,
                    bytesPerToken / 1024.0, this->kvCacheId);
+#ifdef USE_CUDA
+            for (auto &it : deviceLinearFixedBytes) {
+                printf("[Fastllm] AutoWarmup GPU %d: linearFixedCache=%.2f MB/request.\n",
+                       it.first, it.second / 1e6);
+            }
+#endif
         }
         captureWarmupPagedCacheManager(pastKeyValuesStorage);
 
@@ -3583,7 +3819,11 @@ namespace fastllm {
                 for (int i = 0; i < seqLen; i++) {
                     shortPos[i] = (float)i;
                 }
-                shortPositionIdsStorage.push_back(Data(this->dataType, {1, seqLen}, shortPos));
+                // Position ids are scalar indices, independent of the model's
+                // activation/weight dtype.  Keeping them in FP32 also avoids
+                // callers accidentally interpreting a packed FP16 buffer as
+                // float values.
+                shortPositionIdsStorage.push_back(Data(DataType::FLOAT32, {1, seqLen}, shortPos));
                 shortPositionIdsVec.push_back(&shortPositionIdsStorage.back());
             }
             std::vector <Data*> shortAttentionMasks(batch, nullptr);
@@ -3647,7 +3887,7 @@ namespace fastllm {
             runBatchSeqWarmup(samplingPrefillSeqLens, true);
         };
 
-        if (autoCalcPages) {
+        if (autoCalcPages && hasCudaTokenGrowingCache) {
 #ifdef USE_CUDA
             std::set <int> deviceIds;
 
@@ -3708,18 +3948,20 @@ namespace fastllm {
                 }
 
                 if (!accountedByLocalShard) {
-                    int id = 0;
-                    if (pastKey.dataDevice == DataDevice::CUDA && !pastKey.dataDeviceIds.empty()) {
-                        id = pastKey.dataDeviceIds[0];
-                    } else if (pastValue.dataDevice == DataDevice::CUDA && !pastValue.dataDeviceIds.empty()) {
-                        id = pastValue.dataDeviceIds[0];
+                    int id = -1;
+                    if (pastKey.dataDevice == DataDevice::CUDA) {
+                        id = pastKey.dataDeviceIds.empty() ? 0 : pastKey.dataDeviceIds[0];
+                    } else if (pastValue.dataDevice == DataDevice::CUDA) {
+                        id = pastValue.dataDeviceIds.empty() ? 0 : pastValue.dataDeviceIds[0];
                     }
-                    deviceIds.insert(id);
-                    deviceBytesPerPage[id] += layerBytesPerPage;
-                    long long keyElementsPerToken = (long long)pastKey.dims[0] * pastKey.dims[2];
-                    long long valueElementsPerToken = (long long)pastValue.dims[0] * pastValue.dims[2];
-                    updateDelayedCacheReserve(id, keyElementsPerToken, valueElementsPerToken);
-                    deviceLayerCount[id]++;
+                    if (id >= 0) {
+                        deviceIds.insert(id);
+                        deviceBytesPerPage[id] += layerBytesPerPage;
+                        long long keyElementsPerToken = (long long)pastKey.dims[0] * pastKey.dims[2];
+                        long long valueElementsPerToken = (long long)pastValue.dims[0] * pastValue.dims[2];
+                        updateDelayedCacheReserve(id, keyElementsPerToken, valueElementsPerToken);
+                        deviceLayerCount[id]++;
+                    }
                 }
                 bytesPerPage += layerBytesPerPage;
             }
@@ -3728,6 +3970,8 @@ namespace fastllm {
             int calculatedMaxPages = -1;
             std::string fallbackReason = "";
             int autoLinearAttentionBatchLimit = -1;
+            int autoLinearAttentionBatchLimitDevice = -1;
+            long long autoLinearAttentionBatchLimitBytes = linearFixedBytes;
 
             for (auto &kv : pastKeyValuesStorage) {
                 kv.first.pageIndex.clear();
@@ -3758,16 +4002,46 @@ namespace fastllm {
                 }
                 return std::max(1, batchLimit);
             };
-            auto updateLinearAttentionBatchLimit = [&](long long avail) {
+            auto getDeviceLinearFixedBytes = [&](int id) -> long long {
+                auto it = deviceLinearFixedBytes.find(id);
+                if (it != deviceLinearFixedBytes.end()) {
+                    return std::max(0LL, it->second);
+                }
+                // When warmup exposes no local CUDA metadata at all, retain the
+                // old global estimate as a conservative compatibility fallback.
+                return deviceLinearFixedBytes.empty() ?
+                    std::max(0LL, linearFixedBytes) : 0LL;
+            };
+            auto updateLinearAttentionBatchLimit = [&](int id, long long avail) {
                 if (userSetMaxBatch || linearFixedBytes <= 0 || avail <= 0) {
                     return;
                 }
-                long long rawLimit = (avail / 2) / linearFixedBytes;
-                int limit = (int)std::min<long long>(std::max(1LL, rawLimit), INT_MAX);
-                if (autoLinearAttentionBatchLimit <= 0) {
+                long long linearBytesOnDevice = getDeviceLinearFixedBytes(id);
+                int budgetPercent = std::max(
+                    1, std::min(100,
+                                this->GetAutoWarmupLinearAttentionBatchBudgetPercent()));
+                __int128 budget = (__int128)avail * budgetPercent / 100;
+                int low = 0, high = getBaseBatchLimit();
+                while (low < high) {
+                    int mid = low + (high - low + 1) / 2;
+                    long long runtimeReserve = std::max(
+                        0LL, this->GetAutoWarmupCudaRuntimeReserveBytes(id, mid));
+                    __int128 fixedNeed = (__int128)mid * linearBytesOnDevice +
+                                         (__int128)runtimeReserve;
+                    if (fixedNeed <= budget) {
+                        low = mid;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                // A model must always be able to make progress with one request,
+                // even when its unavoidable fixed state exceeds the target share.
+                int limit = std::max(1, low);
+                if (autoLinearAttentionBatchLimit <= 0 ||
+                    limit < autoLinearAttentionBatchLimit) {
                     autoLinearAttentionBatchLimit = limit;
-                } else {
-                    autoLinearAttentionBatchLimit = std::min(autoLinearAttentionBatchLimit, limit);
+                    autoLinearAttentionBatchLimitDevice = id;
+                    autoLinearAttentionBatchLimitBytes = linearBytesOnDevice;
                 }
             };
             bool skipShortWarmupForward =
@@ -3831,6 +4105,7 @@ namespace fastllm {
                 long long delayedCacheBytesPerPage =
                     deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
                 delayedCacheBytesPerPage = std::max(0LL, delayedCacheBytesPerPage);
+                long long linearBytesOnDevice = getDeviceLinearFixedBytes(id);
                 long long rawPages = avail / kvBytesPerPage;
                 if (rawPages <= 0) {
                     return (int)std::min<long long>(rawPages, INT_MAX);
@@ -3846,7 +4121,7 @@ namespace fastllm {
                     return std::max(0LL, reserve);
                 };
                 long long probeBatch = std::min<long long>(batchLimit, rawPages);
-                if (linearFixedBytes <= 0 && runtimeReserveBytes(probeBatch) <= 0 &&
+                if (linearBytesOnDevice <= 0 && runtimeReserveBytes(probeBatch) <= 0 &&
                     delayedCacheBytesPerPage <= 0) {
                     return (int)std::min<long long>(rawPages, INT_MAX);
                 }
@@ -3857,7 +4132,7 @@ namespace fastllm {
                     long long activeBatch = std::min<long long>(batchLimit, mid);
                     __int128 need = (__int128)mid * kvBytesPerPage +
                                     (__int128)mid * delayedCacheBytesPerPage +
-                                    (__int128)activeBatch * linearFixedBytes +
+                                    (__int128)activeBatch * linearBytesOnDevice +
                                     (__int128)runtimeReserveBytes(activeBatch);
                     if (need <= avail) {
                         low = mid;
@@ -3869,7 +4144,7 @@ namespace fastllm {
                     long long activeBatch = std::min<long long>(batchLimit, low);
                     long long runtimeReserve = runtimeReserveBytes(activeBatch);
                     printf("[Fastllm] AutoWarmup GPU %d: limit pages %lld -> %lld, reserve %.2f MB/request linear cache, %.2f MB/runtime cache up to batch %lld, %.2f MB/page delayed paged cache.\n",
-                           id, rawPages, low, linearFixedBytes / 1e6,
+                           id, rawPages, low, linearBytesOnDevice / 1e6,
                            runtimeReserve / 1e6, activeBatch,
                            delayedCacheBytesPerPage / 1e6);
                 }
@@ -3878,23 +4153,33 @@ namespace fastllm {
             if (deviceBytesPerPage.size() > 1) {
                 // 多卡模式：对每张实际承载 token-growing cache 的卡分别限流，取最小值
                 int maxPages = INT_MAX;
+                bool hasUnusableCacheDevice = false;
                 for (auto &it : deviceBytesPerPage) {
                     int id = it.first;
-                    if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
+                    long long perPageOnDevice = it.second;
+                    if (id >= 0 && id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long rawAvail = freeSizes[id] - reserved;
                         long long runtimeHeadroom = getCudaRuntimeHeadroom(id, rawAvail);
                         long long avail = rawAvail - runtimeHeadroom;
-                        long long perPageOnDevice = it.second;
-                        updateLinearAttentionBatchLimit(avail);
+                        updateLinearAttentionBatchLimit(id, avail);
                         printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
                                runtimeHeadroom / 1e6, avail / 1e9, perPageOnDevice / 1e6,
                                deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
-                        if (perPageOnDevice > 0 && avail > 0) {
+                        if (perPageOnDevice > 0) {
                             int pages = fitPagesWithLinearReserve(id, avail, perPageOnDevice);
                             maxPages = std::min(maxPages, pages);
+                            hasUnusableCacheDevice = hasUnusableCacheDevice || pages <= 0;
+                        } else {
+                            maxPages = 0;
+                            hasUnusableCacheDevice = true;
                         }
+                    } else {
+                        // Missing telemetry for a cache-bearing GPU must not make another
+                        // GPU's positive budget look safe for the whole tensor-parallel cache.
+                        maxPages = 0;
+                        hasUnusableCacheDevice = true;
                     }
                 }
                 if (maxPages > 0 && maxPages < INT_MAX) {
@@ -3912,7 +4197,9 @@ namespace fastllm {
                         }
                     }
                 } else {
-                    fallbackReason = "no GPU has positive availForKV / kvPerPage after reserve.";
+                    fallbackReason = hasUnusableCacheDevice ?
+                        "at least one cache-bearing GPU has no usable KV budget after reserve." :
+                        "multi-GPU page calculation did not find a cache-bearing GPU.";
                 }
             } else {
                 // 单卡模式：只看真正承载 paged KV cache 的设备
@@ -3926,7 +4213,7 @@ namespace fastllm {
                         long long rawAvail = freeSizes[cacheDeviceId] - reserved;
                         long long runtimeHeadroom = getCudaRuntimeHeadroom(cacheDeviceId, rawAvail);
                         cacheAvail = rawAvail - runtimeHeadroom;
-                        updateLinearAttentionBatchLimit(cacheAvail);
+                        updateLinearAttentionBatchLimit(cacheDeviceId, cacheAvail);
                         printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, runtimeHeadroom=%.2f MB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                cacheDeviceId, freeSizes[cacheDeviceId] / 1e9, totalSizes[cacheDeviceId] / 1e9,
                                reserved / 1e9, runtimeHeadroom / 1e6, cacheAvail / 1e9, cacheBytesPerPage / 1e6,
@@ -3969,8 +4256,17 @@ namespace fastllm {
                 int limitedBatch = std::max(1, std::min(baseBatchLimit, autoLinearAttentionBatchLimit));
                 if (limitedBatch < baseBatchLimit) {
                     this->maxBatch = limitedBatch;
-                    printf("[Fastllm] AutoWarmup auto max_batch limited %d -> %d: linear attention cache %.2f MB/request, capped to <=50%% of availForKV.\n",
-                           baseBatchLimit, limitedBatch, linearFixedBytes / 1e6);
+                    int budgetPercent = std::max(
+                        1, std::min(100,
+                                    this->GetAutoWarmupLinearAttentionBatchBudgetPercent()));
+                    printf("[Fastllm] AutoWarmup auto max_batch limited %d -> %d: linear attention cache %.2f MB/request plus model runtime buffers, targeted to <=%d%% of availForKV.\n",
+                           baseBatchLimit, limitedBatch,
+                           autoLinearAttentionBatchLimitBytes / 1e6,
+                           budgetPercent);
+                    if (autoLinearAttentionBatchLimitDevice >= 0) {
+                        printf("  Limiting GPU: %d.\n",
+                               autoLinearAttentionBatchLimitDevice);
+                    }
                 }
             }
 
@@ -3982,7 +4278,24 @@ namespace fastllm {
                     warmupMaxBatch = this->maxBatch;
                 }
                 warmupMaxBatch = NormalizeMaxBatchByModelCapability(this, warmupMaxBatch);
-                warmupMaxBatch = std::max(1, std::min(warmupMaxBatch, fastllm::GetMaxTokens() / 128));
+                const int configuredWarmupMaxBatch = warmupMaxBatch;
+                warmupMaxBatch = std::max(
+                    1, std::min(warmupMaxBatch, fastllm::GetMaxTokens() / 128));
+                if (warmupMaxBatch < configuredWarmupMaxBatch &&
+                    this->ShouldEnforceAutoWarmupRuntimeBatchLimit()) {
+                    // fitPagesWithLinearReserve() has already accounted for the
+                    // per-request linear-attention state and model-specific CUDA
+                    // runtime buffers (including Qwen3.5 MTP rollback snapshots).
+                    // A smaller page result therefore also limits the number of
+                    // requests that can safely be active at once.  Keep that
+                    // validated limit after the later KV-cache recalibration;
+                    // otherwise recalibration may grow the cache again while the
+                    // scheduler still advertises the original maxBatch, leading
+                    // to a runtime cudaMalloc OOM at higher concurrency.
+                    this->maxBatch = warmupMaxBatch;
+                    printf("[Fastllm] AutoWarmup runtime max_batch limited %d -> %d by the validated CUDA memory/KV budget.\n",
+                           configuredWarmupMaxBatch, warmupMaxBatch);
+                }
                 printf("[Fastllm] AutoWarmup CUDA batch warmup up to %d.\n", warmupMaxBatch);
                 int warmupTotalPages = pageLen > 0 ?
                     std::max(1, (fastllm::GetMaxTokens() + pageLen - 1) / pageLen) : 0;
@@ -4008,6 +4321,100 @@ namespace fastllm {
                 if (warmupAddPrefillEffectiveBatch != warmupMaxPrefillBatch) {
                     runSamplingPrefillWarmup(warmupAddPrefillBatch, "add-prefill");
                 }
+
+                // The full-batch prefill above materializes the real CUDA scratch
+                // pool. It can be substantially larger than the small pre-page
+                // warmup, especially for hybrid linear-attention models. Recheck
+                // the actual free memory before allocating long-lived sampling
+                // buffers and give memory back from the auto-sized KV cache when
+                // necessary. Otherwise the page estimate can leave enough room on
+                // paper while the following runtime-buffer allocations still OOM.
+                auto shrinkCachePagesForRuntimeBuffers = [&]() {
+                    if (!updatedPages || pageLen <= 0 || deviceBytesPerPage.empty()) {
+                        return;
+                    }
+
+                    int currentPages = std::max(
+                        1, (fastllm::GetMaxTokens() + pageLen - 1) / pageLen);
+                    int calibratedPages = currentPages;
+                    auto freeBeforeRuntime = FastllmCudaGetFreeSizes();
+                    auto totalBeforeRuntime = FastllmCudaGetTotalSizes();
+                    std::map<int, long long> deviceTargetFree;
+                    std::map<int, long long> deviceRemovePages;
+
+                    for (auto &it : deviceBytesPerPage) {
+                        int id = it.first;
+                        long long bytesPerPageOnDevice = it.second;
+                        if (bytesPerPageOnDevice <= 0 || id < 0 ||
+                            id >= (int)freeBeforeRuntime.size() ||
+                            id >= (int)totalBeforeRuntime.size()) {
+                            continue;
+                        }
+
+                        long long finalSafety = std::max(
+                            128LL * 1024LL * 1024LL,
+                            totalBeforeRuntime[id] / 200);
+                        finalSafety = std::min(
+                            finalSafety, 512LL * 1024LL * 1024LL);
+                        long long targetFree =
+                            (long long)(totalBeforeRuntime[id] *
+                                        (1.0 - fastllm::GetGpuMemRatio())) +
+                            finalSafety +
+                            std::max(
+                                0LL,
+                                this->GetAutoWarmupCudaRuntimeReserveBytes(
+                                    id, warmupMaxBatch));
+                        deviceTargetFree[id] = targetFree;
+
+                        long long deficit = targetFree - freeBeforeRuntime[id];
+                        if (deficit <= 0) {
+                            deviceRemovePages[id] = 0;
+                            continue;
+                        }
+                        long long removePages =
+                            (deficit + bytesPerPageOnDevice - 1) /
+                            bytesPerPageOnDevice;
+                        deviceRemovePages[id] = removePages;
+                        long long devicePages = std::max<long long>(
+                            std::max(1, minPages),
+                            (long long)currentPages - removePages);
+                        calibratedPages = std::min(
+                            calibratedPages,
+                            (int)std::min<long long>(devicePages, INT_MAX));
+                    }
+
+                    if (calibratedPages >= currentPages) {
+                        return;
+                    }
+
+                    printf("[Fastllm] AutoWarmup shrink cache pages for CUDA runtime buffers: %d -> %d (tokens: %lld -> %lld).\n",
+                           currentPages, calibratedPages,
+                           (long long)currentPages * pageLen,
+                           (long long)calibratedPages * pageLen);
+                    for (auto &it : deviceBytesPerPage) {
+                        int id = it.first;
+                        if (id < 0 || id >= (int)freeBeforeRuntime.size() ||
+                            id >= (int)totalBeforeRuntime.size()) {
+                            continue;
+                        }
+                        printf("  GPU %d: freeBeforeRuntime=%.2f GB, targetFree=%.2f GB, localKVPerPage=%.2f MB, removePages=%lld.\n",
+                               id, freeBeforeRuntime[id] / 1e9,
+                               deviceTargetFree.count(id) ?
+                                   deviceTargetFree[id] / 1e9 : 0.0,
+                               it.second / 1e6,
+                               deviceRemovePages.count(id) ?
+                                   deviceRemovePages[id] : 0);
+                    }
+
+                    autoWarmupPagedCacheManager = nullptr;
+                    ClearAllPagedCacheManagers();
+                    fastllm::SetMaxTokens(calibratedPages * pageLen);
+                    calculatedMaxPages = calibratedPages;
+                    runUniformBatchWarmup(1, 1, false);
+                    printCudaWarmupPoolStats(
+                        "runtime-reserved paged cache allocation");
+                };
+                shrinkCachePagesForRuntimeBuffers();
                 this->WarmupCudaRuntimeBuffers(warmupMaxBatch);
                 printCudaWarmupPoolStats("batch and sampling warmup");
 

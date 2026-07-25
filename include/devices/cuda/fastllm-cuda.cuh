@@ -107,10 +107,12 @@ void FastllmCudaStreamDestroy(void *stream);
 void FastllmCudaStreamSynchronize(void *stream);
 
 void *FastllmCudaEventCreate();
+void *FastllmCudaEventCreateTiming();
 void FastllmCudaEventDestroy(void *event);
 void FastllmCudaEventRecord(void *event, void *stream = nullptr);
 void FastllmCudaEventRecordCurrentThread(void *event);
 void FastllmCudaEventSynchronize(void *event);
+float FastllmCudaEventElapsedTime(void *start, void *end);
 void FastllmCudaStreamWaitEvent(void *stream, void *event);
 void FastllmCudaCurrentThreadStreamWaitEvent(void *event);
 
@@ -127,6 +129,7 @@ bool FastllmCudaGraphLaunch(void *exec);
 void FastllmCudaGraphDestroy(void *graph);
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
+bool FastllmCudaGraphIsCapturing();
 bool FastllmCudaGraphCaptureInvalidated();
 
 // Qwen3.5 MoE graph markers are emitted only while the per-thread stream is
@@ -220,10 +223,26 @@ bool FastllmCudaGptqMarlinRepack(const uint32_t *b_q_weight, uint32_t *out,
                                  int size_k, int size_n);
 bool FastllmCudaGptqMarlinRepackStream(const uint32_t *b_q_weight, uint32_t *out,
                                        int size_k, int size_n, void *stream);
+bool FastllmCudaGptqMarlinRepackBits(const uint32_t *b_q_weight, uint32_t *out,
+                                     int size_k, int size_n, int num_bits);
+bool FastllmCudaGptqMarlinRepackBitsStream(const uint32_t *b_q_weight, uint32_t *out,
+                                           int size_k, int size_n, int num_bits,
+                                           void *stream);
 bool FastllmCudaMarlinHalfInt4Gemm(const void *a, const uint32_t *b_q_weight,
                                    const void *b_scales, const uint32_t *b_zeros,
                                    void *c, int size_m, int size_n, int size_k,
                                    int group_size, int *workspace);
+// SM75+ weight-only FP8 Marlin (W8A16), for small-batch / MTP verify (n<=8).
+// Returns false to fall back to native FP8 GEMV.
+bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
+                                  const void *b_scales, void *c,
+                                  int size_m, int size_n, int size_k,
+                                  int group_size, int *workspace);
+bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
+                                                fastllm::Data &weight,
+                                                const fastllm::Data &bias,
+                                                fastllm::Data &output,
+                                                int n, int m, int k);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
@@ -451,6 +470,13 @@ bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
 namespace fastllm {
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
                                        int groups, int oRank, Data &output);
+bool FastllmCudaTryTritonChunkGdnPostConv(
+        const Data &qInput, const Data &kInput, const Data &vInput,
+        const Data &gInput, const Data &betaInput,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float qScale,
+        Data &q, Data &k, Data &v, Data &g, Data &beta,
+        Data &kBeta, Data &vBeta);
 bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
@@ -631,7 +657,32 @@ bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(const fastllm::Data &i
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaHalfMergeMOEInt8Batch1Indexed(const fastllm::Data &input,
+                                              fastllm::Data &scratch,
+                                              fastllm::Data &output,
+                                              fastllm::Data **weights,
+                                              int weightsBatch,
+                                              const int32_t *indices,
+                                              const float *scores,
+                                              int topk);
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(const fastllm::Data &input,
+                                                   fastllm::Data &scratch,
+                                                   fastllm::Data &output,
+                                                   fastllm::Data **weights,
+                                                   int weightsBatch,
+                                                   const int32_t *indices,
+                                                   const float *scores,
+                                                   int topk);
+bool FastllmCudaHalfMergeMOEInt4GroupSmallBatchIndexed(const fastllm::Data &input,
+                                                       fastllm::Data &scratch,
+                                                       fastllm::Data &output,
+                                                       fastllm::Data **weights,
+                                                       int weightsBatch,
+                                                       const int32_t *indices,
+                                                       const float *scores,
+                                                       int batch,
+                                                       int topk);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -802,6 +853,26 @@ bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
     const fastllm::Data &windowKV, const fastllm::Data &compressedKV,
     const fastllm::Data &attnSink, int windowSize, int compressRatio,
     const int32_t *decodeMeta, float softmaxScale, float *output);
+
+bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
+    const char *hCubinPath, const char *hKernelName, int hNumWarps, int hShared,
+    const char *oCubinPath, const char *oKernelName, int oNumWarps, int oShared,
+    int chunks, int chunkSize, int kDim, int vDim, int blockV,
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn, fastllm::Data &kCumdecay,
+    fastllm::Data &lastRecurrentState, fastllm::Data &coreAttnOut);
+
+bool FastllmCudaTritonChunkGdnPostConv(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared, int blockT,
+    const fastllm::Data &qInput, const fastllm::Data &kInput,
+    const fastllm::Data &vInput, const fastllm::Data &gInput,
+    const fastllm::Data &betaInput,
+    int batch, int seqLen, int keyHeads, int valueHeads,
+    int kDim, int vDim, float qScale,
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &beta,
+    fastllm::Data &kBeta, fastllm::Data &vBeta);
 
 bool FastllmCudaTritonMergeMOEFP8E4M3Indexed(
     const char *const *cubinPaths, const char *const *kernelNames,

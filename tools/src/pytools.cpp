@@ -34,6 +34,27 @@ struct FASTLLM_PYTOOLS_INIT {
 } fastllm_pytools_init;
 
 extern "C" {
+    typedef void (*FastllmModelLoadProgressCallback)(const char *stage,
+                                                     uint64_t current,
+                                                     uint64_t total,
+                                                     uint64_t completedBytes,
+                                                     uint64_t totalBytes);
+
+    DLL_EXPORT void set_model_load_progress_callback(FastllmModelLoadProgressCallback callback) {
+        if (callback == nullptr) {
+            fastllm::ClearModelLoadProgressCallback();
+            return;
+        }
+        fastllm::SetModelLoadProgressCallback(
+            [callback](const fastllm::ModelLoadProgress &progress) {
+                callback(progress.stage.c_str(),
+                         progress.current,
+                         progress.total,
+                         progress.completedBytes,
+                         progress.totalBytes);
+            });
+    }
+
     DLL_EXPORT void print_cpu_ins() {
         fastllm::PrintInstructionInfo();
     }
@@ -469,14 +490,16 @@ extern "C" {
     DLL_EXPORT void set_model_moe_atype(int modelId, char *moe_atype) {
         auto model = models.GetModel(modelId);
         std::string atypeStr = moe_atype;
-        if (atypeStr == "float16" || atypeStr == "half") {
+        if (atypeStr == "" || atypeStr == "auto") {
+            model->SetMoeAtype(fastllm::DataType::DATA_AUTO_NONE);
+        } else if (atypeStr == "float16" || atypeStr == "half") {
             model->SetMoeAtype(fastllm::DataType::FLOAT16);
         } else if (atypeStr == "bfloat16" || atypeStr == "bf16") {
             model->SetMoeAtype(fastllm::DataType::BFLOAT16);
-        } else if (atypeStr == "float" || atypeStr == "float32" || atypeStr == "" || atypeStr == "auto") {
+        } else if (atypeStr == "float" || atypeStr == "float32") {
             model->SetMoeAtype(fastllm::DataType::FLOAT32);
         } else {
-            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be float32, float16 or bfloat16.");
+            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be auto, float32, float16 or bfloat16.");
         }
         return;
     }
@@ -930,6 +953,27 @@ extern "C" {
             batch = 1;
         }
         model->maxBatch = batch;
+    }
+
+    DLL_EXPORT int get_max_batch_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        return model->maxBatch;
+    }
+
+    DLL_EXPORT int set_max_context_length_llm_model(int modelId, int length) {
+        auto model = models.GetModel(modelId);
+        if (length > 0 && length < model->max_positions) {
+            model->max_positions = length;
+        }
+        return model->max_positions;
+    }
+
+    DLL_EXPORT int get_kv_cache_token_limit_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        if (model->tokensLimit > 0) {
+            return model->tokensLimit;
+        }
+        return fastllm::GetMaxTokens();
     }
 
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {

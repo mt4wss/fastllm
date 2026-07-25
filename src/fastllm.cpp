@@ -261,6 +261,8 @@ namespace fastllm {
     thread_local Executor *curExecutor = &defaultExecutor;
 
     static std::mutex globalLocker;
+    static std::mutex modelLoadProgressLocker;
+    static ModelLoadProgressCallback modelLoadProgressCallback;
     static int threads = 4;
     static AliveThreadPool *fastllmAliveThreadPool = nullptr;
     static bool lowMemMode = false;
@@ -274,6 +276,31 @@ namespace fastllm {
     static int defaultPageLen = 128;
     static float gpuMemRatio = 0.9f;
     static Data emptyData;
+
+    void SetModelLoadProgressCallback(const ModelLoadProgressCallback &callback) {
+        std::lock_guard<std::mutex> guard(modelLoadProgressLocker);
+        modelLoadProgressCallback = callback;
+    }
+
+    void ClearModelLoadProgressCallback() {
+        std::lock_guard<std::mutex> guard(modelLoadProgressLocker);
+        modelLoadProgressCallback = nullptr;
+    }
+
+    void ReportModelLoadProgress(const std::string &stage,
+                                 uint64_t current,
+                                 uint64_t total,
+                                 uint64_t completedBytes,
+                                 uint64_t totalBytes) {
+        ModelLoadProgressCallback callback;
+        {
+            std::lock_guard<std::mutex> guard(modelLoadProgressLocker);
+            callback = modelLoadProgressCallback;
+        }
+        if (callback) {
+            callback({stage, current, total, completedBytes, totalBytes});
+        }
+    }
     static FastllmEnv fastllmEnv;
 
     static std::map <DataType, int> DataTypeBits = {
@@ -1283,6 +1310,40 @@ namespace fastllm {
                 data.scales.resize(k * group);
                 memcpy(data.mins.data(), oriMins, k * group * sizeof(float));
                 memcpy(data.scales.data(), oriScales, k * group * sizeof(float));
+                // AWQ stores an integer zero point separately from its FP16
+                // scale.  Keep that integer when the supplied affine metadata
+                // is exactly representable as (q - zero) * scale.  Rebuilding
+                // a FP16 min later introduces an avoidable second rounding and
+                // can accumulate across many recurrent MoE layers.
+                data.zeros.resize(k * group);
+                bool hasIntegerZeroPoints = true;
+                for (int i = 0; i < k * group; i++) {
+                    const float scale = data.scales[i];
+                    const float minValue = data.mins[i];
+                    if (!std::isfinite(scale) || !std::isfinite(minValue)) {
+                        hasIntegerZeroPoints = false;
+                        break;
+                    }
+                    if (scale == 0.0f) {
+                        if (minValue != 0.0f) {
+                            hasIntegerZeroPoints = false;
+                            break;
+                        }
+                        data.zeros[i] = 0;
+                        continue;
+                    }
+                    const int zero = (int)std::lroundf(-minValue / scale);
+                    const float error = std::fabs(minValue + scale * zero);
+                    const float tolerance = std::max(1e-7f, std::fabs(scale) * 1e-4f);
+                    if (zero < 0 || zero > 15 || error > tolerance) {
+                        hasIntegerZeroPoints = false;
+                        break;
+                    }
+                    data.zeros[i] = zero;
+                }
+                if (!hasIntegerZeroPoints) {
+                    data.zeros.clear();
+                }
                 data.perChannelAxis = 0;
                 /* data.perChannelsConfigs.resize(k * group);
                 for (int i = 0; i < k * group; i++) {
@@ -1863,7 +1924,14 @@ namespace fastllm {
             }
         } if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            if (this->dataType == DataType::FLOAT32) {
+            // IEEE float32/float16/bfloat16 all represent zero with all bits
+            // cleared.  Initializing large CUDA caches through a pageable host
+            // vector turns one logical memset into a synchronous H2D copy for
+            // every request and layer, which is especially expensive during
+            // batched prefill.
+            if (v == 0.0f) {
+                FastllmCudaMemset0(this->cudaData, this->expansionBytes);
+            } else if (this->dataType == DataType::FLOAT32) {
                 std::vector <float> f = std::vector <float> (Count(0), v);
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
             } else if (this->dataType == DataType::FLOAT16) {
@@ -3061,6 +3129,7 @@ namespace fastllm {
         bool useScore = this->dicts.find("tokenizer_use_score") != this->dicts.end()
                 && this->dicts["tokenizer_use_score"] == "1";
         int vocabLen = buffer.ReadInt();
+        ReportModelLoadProgress("tokenizer", 0, std::max(1, vocabLen));
         for (int i = 0; i < vocabLen; i++) {
             int len = buffer.ReadInt();
             std::string x = "";
@@ -3070,6 +3139,13 @@ namespace fastllm {
             int id = buffer.ReadInt();
             float score = useScore ? buffer.ReadFloat() : -i;
             tokenizer.Insert(x, id, score);
+            if (i + 1 == vocabLen ||
+                (i + 1) * 100 / std::max(1, vocabLen) != i * 100 / std::max(1, vocabLen)) {
+                ReportModelLoadProgress("tokenizer", i + 1, vocabLen);
+            }
+        }
+        if (vocabLen == 0) {
+            ReportModelLoadProgress("tokenizer", 1, 1);
         }
         bool hasSpecialTokens = this->dicts.find("tokenizer_has_special_tokens") != this->dicts.end()
                 && this->dicts["tokenizer_has_special_tokens"] == "1";
@@ -3086,7 +3162,10 @@ namespace fastllm {
         if (this->dicts.find("chat_template") != this->dicts.end())
             tokenizer.chatTemplate = this->dicts["chat_template"];
 
+        ReportModelLoadProgress("weights_prepare", 0, 1);
         int len = buffer.ReadInt();
+        ReportModelLoadProgress("weights_prepare", 1, 1);
+        ReportModelLoadProgress("weights_load", 0, std::max(1, len));
         for (int i = 0; i < len; i++) {
             std::string name = buffer.ReadString();
             //printf("%s\n", name.c_str());
@@ -3202,6 +3281,13 @@ namespace fastllm {
 
             printf("Load (%d / %d) \r", (i + 1), len);
             fflush(stdout);
+            if (i + 1 == len ||
+                (i + 1) * 100 / std::max(1, len) != i * 100 / std::max(1, len)) {
+                ReportModelLoadProgress("weights_load", i + 1, len);
+            }
+        }
+        if (len == 0) {
+            ReportModelLoadProgress("weights_load", 1, 1);
         }
         printf("\n");
         fflush(stdout);

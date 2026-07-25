@@ -105,7 +105,13 @@ namespace fastllm {
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
         virtual int GetChunkedPrefillSize() override;
 
+        virtual int GetBatchedPrefillTokenLimit() override;
+
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
+
+        virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const override;
+
+        virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const override;
 
         virtual void WarmupCudaRuntimeBuffers(int batch) override;
 
@@ -215,7 +221,10 @@ namespace fastllm {
             int tokens = 0;
         };
         bool mtpWeightsPrepared = false;
+        bool mtpSharedWeightsPrepared = false;
         int mtpWeightsPreparedDevice = -1;
+        std::vector <Data*> mtpMoeWeights;
+        std::vector <Data*> mtpMoeBiass;
         bool speculativeCollectAllLogits = false;
         bool speculativeCaptureAllHiddenStates = false;
         bool speculativeCacheOnlyForward = false;
@@ -290,7 +299,9 @@ namespace fastllm {
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpAttentionKVHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearConvSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        std::vector <uint8_t> threadTpLinearAttentionLayers;
         std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
         PersistentWorkerGroup threadTpWorkerGroup;
 
@@ -335,10 +346,12 @@ namespace fastllm {
                                         const Data &mropePositionDelta,
                                         Data &adjustedPositionIds);
         bool HasMtpWeights() const;
+        bool HasMtpMoeWeights() const;
         bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
         bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
         void AddMtpRmsNormOffset();
         void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        void RunMtpFeedForward(int device, Data &hiddenStates);
         void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
         Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
         Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);

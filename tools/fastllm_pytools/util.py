@@ -4,6 +4,15 @@ import sys
 import subprocess
 import glob
 
+def _positive_int(value: str) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
 def _has_cuda_device() -> bool:
     if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
         return True
@@ -203,7 +212,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
     parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效；auto默认使用float16，带缩放因子的FP8源权重保持FP8）')
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
-    parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用float32、float16或bfloat16')
+    parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
@@ -254,6 +263,9 @@ def add_server_args(parser):
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
+    parser.add_argument("--max_context_length", "--max-context-length", dest = "max_context_length",
+                        type = _positive_int, default = -1,
+                        help = "限制单会话输入和输出合计的最大token数；默认取模型上限和KV Cache总容量的较小值")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
@@ -262,6 +274,12 @@ def add_server_args(parser):
     parser.add_argument("--think", type = str, default = "false", help="if <think> lost")
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
     parser.add_argument("--dev_mode", action = 'store_true', help = "开发模式, 启用后能够获取对话列表并主动停止")
+    parser.add_argument(
+        "--startup-progress",
+        choices = ["off", "ndjson"],
+        default = "off",
+        help = "启动进度输出格式；ndjson 会向 stderr 输出 FTLLM_PROGRESS 事件",
+    )
 
 def expand_cudapp_device(device_str):
     if not device_str or not device_str.startswith("cudapp="):
@@ -280,7 +298,9 @@ def expand_cudapp_device(device_str):
         weights = [1] * n
     return str({f'cuda:{i}': w for i, w in enumerate(weights)})
 
-def make_normal_llm_model(args):
+def make_normal_llm_model(args, startup_progress = None):
+    if startup_progress is not None:
+        startup_progress.progress("initializing", 0, 1)
     if (args.model and args.model != ''):
         if (args.model.endswith(".json") and os.path.exists(args.model)):
             import json
@@ -582,28 +602,60 @@ def make_normal_llm_model(args):
     if (args.chat_template != "" and os.path.exists(args.chat_template)):
         with open(args.chat_template, "r", encoding="utf-8") as file:
             args.chat_template = file.read()
-    model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
-                        moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora, 
-                        dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
-    if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
-        model.enable_thinking = False
-    model.set_atype(args.atype)
-    if (args.moe_atype != ""):
-        model.set_moe_atype(args.moe_atype)
-    if (args.cache_history.lower() not in ["", "false", "0", "off"]):
-        model.set_save_history(True)
-        if (args.cache_fast in ["", "false", "0", "off"]):
-            llm.set_cpu_historycache(True)
-    if (args.moe_experts > 0):
-        model.set_moe_experts(args.moe_experts)
-    if (args.max_batch > 0):
-        model.set_max_batch(args.max_batch)
-    if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
-        model.set_kv_cache_limit(args.kv_cache_limit)
-    if (args.chunked_prefill_size > 0):
-        model.set_chunked_prefill_size(args.chunked_prefill_size)
-    model.warmup()
-    return model
+    if startup_progress is not None:
+        startup_progress.progress("initializing", 1, 1)
+        llm.set_model_load_progress_callback(startup_progress.model_load_progress)
+    try:
+        model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
+                            moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora,
+                            dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
+        llm.report_model_load_progress("weights_finalize", 0, 1)
+        if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
+            model.enable_thinking = False
+        model.set_atype(args.atype)
+        if (args.moe_atype != ""):
+            model.set_moe_atype(args.moe_atype)
+        if (args.cache_history.lower() not in ["", "false", "0", "off"]):
+            model.set_save_history(True)
+            if (args.cache_fast in ["", "false", "0", "off"]):
+                llm.set_cpu_historycache(True)
+        if (args.moe_experts > 0):
+            model.set_moe_experts(args.moe_experts)
+        if (args.max_batch > 0):
+            model.set_max_batch(args.max_batch)
+        model.native_context_window = model.get_max_input_len()
+        model.configured_context_window_limit = None
+        max_context_length = getattr(args, "max_context_length", -1)
+        if (max_context_length == 0 or max_context_length < -1):
+            raise ValueError("--max_context_length must be a positive integer")
+        if (max_context_length > 0):
+            model.configured_context_window_limit = max_context_length
+            effective_context_length = model.set_max_context_length(max_context_length)
+            print("[Fastllm] Per-session context window limit: %d tokens "
+                  "(requested=%d, model max=%d)." %
+                  (effective_context_length, max_context_length, model.native_context_window))
+        if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
+            model.set_kv_cache_limit(args.kv_cache_limit)
+        if (args.chunked_prefill_size > 0):
+            model.set_chunked_prefill_size(args.chunked_prefill_size)
+        llm.report_model_load_progress("weights_finalize", 1, 1)
+        llm.report_model_load_progress("warmup", 0, 1)
+        model.warmup()
+        llm.report_model_load_progress("warmup", 1, 1)
+        effective_max_batch = model.get_max_batch()
+        if (mtp > 0 and args.max_batch > 0 and
+                effective_max_batch > 0 and effective_max_batch < args.max_batch):
+            raise RuntimeError(
+                "MTP startup validation failed: requested --max_batch=%d, but "
+                "the current model/TP/MTP/GPU memory configuration safely "
+                "supports at most %d concurrent requests. Lower --max_batch "
+                "to %d or less, reduce --mtp, or use GPUs with more memory."
+                % (args.max_batch, effective_max_batch, effective_max_batch)
+            )
+        return model
+    finally:
+        if startup_progress is not None:
+            llm.set_model_load_progress_callback(None)
 
 def make_download_parser(add_help = True):
     parser = argparse.ArgumentParser(

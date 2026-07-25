@@ -20,11 +20,16 @@ using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
 
 bool FastllmInitNccl(const std::vector<int>& devices);
 // Graph-safe small-tensor all-reduce backed by direct peer reads and a GPU-side
-// barrier.  Both functions return false when disabled or unsupported so NCCL
-// remains the fallback.
+// barrier. It is opt-in through FASTLLM_CUDA_CUSTOM_ALLREDUCE=1; all functions
+// return false when disabled or unsupported so NCCL remains the fallback.
+bool FastllmCudaCustomAllReduceEnabled();
 bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
+// TP=2 graph-safe fused residual path: dest = allreduce(data) + dest.
+// Returns false without modifying dest when the topology/type is unsupported.
+bool FastllmCudaCustomAllReduceAdd(void* data, void* dest, int count,
+                                   int dataType, int deviceId);
 // CUDA Graph 中的跨卡点对点搬运使用独立的双 rank 通信域，避免与模型的
 // TP/EP 集合通信共享 NCCL 操作序列。通信域必须在开始 stream capture 前创建。
 bool FastllmInitNcclGraphPeer(int srcDevice, int dstDevice);

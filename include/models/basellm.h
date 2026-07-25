@@ -174,6 +174,14 @@ namespace fastllm {
 
         virtual ~basellm();
 
+    protected:
+        // Stop the scheduler and release every request context.  The operation
+        // is idempotent so a derived destructor can drop model-specific cache
+        // managers only after no request Data object still references them.
+        void ShutdownRuntime();
+
+    public:
+
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
         virtual void InitParams(); // 初始化参数信息 
@@ -328,6 +336,12 @@ namespace fastllm {
 
         virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const { return 0; }
 
+        // AutoWarmup 最多允许 linear-attention 固定状态和模型 runtime buffer
+        // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
+        virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
+
+        virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
+
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
 
         // 当前运行配置是否可以使用 ForwardGPU。
@@ -377,6 +391,13 @@ namespace fastllm {
 
         virtual int GetChunkedPrefillSize();
 
+        // Maximum aggregate token count when several independent short
+        // prompts are combined into one prefill.  This is normally identical
+        // to the per-request chunk size, but hybrid models may use smaller
+        // per-request chunks for recurrent-state snapshots while retaining a
+        // larger aggregate batching limit.
+        virtual int GetBatchedPrefillTokenLimit();
+
         virtual void SetDataType(DataType dataType);
 
         virtual void SetKVCacheDataType(DataType dataType);
@@ -400,6 +421,10 @@ namespace fastllm {
         virtual std::vector <int> ApplyChatTemplateToTokens(const JinjaVar &var);
 
         // 输出未满足最低长度时阻止产生EOS
+        std::vector<int> GetMinOutputResetLengths(
+            int batch,
+            const std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+            const std::vector<GenerationConfig> &generationConfigs) const;
         virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues, 
             const GenerationConfig &generationConfig);
         virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
@@ -493,6 +518,7 @@ namespace fastllm {
         DataType moeAtype = DataType::FLOAT32; // MOE 层激活类型，可由 --moe_atype 设定
         bool isFree = false; // 是否释放
         bool useCustomKVCacheDataType = false;
+        bool useCustomMoeAtype = false;
 
         int kvCacheId = 0; // 最早使用kv_cache的层编号 （因为有一些混合架构的模型，其中一些block是线性attention）
         bool canDoBatchForward = true; // 是否支持batch推理

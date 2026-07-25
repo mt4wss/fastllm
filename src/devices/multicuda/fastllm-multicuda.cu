@@ -19,6 +19,7 @@
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <thread>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
@@ -1636,6 +1637,11 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curDevice->scales.resize(lenGroupCount);
                     curDevice->mins.resize(lenGroupCount);
                     if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+                        if (!weight.zeros.empty()) {
+                            fastllm::AssertInFastLLM(weight.zeros.size() == kGroupCount,
+                                                     "INT4_GROUP tensor parallel row split zero-point shape mismatch.\n");
+                            curDevice->zeros.resize(lenGroupCount);
+                        }
                         int curLen = 0;
                         for (auto &it : div) {
                             size_t dstOffset = static_cast<size_t>(curLen) * weightGroupSize;
@@ -1645,6 +1651,10 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                    copyCount * sizeof(float));
                             memcpy(curDevice->mins.data() + dstOffset, weight.mins.data() + srcOffset,
                                    copyCount * sizeof(float));
+                            if (!weight.zeros.empty()) {
+                                memcpy(curDevice->zeros.data() + dstOffset, weight.zeros.data() + srcOffset,
+                                       copyCount * sizeof(int));
+                            }
                             curLen += (it.second - it.first);
                         }
                     } else {
@@ -1664,25 +1674,79 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                         }
                     }
                 } else {
-                    curDevice->scales.resize(kGroupCount);
-                    curDevice->mins.resize(kGroupCount);
-                    curDevice->group = weight.group;
                     curDevice->groupCnt = weight.groupCnt;
                     if (weight.dataType == fastllm::DataType::INT4_GROUP) {
-                        int base = div[0].first / weight.groupCnt;
-                        std::vector <float> scales, mins;
-                        size_t baseOffset = static_cast<size_t>(base);
-                        for (size_t i = 0; i < weight.scales.size(); i++) {
-                            size_t src = i + baseOffset;
-                            scales.push_back(src < weight.scales.size() ? weight.scales[src] : 0.0f);
+                        fastllm::AssertInFastLLM(weight.groupCnt > 0 && weight.group > 0,
+                                                 "INT4_GROUP tensor parallel column split requires valid group metadata.\n");
+                        fastllm::AssertInFastLLM(weight.scales.size() == kGroupCount &&
+                                                 weight.mins.size() == kGroupCount,
+                                                 "INT4_GROUP tensor parallel column split scale shape mismatch.\n");
+
+                        int localGroup = len == 0 ? 0 : (len - 1) / weight.groupCnt + 1;
+                        curDevice->group = localGroup;
+                        curDevice->scales.resize(kSize * static_cast<size_t>(localGroup));
+                        curDevice->mins.resize(kSize * static_cast<size_t>(localGroup));
+                        if (!weight.zeros.empty()) {
+                            fastllm::AssertInFastLLM(weight.zeros.size() == kGroupCount,
+                                                     "INT4_GROUP tensor parallel column split zero-point shape mismatch.\n");
+                            curDevice->zeros.resize(kSize * static_cast<size_t>(localGroup));
                         }
-                        for (size_t i = 0; i < weight.mins.size(); i++) {
-                            size_t src = i + baseOffset;
-                            mins.push_back(src < weight.mins.size() ? weight.mins[src] : 0.0f);
+                        if (len == 0) {
+                            continue;
                         }
-                        memcpy(curDevice->scales.data(), scales.data(), kGroupCount * sizeof(float));
-                        memcpy(curDevice->mins.data(), mins.data(), kGroupCount * sizeof(float));
+
+                        std::vector<int> sourceGroups(static_cast<size_t>(localGroup), -1);
+                        size_t localColumn = 0;
+                        for (auto &it : div) {
+                            fastllm::AssertInFastLLM(it.first >= 0 && it.second >= it.first && it.second <= m,
+                                                     "INT4_GROUP tensor parallel column split range is invalid.\n");
+                            size_t sourceColumn = static_cast<size_t>(it.first);
+                            size_t sourceEnd = static_cast<size_t>(it.second);
+                            while (sourceColumn < sourceEnd) {
+                                size_t localScaleColumn = localColumn / static_cast<size_t>(weight.groupCnt);
+                                size_t sourceScaleColumn = sourceColumn / static_cast<size_t>(weight.groupCnt);
+                                fastllm::AssertInFastLLM(localScaleColumn < sourceGroups.size() &&
+                                                         sourceScaleColumn < weightGroupSize,
+                                                         "INT4_GROUP tensor parallel column split scale index overflow.\n");
+                                if (sourceGroups[localScaleColumn] < 0) {
+                                    sourceGroups[localScaleColumn] = static_cast<int>(sourceScaleColumn);
+                                } else {
+                                    fastllm::AssertInFastLLM(
+                                        sourceGroups[localScaleColumn] == static_cast<int>(sourceScaleColumn),
+                                        "INT4_GROUP tensor parallel column split crosses incompatible groups.\n");
+                                }
+                                size_t localRemain = static_cast<size_t>(weight.groupCnt) -
+                                                     localColumn % static_cast<size_t>(weight.groupCnt);
+                                size_t sourceRemain = static_cast<size_t>(weight.groupCnt) -
+                                                      sourceColumn % static_cast<size_t>(weight.groupCnt);
+                                size_t step = std::min(sourceEnd - sourceColumn,
+                                                       std::min(localRemain, sourceRemain));
+                                localColumn += step;
+                                sourceColumn += step;
+                            }
+                        }
+                        fastllm::AssertInFastLLM(localColumn == static_cast<size_t>(len),
+                                                 "INT4_GROUP tensor parallel column split scale length mismatch.\n");
+                        for (int group = 0; group < localGroup; group++) {
+                            fastllm::AssertInFastLLM(sourceGroups[group] >= 0,
+                                                     "INT4_GROUP tensor parallel column split has an unmapped group.\n");
+                        }
+                        for (size_t row = 0; row < kSize; row++) {
+                            for (int group = 0; group < localGroup; group++) {
+                                size_t dst = row * static_cast<size_t>(localGroup) + static_cast<size_t>(group);
+                                size_t src = row * weightGroupSize +
+                                             static_cast<size_t>(sourceGroups[group]);
+                                curDevice->scales[dst] = weight.scales[src];
+                                curDevice->mins[dst] = weight.mins[src];
+                                if (!weight.zeros.empty()) {
+                                    curDevice->zeros[dst] = weight.zeros[src];
+                                }
+                            }
+                        }
                     } else {
+                        curDevice->scales.resize(kGroupCount);
+                        curDevice->mins.resize(kGroupCount);
+                        curDevice->group = weight.group;
                         curDevice->zeros.resize(kGroupCount);
                         memcpy(curDevice->scales.data(), weight.scales.data(), kGroupCount * sizeof(float));
                         memcpy(curDevice->mins.data(), weight.mins.data(), kGroupCount * sizeof(float));
@@ -2215,14 +2279,14 @@ static bool FastllmNcclPostSyncEnabled(cudaStream_t stream) {
 
 namespace {
 
-// Speculative verification uses 2--4 rows of hidden states. At TP=2 these
-// tensors are only tens of KiB, where NCCL launch/protocol latency is larger
-// than the actual peer transfer. Keep this path deliberately narrow: single
-// process, two peer-accessible CUDA devices, residual-fused reductions, and
-// tensors large enough to be the multi-token verification path. Everything
-// else uses the existing NCCL implementation.
+// Keep the direct-read path bounded to the same 8 MiB envelope used by
+// vLLM's one-stage custom all-reduce.  Decode batches for wide dense models
+// readily exceed the old 64K-element speculative-decoding limit (for example,
+// batch 64 x hidden 5120 is 640 KiB), where falling back to NCCL dominates the
+// layer time despite the tensor still being a good fit for one-stage P2P.
 constexpr int FASTLLM_TP2_P2P_MIN_ELEMENTS = 4096;
-constexpr int FASTLLM_TP2_P2P_MAX_ELEMENTS = 65536;
+constexpr size_t FASTLLM_TP2_P2P_MAX_BYTES =
+    8ULL * 1024ULL * 1024ULL;
 constexpr int FASTLLM_TP2_P2P_MAX_BLOCKS = 36;
 
 struct alignas(128) FastllmTP2P2PSignal {
@@ -2233,12 +2297,25 @@ struct alignas(128) FastllmTP2P2PSignal {
 };
 
 struct FastllmTP2P2PState {
+    struct HostPointerSlot {
+        std::atomic<uint32_t> sequences[2];
+        std::atomic<uintptr_t> inputPointers[2];
+
+        HostPointerSlot() {
+            for (int rank = 0; rank < 2; rank++) {
+                sequences[rank].store(0, std::memory_order_relaxed);
+                inputPointers[rank].store(0, std::memory_order_relaxed);
+            }
+        }
+    };
+
     std::mutex initMutex;
     bool initialized = false;
     bool available = false;
     int devices[2] = {-1, -1};
     FastllmTP2P2PSignal *signals[2] = {nullptr, nullptr};
     std::atomic<uint32_t> sequence[2];
+    HostPointerSlot hostPointerSlots[2];
 
     FastllmTP2P2PState() {
         sequence[0].store(0, std::memory_order_relaxed);
@@ -2254,6 +2331,21 @@ FastllmTP2P2PState &FastllmGetTP2P2PState() {
 bool FastllmTP2P2PEnabled() {
     static bool enabled = []() {
         const char *env = std::getenv("FASTLLM_CUDA_TP2_P2P_ALLREDUCE");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return value != "0" && value != "false" && value != "off" &&
+               value != "no";
+    }();
+    return enabled;
+}
+
+bool FastllmTP2P2PHostPointerExchangeEnabled() {
+    static bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_CUDA_TP2_HOST_POINTER_EXCHANGE");
         if (env == nullptr || env[0] == '\0') {
             return true;
         }
@@ -2392,6 +2484,66 @@ __global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddDirectKernel(
     }
 }
 
+// FastLLM runs TP ranks in persistent host workers in the same process, so
+// peer-access UVA pointers can be exchanged before launch.  Keeping pointer
+// publication out of the GPU kernel removes one system-scope release/acquire
+// per block.  The remaining two barriers deliberately match vLLM's one-stage
+// custom all-reduce: they only coordinate progress and therefore use volatile
+// global loads/stores rather than system fences.
+template <typename T>
+__global__ __launch_bounds__(512, 1) void FastllmTP2P2PReduceAddKnownPeerKernel(
+        T *dst, const T *residual, const T *localInput,
+        const T *peerInput, int count,
+        FastllmTP2P2PSignal *selfSignal,
+        FastllmTP2P2PSignal *peerSignal,
+        int rank, uint32_t sequence) {
+    const int peerRank = 1 - rank;
+    const int slot = sequence & 1;
+    if (threadIdx.x == 0) {
+        FastllmTP2StoreRelease(
+            &peerSignal->flags[0][slot][blockIdx.x][rank], sequence);
+        while (FastllmTP2LoadAcquire(
+                   &selfSignal->flags[0][slot][blockIdx.x][peerRank]) !=
+               sequence) {
+        }
+    }
+    __syncthreads();
+
+    using Packed = FastllmTP2Packed<T>;
+    constexpr int valuesPerPack = 16 / sizeof(T);
+    const int packedCount = count / valuesPerPack;
+    Packed *packedDst = (Packed*)dst;
+    const Packed *packedResidual = (const Packed*)residual;
+    const Packed *packedLocal = (const Packed*)localInput;
+    const Packed *packedPeer = (const Packed*)peerInput;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < packedCount; index += gridDim.x * blockDim.x) {
+        Packed localValue = packedLocal[index];
+        Packed peerValue = packedPeer[index];
+        Packed rank0 = rank == 0 ? localValue : peerValue;
+        Packed rank1 = rank == 0 ? peerValue : localValue;
+        Packed residualValue = packedResidual[index];
+#pragma unroll
+        for (int i = 0; i < valuesPerPack; i++) {
+            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
+                                                 rank1.values[i]);
+            rank0.values[i] = FastllmTP2AddValue(rank0.values[i],
+                                                 residualValue.values[i]);
+        }
+        packedDst[index] = rank0;
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        FastllmTP2StoreRelease(
+            &peerSignal->flags[1][slot][blockIdx.x][rank], sequence);
+        while (FastllmTP2LoadAcquire(
+                   &selfSignal->flags[1][slot][blockIdx.x][peerRank]) !=
+               sequence) {
+        }
+    }
+}
+
 bool FastllmInitTP2P2PState(FastllmTP2P2PState &state) {
     std::lock_guard<std::mutex> guard(state.initMutex);
     if (state.initialized) {
@@ -2495,19 +2647,68 @@ void FastllmLaunchTP2P2PReduceAddDirect(
         selfSignal, peerSignal, rank, sequence);
 }
 
+template <typename T>
+void FastllmLaunchTP2P2PReduceAddKnownPeer(
+        T *dst, const T *residual, const T *localInput,
+        const T *peerInput, int count,
+        FastllmTP2P2PSignal *selfSignal,
+        FastllmTP2P2PSignal *peerSignal,
+        int rank, uint32_t sequence, cudaStream_t stream) {
+    constexpr int valuesPerPack = 16 / sizeof(T);
+    int packedCount = count / valuesPerPack;
+    int blocks = std::max(1, std::min(FASTLLM_TP2_P2P_MAX_BLOCKS,
+                                     (packedCount + 511) / 512));
+    FastllmTP2P2PReduceAddKnownPeerKernel<T><<<blocks, 512, 0, stream>>>(
+        dst, residual, localInput, peerInput, count,
+        selfSignal, peerSignal, rank, sequence);
+}
+
+const void *FastllmTP2P2PExchangeHostPointer(
+        FastllmTP2P2PState &state, int rank, uint32_t sequence,
+        const void *localInput) {
+    const int slot = sequence & 1;
+    const int peerRank = 1 - rank;
+    auto &hostSlot = state.hostPointerSlots[slot];
+    hostSlot.inputPointers[rank].store(
+        (uintptr_t)localInput, std::memory_order_relaxed);
+    hostSlot.sequences[rank].store(sequence, std::memory_order_release);
+
+    // Both TP ranks are persistent workers.  A short spin keeps their CUDA
+    // launches aligned; yield occasionally so initialization or tracing never
+    // starves the peer worker on CPU-constrained hosts.
+    uint32_t spins = 0;
+    while (hostSlot.sequences[peerRank].load(std::memory_order_acquire) !=
+           sequence) {
+        if ((++spins & 1023U) == 0) {
+            std::this_thread::yield();
+        }
+    }
+    return (const void*)hostSlot.inputPointers[peerRank].load(
+        std::memory_order_relaxed);
+}
+
 } // namespace
 
 static bool FastllmCanUseTP2P2PAllReduceAddImpl(
         int count, int dataType, int deviceId, int *rankOut) {
+    size_t typeBytes = dataType == fastllm::DataType::FLOAT32
+        ? sizeof(float) : sizeof(uint16_t);
+    size_t bytes = (size_t)count * typeBytes;
     if (count < FASTLLM_TP2_P2P_MIN_ELEMENTS ||
-        count > FASTLLM_TP2_P2P_MAX_ELEMENTS ||
-        ((size_t)count * (dataType == fastllm::DataType::FLOAT32
-             ? sizeof(float) : sizeof(uint16_t))) % 16 != 0 ||
+        bytes > FASTLLM_TP2_P2P_MAX_BYTES || bytes % 16 != 0 ||
         (dataType != fastllm::DataType::FLOAT16 &&
          dataType != fastllm::DataType::BFLOAT16 &&
          dataType != fastllm::DataType::FLOAT32) ||
-        FastllmCudaGetNcclForceSync() || fastllm::GetFastllmEnv().cudaGraph) {
+        FastllmCudaGetNcclForceSync()) {
         return false;
+    }
+
+    // CUDA Graph uses pre-registered pointer tuples and device-side counters.
+    // Avoid touching the eager path's host sequence state while capturing.
+    if (fastllm::GetFastllmEnv().cudaGraph) {
+        return FastllmCudaCustomAllReduceEnabled() &&
+               g_ncclWorldSize == 2 &&
+               g_ncclRanks.find(deviceId) != g_ncclRanks.end();
     }
 
     FastllmTP2P2PState &state = FastllmGetTP2P2PState();
@@ -2539,6 +2740,11 @@ bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count,
         return false;
     }
 
+    if (fastllm::GetFastllmEnv().cudaGraph) {
+        return FastllmCudaCustomAllReduceAdd(
+            data, dest, count, dataType, deviceId);
+    }
+
     int rank = -1;
     if (!FastllmCanUseTP2P2PAllReduceAddImpl(
             count, dataType, deviceId, &rank)) {
@@ -2549,22 +2755,51 @@ bool FastllmTryTP2P2PAllReduceAdd(void* data, void* dest, int count,
         1, std::memory_order_relaxed) + 1;
     cudaSetDevice(deviceId);
     cudaStream_t stream = cudaStreamPerThread;
+    const void *peerData = nullptr;
+    if (FastllmTP2P2PHostPointerExchangeEnabled()) {
+        peerData = FastllmTP2P2PExchangeHostPointer(
+            state, rank, sequence, data);
+    }
     if (dataType == fastllm::DataType::FLOAT16) {
-        FastllmLaunchTP2P2PReduceAddDirect(
-            (half*)dest, (const half*)dest, (const half*)data, count,
-            state.signals[rank], state.signals[1 - rank],
-            rank, sequence, stream);
+        if (peerData != nullptr) {
+            FastllmLaunchTP2P2PReduceAddKnownPeer(
+                (half*)dest, (const half*)dest, (const half*)data,
+                (const half*)peerData, count,
+                state.signals[rank], state.signals[1 - rank],
+                rank, sequence, stream);
+        } else {
+            FastllmLaunchTP2P2PReduceAddDirect(
+                (half*)dest, (const half*)dest, (const half*)data, count,
+                state.signals[rank], state.signals[1 - rank],
+                rank, sequence, stream);
+        }
     } else if (dataType == fastllm::DataType::BFLOAT16) {
-        FastllmLaunchTP2P2PReduceAddDirect(
-            (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
-            (const __nv_bfloat16*)data, count,
-            state.signals[rank], state.signals[1 - rank],
-            rank, sequence, stream);
+        if (peerData != nullptr) {
+            FastllmLaunchTP2P2PReduceAddKnownPeer(
+                (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
+                (const __nv_bfloat16*)data, (const __nv_bfloat16*)peerData,
+                count, state.signals[rank], state.signals[1 - rank],
+                rank, sequence, stream);
+        } else {
+            FastllmLaunchTP2P2PReduceAddDirect(
+                (__nv_bfloat16*)dest, (const __nv_bfloat16*)dest,
+                (const __nv_bfloat16*)data, count,
+                state.signals[rank], state.signals[1 - rank],
+                rank, sequence, stream);
+        }
     } else {
-        FastllmLaunchTP2P2PReduceAddDirect(
-            (float*)dest, (const float*)dest, (const float*)data, count,
-            state.signals[rank], state.signals[1 - rank],
-            rank, sequence, stream);
+        if (peerData != nullptr) {
+            FastllmLaunchTP2P2PReduceAddKnownPeer(
+                (float*)dest, (const float*)dest, (const float*)data,
+                (const float*)peerData, count,
+                state.signals[rank], state.signals[1 - rank],
+                rank, sequence, stream);
+        } else {
+            FastllmLaunchTP2P2PReduceAddDirect(
+                (float*)dest, (const float*)dest, (const float*)data, count,
+                state.signals[rank], state.signals[1 - rank],
+                rank, sequence, stream);
+        }
     }
     cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess) {
