@@ -337,6 +337,78 @@ namespace fastllm {
         }
     }
 
+    extern bool LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Kernel(
+                        uint8_t *inputData, uint8_t *weightData,
+                        float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+
+    bool LinearINT8GROUP32_INT4GROUP32_Kernel(uint8_t *inputData, uint8_t *weightData,
+                        float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (m <= 0 || m % 32 != 0) {
+            return false;
+        }
+        if (GetCPUInstructInfo()->hasAVX512VNNI) {
+            return LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Kernel(
+                inputData, weightData, biasData, outputData,
+                n, m, k, st, end);
+        }
+        constexpr int groupCnt = 32;
+        const int groups = m / groupCnt;
+        const size_t lda = GetDataBytes(DataType::INF_INT8_GROUP32, 1, m);
+        const size_t ldb = GetDataBytes(DataType::INT4_GROUP32, 1, m);
+        const size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        constexpr size_t astride = groupCnt + sizeof(float) + sizeof(int);
+
+#ifdef __AVX2__
+        const __m128i nibbleMask128 = _mm_set1_epi8(0x0f);
+        const __m256i ones = _mm256_set1_epi16(1);
+#endif
+        for (int i = 0; i < n; i++) {
+            float *floatC = (float*)((uint8_t*)outputData + (size_t)i * ldc);
+            for (int j = st; j < end; j++) {
+                float total = 0.0f;
+                for (int g = 0; g < groups; g++) {
+                    const uint8_t *inputGroup = inputData + (size_t)i * lda + (size_t)g * astride;
+                    const int8_t *quantizedInput = (const int8_t*)inputGroup;
+                    const float scaleA = *(const float*)(inputGroup + groupCnt);
+                    const int sumA = *(const int*)(inputGroup + groupCnt + sizeof(float));
+
+                    const uint8_t *weightRow = weightData + (size_t)j * ldb;
+                    const uint8_t *weightGroup = weightRow +
+                        GetInt4Group32DataOffset(g, groups);
+                    const uint16_t scaleBits = *(const uint16_t*)(weightRow +
+                        GetInt4Group32ScaleOffset(g, groups));
+                    const float scaleB = BFloat16BitsToFloat32(scaleBits);
+                    int sum = 0;
+#ifdef __AVX2__
+                    // Group-32 weights keep FastLLM's normal high/low nibble order.
+                    // Interleave the two nibble vectors back to q0..q31 before
+                    // using the unsigned-byte x signed-byte dot product.
+                    __m128i packed = _mm_loadu_si128((const __m128i*)weightGroup);
+                    __m128i low = _mm_and_si128(packed, nibbleMask128);
+                    __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), nibbleMask128);
+                    __m256i quantizedWeight = _mm256_set_m128i(
+                        _mm_unpackhi_epi8(high, low), _mm_unpacklo_epi8(high, low));
+                    __m256i input = _mm256_loadu_si256((const __m256i*)quantizedInput);
+                    __m256i products = _mm256_maddubs_epi16(quantizedWeight, input);
+                    sum = I32sum(_mm256_madd_epi16(products, ones));
+#else
+                    for (int l = 0; l < groupCnt; l += 2) {
+                        uint8_t packed = weightGroup[l / 2];
+                        sum += quantizedInput[l] * ((packed >> 4) & 0x0f) +
+                               quantizedInput[l + 1] * (packed & 0x0f);
+                    }
+#endif
+                    total += (sum - 8 * sumA) * scaleA * scaleB;
+                }
+                floatC[j] = total;
+            }
+        }
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+
     void MultiThreadLinearFloat32Float32Op::Run() {
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
@@ -826,88 +898,59 @@ namespace fastllm {
                 }
             }
         }
-#elif defined(__aarch64__FOR_FP16_FP16)
-        // 定义常量 Mask，用于提取权重的位
-        const uint8x16_t mask_sign = vdupq_n_u8(0x80);
-        const uint8x16_t mask_body = vdupq_n_u8(0x7F);
+#elif defined(__aarch64__)
+        // E4M3 values can be represented as tiny FP32 values by moving their
+        // sign/body bits to the corresponding FP32 positions. Multiplication
+        // by 2^120 restores the real magnitude. This avoids a lookup per
+        // element and, unlike the old dormant ARM path, correctly treats the
+        // input as BF16 rather than FP16.
+        const uint32x4_t signMask = vdupq_n_u32(0x80);
+        const uint32x4_t bodyMask = vdupq_n_u32(0x7f);
 
         for (int i = 0; i < n; i++) {
+            const uint16_t *inputRow = inputData + (size_t)i * m;
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
+                const uint8_t *weightRow = weightData + (size_t)j * m;
                 int currentBlockK = j / blockK;
 
                 for (int midx = 0; midx < ms; midx++) {
-                    // pow(2, 8) 是常量 256.0f
-                    float curScale = scales[currentBlockK * ms + midx] * 256.0f;
-                    
+                    float curScale = scales[currentBlockK * ms + midx];
                     int l = midx * blockM;
-                    int l_end = l + blockM;
-                    if (l_end > m) l_end = m;
-                    
-                    // 初始化 FP16 累加器向量为 0
-                    float16x8_t acc_vec = vdupq_n_f16(0.0f);
-                    
-                    // 指向当前 Input 和 Weight 的指针
-                    // 注意：这里假设 inputData 是以 uint16_t 存储的 fp16 数据，强制转换为 float16_t* 读取
-                    const float16_t* ptr_in = (const float16_t*)(inputData + i * m + l);
-                    const uint8_t* ptr_w = (const uint8_t*)(weightData + j * m + l);
-                    
-                    int count = l_end - l;
-                    int vec_step = 0;
+                    int lEnd = std::min(m, l + blockM);
+                    float32x4_t sum0 = vdupq_n_f32(0.0f);
+                    float32x4_t sum1 = vdupq_n_f32(0.0f);
 
-                    // 1. 向量化循环：每次处理 16 个元素 (2个 float16x8 块)
-                    for (; vec_step <= count - 16; vec_step += 16) {
-                        // --- 加载输入 (FP16) ---
-                        float16x8_t in0 = vld1q_f16(ptr_in + vec_step);
-                        float16x8_t in1 = vld1q_f16(ptr_in + vec_step + 8);
-                        
-                        // --- 加载并解压权重 (UINT8 -> FP16) ---
-                        // 加载 16 个 uint8 权重
-                        uint8x16_t w_raw = vld1q_u8(ptr_w + vec_step);
-                        
-                        // 将 128位的 u8x16 拆分为两个 64位的 u8x8 以便进行长移位(vshll)
-                        uint8x8_t w_low = vget_low_u8(w_raw);
-                        uint8x8_t w_high = vget_high_u8(w_raw);
-                        
-                        // [Low Part] 处理前 8 个权重
-                        // 逻辑: ((u8 & 0x80) << 8) | ((u8 & 0x7F) << 7)
-                        uint16x8_t w0_sign = vshll_n_u8(vand_u8(w_low, vget_low_u8(mask_sign)), 8);
-                        uint16x8_t w0_body = vshll_n_u8(vand_u8(w_low, vget_low_u8(mask_body)), 7);
-                        float16x8_t w0 = vreinterpretq_f16_u16(vorrq_u16(w0_sign, w0_body));
-                        
-                        // [High Part] 处理后 8 个权重
-                        uint16x8_t w1_sign = vshll_n_u8(vand_u8(w_high, vget_high_u8(mask_sign)), 8);
-                        uint16x8_t w1_body = vshll_n_u8(vand_u8(w_high, vget_high_u8(mask_body)), 7);
-                        float16x8_t w1 = vreinterpretq_f16_u16(vorrq_u16(w1_sign, w1_body));
-                        
-                        // --- FMA 计算 ---
-                        acc_vec = vfmaq_f16(acc_vec, in0, w0);
-                        acc_vec = vfmaq_f16(acc_vec, in1, w1);
-                    }
-                    
-                    // 将 sum_vec 转换为 FP32 并求和
-                    float16x4_t slow = vget_low_f16(acc_vec);
-                    float16x4_t shigh = vget_high_f16(acc_vec);
-                    float32x4_t flow = vcvt_f32_f16(slow);
-                    float32x4_t fhigh = vcvt_f32_f16(shigh);
-                    float blockSum = vaddvq_f32(flow) + vaddvq_f32(fhigh);
-                    
-                    // 2. 处理剩余的元素 (Scalar cleanup)
-                    for (int k = vec_step; k < count; k++) {
-                        int current_idx = i * m + l + k;
-                        // 使用 dict 保持与原始代码一致的转换行为，或者直接转换
-                        float inp = fp16tofp32.dict[inputData[current_idx]]; 
-                        
-                        uint8_t u8_val = weightData[j * m + l + k];
-                        uint16_t fp32_w_bits = ((uint16_t)(u8_val & 0x80) << 8) | ((uint16_t)(u8_val & 0x7F) << 7);
-                        float w = fp16tofp32.dict[fp32_w_bits];
+                    for (; l + 7 < lEnd; l += 8) {
+                        uint16x8_t bf16 = vld1q_u16(inputRow + l);
+                        float32x4_t input0 = vreinterpretq_f32_u32(
+                            vshll_n_u16(vget_low_u16(bf16), 16));
+                        float32x4_t input1 = vreinterpretq_f32_u32(
+                            vshll_n_u16(vget_high_u16(bf16), 16));
 
-                        blockSum += inp * w;
+                        uint16x8_t weight16 = vmovl_u8(vld1_u8(weightRow + l));
+                        uint32x4_t weightBits0 = vmovl_u16(vget_low_u16(weight16));
+                        uint32x4_t weightBits1 = vmovl_u16(vget_high_u16(weight16));
+                        float32x4_t weight0 = vreinterpretq_f32_u32(vorrq_u32(
+                            vshlq_n_u32(vandq_u32(weightBits0, signMask), 24),
+                            vshlq_n_u32(vandq_u32(weightBits0, bodyMask), 20)));
+                        float32x4_t weight1 = vreinterpretq_f32_u32(vorrq_u32(
+                            vshlq_n_u32(vandq_u32(weightBits1, signMask), 24),
+                            vshlq_n_u32(vandq_u32(weightBits1, bodyMask), 20)));
+                        sum0 = vfmaq_f32(sum0, input0, weight0);
+                        sum1 = vfmaq_f32(sum1, input1, weight1);
                     }
 
+                    float blockSum = (vaddvq_f32(sum0) + vaddvq_f32(sum1)) * magicScale;
+                    for (; l < lEnd; l++) {
+                        uint32_t inputBits = (uint32_t)inputRow[l] << 16;
+                        float inputValue;
+                        memcpy(&inputValue, &inputBits, sizeof(inputValue));
+                        blockSum += inputValue * fp8e4m3tofp32.dict[weightRow[l]];
+                    }
                     now += blockSum * curScale;
                 }
-                outputData[i * k + j] = now;
+                outputData[(size_t)i * k + j] = now;
             }
         }
 #else
@@ -1234,7 +1277,9 @@ namespace fastllm {
     
     void MultiThreadLinearInt8Int4GroupOp::Run() {
 #ifdef __AVX2__
-        if (group == 1) {
+        const bool canUsePackedAvx2 =
+            groupCnt > 0 && groupCnt % 32 == 0 && m % 32 == 0;
+        if (group == 1 && canUsePackedAvx2) {
             int block = 0;
             int realGroup = (m - 1) / groupCnt + 1;            
             std::vector <float> tempValue, values;
@@ -1381,7 +1426,7 @@ namespace fastllm {
                 }
             }
             return;
-        } else if (true) {
+        } else if (canUsePackedAvx2) {
             int block = 0;
             int realGroup = (m - 1) / groupCnt + 1;            
             std::vector <float> values;
@@ -1522,14 +1567,18 @@ namespace fastllm {
                         sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
                     }
                     value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
-#elif defined(__AVX2__)
-                    value += DotU4U8(weightWalk + (i * m + st) / 2, inputWalk + st, end - st);
-                    j += (end - st);
 #endif
                     for (; j + 1 < end; j += 2) {
                         int id = (i * m + j) / 2;
                         value += (weightWalk[id] >> 4) * inputWalk[j];
                         value += (weightWalk[id] & 0xF) * inputWalk[j + 1];
+                    }
+                    for (; j < end; j++) {
+                        int id = (i * m + j) / 2;
+                        int q = ((i * m + j) & 1)
+                            ? (weightWalk[id] & 0xF)
+                            : (weightWalk[id] >> 4);
+                        value += q * inputWalk[j];
                     }
                 }
 
@@ -1975,11 +2024,6 @@ namespace fastllm {
             Float32ToBFloat16(inputData, bf16Input.data(), n * m);
         }
 
-        std::vector <uint16_t> &bf16Weight = fastllmBf16Manager.bf16Weight;
-        if (bf16Weight.size() < k * m) {
-            bf16Weight.resize(k * m);
-        }
-
         int per = k / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearBFloat16FP8E4M3Op*> ops;
@@ -2161,6 +2205,97 @@ namespace fastllm {
     struct FastllmQuantManager {
         std::vector <uint8_t> uinput;
     } fastllmQuantManager;
+
+    struct MultiThreadLinearInt4Group32Op : MultiThreadBaseOp {
+        uint8_t *inputData;
+        uint8_t *weightData;
+        float *biasData;
+        float *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadLinearInt4Group32Op(
+                uint8_t *inputData, uint8_t *weightData, float *biasData,
+                float *outputData, int n, int m, int k, int st, int end) :
+            inputData(inputData), weightData(weightData), biasData(biasData),
+            outputData(outputData), n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run() override {
+            LinearINT8GROUP32_INT4GROUP32_Kernel(
+                inputData, weightData, biasData, outputData,
+                n, m, k, st, end);
+        }
+    };
+
+    struct MultiThreadQuantizeInt8Group32Op : MultiThreadBaseOp {
+        uint8_t *output;
+        const float *input;
+        int rows, columns;
+
+        MultiThreadQuantizeInt8Group32Op(uint8_t *output, const float *input,
+                                        int rows, int columns) :
+            output(output), input(input), rows(rows), columns(columns) {}
+
+        void Run() override {
+            ConvertFromFloat32(output, DataType::INF_INT8_GROUP32,
+                               input, rows, columns);
+        }
+    };
+
+    void RunLinearFloat32Int4Group32(
+            float *inputData, Data &weight, float *outputData, float *biasData,
+            int n, int m, int k,
+            AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<uint8_t> &quantizedInput = fastllmQuantManager.uinput;
+        quantizedInput.resize(GetDataBytes(DataType::INF_INT8_GROUP32, n, m));
+        // Prefill can contain many rows. Quantizing all group-32 activation
+        // blocks on the caller thread becomes visible before the parallel
+        // GEMM, so split that conversion across the same active pool.
+        if ((size_t)n * m >= 10000 && n > 1 && threadNum > 1) {
+            const int quantThreads = std::min(n, threadNum);
+            const size_t rowBytes = GetDataBytes(
+                DataType::INF_INT8_GROUP32, 1, m);
+            std::vector<MultiThreadQuantizeInt8Group32Op*> quantOps;
+            quantOps.reserve(quantThreads);
+            int currentRow = 0;
+            for (int i = 0; i < quantThreads; i++) {
+                const int rows = n / quantThreads + (i < n % quantThreads);
+                quantOps.push_back(new MultiThreadQuantizeInt8Group32Op(
+                    quantizedInput.data() + (size_t)currentRow * rowBytes,
+                    inputData + (size_t)currentRow * m, rows, m));
+                currentRow += rows;
+            }
+            for (int i = 0; i < quantThreads; i++) {
+                pool->PushOp(startTid + i, quantOps[i]);
+            }
+            for (int i = 0; i < quantThreads; i++) {
+                pool->Wait(startTid + i);
+                delete quantOps[i];
+            }
+        } else {
+            ConvertFromFloat32(quantizedInput.data(), DataType::INF_INT8_GROUP32,
+                               inputData, n, m);
+        }
+
+        const int per = k / threadNum;
+        int current = 0;
+        std::vector<MultiThreadLinearInt4Group32Op*> ops;
+        ops.reserve(threadNum);
+        for (int i = 0; i < threadNum; i++) {
+            const int end = i == threadNum - 1 ? k :
+                current + per + (current + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearInt4Group32Op(
+                quantizedInput.data(), (uint8_t*)weight.cpuData, biasData,
+                outputData, n, m, k, current, end));
+            current = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
 
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, int group, int groupCnt,

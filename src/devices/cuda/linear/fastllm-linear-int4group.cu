@@ -7,6 +7,8 @@
 #include "devices/cuda/fastllm-awq-sm70.cuh"
 
 #include <cmath>
+#include <cuda_bf16.h>
+#include <type_traits>
 #include <unordered_map>
 
 #if !defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
@@ -375,6 +377,7 @@ static constexpr int INT4GROUP_MARLIN_ZEROS_IDX = 4;
 static constexpr int INT4GROUP_MARLIN_WORKSPACE_IDX = 5;
 static constexpr int INT4GROUP_MOE_POINTER_TABLE_IDX = 6;
 static constexpr int INT4GROUP_MOE_QUANT_META_IDX = 7;
+static constexpr int INT4GROUP_MOE_PACKED_ZEROS_IDX = 8;
 
 static constexpr int INT4GROUP_HALF_SCALES_IDX = 0;
 static constexpr int INT4GROUP_HALF_MINS_IDX = 1;
@@ -533,6 +536,7 @@ static void FastllmCudaInt4GroupReleaseFallbackCaches(fastllm::Data &weight) {
     FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_CUDA_BIAS_IDX);
     FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_MOE_POINTER_TABLE_IDX);
     FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_MOE_QUANT_META_IDX);
+    FastllmCudaInt4GroupReleaseExtraCudaData(weight, INT4GROUP_MOE_PACKED_ZEROS_IDX);
 }
 
 static void FastllmCudaInt4GroupReleaseOriginalWeight(fastllm::Data &weight) {
@@ -1053,6 +1057,12 @@ static void FastllmCudaInt4GroupEnsureHalfBiasOnDevice(fastllm::Data &weight, co
 namespace {
     static constexpr int INT4GROUP_MOE_WARPS = 8;
 
+    __device__ __forceinline__ float FastllmCudaLoadInt4GroupPackedZero(
+            const uint8_t *zeros, size_t index) {
+        const uint8_t packed = __ldg(zeros + (index >> 1));
+        return (float)((index & 1) ? (packed & 15) : (packed >> 4));
+    }
+
     struct Int4GroupMoeBatch1Table {
         const uint8_t **gateupWeights = nullptr;
         const uint8_t **downWeights = nullptr;
@@ -1060,6 +1070,8 @@ namespace {
         const half *gateupOffsets = nullptr;
         const half *downScales = nullptr;
         const half *downOffsets = nullptr;
+        const uint8_t *gateupPackedZeros = nullptr;
+        const uint8_t *downPackedZeros = nullptr;
         bool useZeroPoint = false;
         int expertCount = 0;
         int hidden = 0;
@@ -1129,12 +1141,16 @@ namespace {
             }
         }
 
-        if ((int)firstGateup.extraCudaData.size() <= INT4GROUP_MOE_QUANT_META_IDX) {
-            firstGateup.extraCudaData.resize(INT4GROUP_MOE_QUANT_META_IDX + 1, nullptr);
+        if ((int)firstGateup.extraCudaData.size() <=
+                INT4GROUP_MOE_PACKED_ZEROS_IDX) {
+            firstGateup.extraCudaData.resize(
+                INT4GROUP_MOE_PACKED_ZEROS_IDX + 1, nullptr);
         }
 
         void *pointerBlock = firstGateup.extraCudaData[INT4GROUP_MOE_POINTER_TABLE_IDX];
         void *quantMetaBlock = firstGateup.extraCudaData[INT4GROUP_MOE_QUANT_META_IDX];
+        void *packedZeroBlock =
+            firstGateup.extraCudaData[INT4GROUP_MOE_PACKED_ZEROS_IDX];
         if (pointerBlock == nullptr || quantMetaBlock == nullptr) {
             std::vector<uint8_t*> hostPointers((size_t)expertCount * 2);
             for (int expert = 0; expert < expertCount; expert++) {
@@ -1144,23 +1160,84 @@ namespace {
 
             const size_t gateupCount = gateupPerExpert * expertCount;
             const size_t downCount = downPerExpert * expertCount;
-            std::vector<half> hostMeta(gateupCount * 2 + downCount * 2);
-            size_t gateupScaleOffset = 0;
-            size_t gateupMinOffset = gateupCount;
-            size_t downScaleOffset = gateupCount * 2;
-            size_t downMinOffset = gateupCount * 2 + downCount;
+            const size_t gateupPackedBytes = (gateupCount + 1) / 2;
+            const size_t downPackedBytes = (downCount + 1) / 2;
+            // AWQ zero points are exact integers in [0, 15].  Store them as
+            // nibbles so the fused kernels read less metadata, and omit the
+            // otherwise redundant FP16 zero-point arrays.
+            bool packedZerosValid = useZeroPoint;
+            std::vector<uint8_t> hostPackedZeros(
+                packedZerosValid ?
+                    gateupPackedBytes + downPackedBytes : 0, 0);
+            auto packZero = [&](size_t base, size_t index, float value) {
+                int zero = (int)value;
+                if (zero < 0 || zero > 15 || value != (float)zero) {
+                    packedZerosValid = false;
+                    return;
+                }
+                uint8_t &packed = hostPackedZeros[base + (index >> 1)];
+                if (index & 1) {
+                    packed |= (uint8_t)zero;
+                } else {
+                    packed |= (uint8_t)(zero << 4);
+                }
+            };
+            if (packedZerosValid) {
+                for (int expert = 0; expert < expertCount; expert++) {
+                    const fastllm::Data &gateup =
+                        *weights[(expert + 1) * 2];
+                    const fastllm::Data &down =
+                        *weights[(expert + 1) * 2 + 1];
+                    for (size_t i = 0; i < gateupPerExpert; i++) {
+                        size_t index =
+                            (size_t)expert * gateupPerExpert + i;
+                        packZero(0, index, gateup.zeros[i]);
+                    }
+                    for (size_t i = 0; i < downPerExpert; i++) {
+                        size_t index =
+                            (size_t)expert * downPerExpert + i;
+                        packZero(gateupPackedBytes, index, down.zeros[i]);
+                    }
+                }
+            }
+
+            if (packedZerosValid) {
+                packedZeroBlock =
+                    FastllmCudaMalloc(hostPackedZeros.size() * sizeof(uint8_t));
+            }
+            const bool usePackedZeros = packedZeroBlock != nullptr;
+            const size_t gateupScaleOffset = 0;
+            const size_t gateupMinOffset = gateupCount;
+            const size_t downScaleOffset = usePackedZeros ?
+                gateupCount : gateupCount * 2;
+            const size_t downMinOffset = gateupCount * 2 + downCount;
+            std::vector<half> hostMeta(
+                usePackedZeros ?
+                    gateupCount + downCount :
+                    gateupCount * 2 + downCount * 2);
             for (int expert = 0; expert < expertCount; expert++) {
                 const fastllm::Data &gateup = *weights[(expert + 1) * 2];
-                const fastllm::Data &down = *weights[(expert + 1) * 2 + 1];
+                const fastllm::Data &down =
+                    *weights[(expert + 1) * 2 + 1];
                 for (size_t i = 0; i < gateupPerExpert; i++) {
-                    hostMeta[gateupScaleOffset + (size_t)expert * gateupPerExpert + i] = (half)gateup.scales[i];
-                    hostMeta[gateupMinOffset + (size_t)expert * gateupPerExpert + i] =
-                        useZeroPoint ? (half)gateup.zeros[i] : (half)gateup.mins[i];
+                    size_t index =
+                        (size_t)expert * gateupPerExpert + i;
+                    hostMeta[gateupScaleOffset + index] =
+                        (half)gateup.scales[i];
+                    if (!usePackedZeros) {
+                        hostMeta[gateupMinOffset + index] = useZeroPoint ?
+                            (half)gateup.zeros[i] : (half)gateup.mins[i];
+                    }
                 }
                 for (size_t i = 0; i < downPerExpert; i++) {
-                    hostMeta[downScaleOffset + (size_t)expert * downPerExpert + i] = (half)down.scales[i];
-                    hostMeta[downMinOffset + (size_t)expert * downPerExpert + i] =
-                        useZeroPoint ? (half)down.zeros[i] : (half)down.mins[i];
+                    size_t index =
+                        (size_t)expert * downPerExpert + i;
+                    hostMeta[downScaleOffset + index] =
+                        (half)down.scales[i];
+                    if (!usePackedZeros) {
+                        hostMeta[downMinOffset + index] = useZeroPoint ?
+                            (half)down.zeros[i] : (half)down.mins[i];
+                    }
                 }
             }
 
@@ -1169,24 +1246,41 @@ namespace {
             if (pointerBlock == nullptr || quantMetaBlock == nullptr) {
                 if (pointerBlock != nullptr) FastllmCudaFree(pointerBlock);
                 if (quantMetaBlock != nullptr) FastllmCudaFree(quantMetaBlock);
+                if (packedZeroBlock != nullptr) FastllmCudaFree(packedZeroBlock);
                 return false;
             }
             FastllmCudaCopyFromHostToDevice(pointerBlock, hostPointers.data(),
                                             hostPointers.size() * sizeof(uint8_t*));
             FastllmCudaCopyFromHostToDevice(quantMetaBlock, hostMeta.data(),
                                             hostMeta.size() * sizeof(half));
+            if (packedZeroBlock != nullptr) {
+                FastllmCudaCopyFromHostToDevice(
+                    packedZeroBlock, hostPackedZeros.data(),
+                    hostPackedZeros.size() * sizeof(uint8_t));
+            }
             firstGateup.extraCudaData[INT4GROUP_MOE_POINTER_TABLE_IDX] = pointerBlock;
             firstGateup.extraCudaData[INT4GROUP_MOE_QUANT_META_IDX] = quantMetaBlock;
+            firstGateup.extraCudaData[INT4GROUP_MOE_PACKED_ZEROS_IDX] =
+                packedZeroBlock;
         }
 
         const size_t gateupCount = gateupPerExpert * expertCount;
         const size_t downCount = downPerExpert * expertCount;
+        const size_t gateupPackedBytes = (gateupCount + 1) / 2;
+        const bool usePackedZeros = packedZeroBlock != nullptr;
         table.gateupWeights = (const uint8_t**)pointerBlock;
         table.downWeights = table.gateupWeights + expertCount;
         table.gateupScales = (const half*)quantMetaBlock;
-        table.gateupOffsets = table.gateupScales + gateupCount;
-        table.downScales = table.gateupOffsets + gateupCount;
-        table.downOffsets = table.downScales + downCount;
+        table.gateupOffsets = usePackedZeros ?
+            nullptr : table.gateupScales + gateupCount;
+        table.downScales = usePackedZeros ?
+            table.gateupScales + gateupCount :
+            table.gateupOffsets + gateupCount;
+        table.downOffsets = usePackedZeros ?
+            nullptr : table.downScales + downCount;
+        table.gateupPackedZeros = (const uint8_t*)packedZeroBlock;
+        table.downPackedZeros = table.gateupPackedZeros == nullptr ? nullptr :
+            table.gateupPackedZeros + gateupPackedBytes;
         table.useZeroPoint = useZeroPoint;
         table.expertCount = expertCount;
         table.hidden = hidden;
@@ -1199,12 +1293,13 @@ namespace {
         return true;
     }
 
-    template <int WARPS_PER_BLOCK>
+    template <int WARPS_PER_BLOCK, bool PACKED_ZEROS>
     __global__ void FastllmCudaInt4GroupMoeGateupSwigluSmallBatchKernel(
             const half *input,
             const uint8_t *const *gateupWeights,
             const half *scales,
             const half *mins,
+            const uint8_t *packedZeros,
             const int32_t *indices,
             half *middle,
             int batch, int topk, int expertCount, int hidden, int inter,
@@ -1231,18 +1326,30 @@ namespace {
                 const int upRow = inter + out;
                 const uint8_t *gateWeight = weight + (size_t)gateRow * hidden / 2;
                 const uint8_t *upWeight = weight + (size_t)upRow * hidden / 2;
-                const half *gateScales = scales + ((size_t)expert * gateupRows + gateRow) * group;
-                const half *gateMins = mins + ((size_t)expert * gateupRows + gateRow) * group;
-                const half *upScales = scales + ((size_t)expert * gateupRows + upRow) * group;
-                const half *upMins = mins + ((size_t)expert * gateupRows + upRow) * group;
+                const size_t gateMeta =
+                    ((size_t)expert * gateupRows + gateRow) * group;
+                const size_t upMeta =
+                    ((size_t)expert * gateupRows + upRow) * group;
+                const half *gateScales = scales + gateMeta;
+                const half *gateMins =
+                    PACKED_ZEROS ? nullptr : mins + gateMeta;
+                const half *upScales = scales + upMeta;
+                const half *upMins =
+                    PACKED_ZEROS ? nullptr : mins + upMeta;
                 const int units = hidden >> 4;
                 for (int unit = lane; unit < units; unit += 32) {
                     const int x = unit << 4;
                     const int gid = x / groupCnt;
                     const float gateScale = __half2float(__ldg(gateScales + gid));
-                    const float gateMin = __half2float(__ldg(gateMins + gid));
                     const float upScale = __half2float(__ldg(upScales + gid));
-                    const float upMin = __half2float(__ldg(upMins + gid));
+                    const float gateMin = PACKED_ZEROS ?
+                        FastllmCudaLoadInt4GroupPackedZero(
+                            packedZeros, gateMeta + gid) :
+                        __half2float(__ldg(gateMins + gid));
+                    const float upMin = PACKED_ZEROS ?
+                        FastllmCudaLoadInt4GroupPackedZero(
+                            packedZeros, upMeta + gid) :
+                        __half2float(__ldg(upMins + gid));
                     union_char8 gatePacked, upPacked;
                     union_half8 input0, input1;
                     gatePacked.in = *reinterpret_cast<const uint2*>(gateWeight + (size_t)unit * 8);
@@ -1261,13 +1368,17 @@ namespace {
                         const uint8_t g0 = gatePacked.out[i];
                         const uint8_t u0 = upPacked.out[i];
                         gateSum += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(g0 >> 4), gateScale, gateMin, useZeroPoint);
+                            (float)(g0 >> 4), gateScale, gateMin,
+                            PACKED_ZEROS || useZeroPoint);
                         gateSum += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(g0 & 15), gateScale, gateMin, useZeroPoint);
+                            (float)(g0 & 15), gateScale, gateMin,
+                            PACKED_ZEROS || useZeroPoint);
                         upSum += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(u0 >> 4), upScale, upMin, useZeroPoint);
+                            (float)(u0 >> 4), upScale, upMin,
+                            PACKED_ZEROS || useZeroPoint);
                         upSum += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(u0 & 15), upScale, upMin, useZeroPoint);
+                            (float)(u0 & 15), upScale, upMin,
+                            PACKED_ZEROS || useZeroPoint);
                     }
                     // Keep the same reduction grouping as the standalone
                     // small-row INT4_GROUP GEMV used by the generic MoE path.
@@ -1296,12 +1407,13 @@ namespace {
         }
     }
 
-    template <int WARPS_PER_BLOCK>
+    template <int WARPS_PER_BLOCK, bool PACKED_ZEROS>
     __global__ void FastllmCudaInt4GroupMoeDownReduceSmallBatchKernel(
             const half *middle,
             const uint8_t *const *downWeights,
             const half *scales,
             const half *mins,
+            const uint8_t *packedZeros,
             const int32_t *indices,
             const float *scores,
             half *output,
@@ -1320,15 +1432,21 @@ namespace {
                 const uint8_t *weight = downWeights[expert];
                 if (weight != nullptr) {
                     const uint8_t *rowWeight = weight + (size_t)out * inter / 2;
-                    const half *rowScales = scales + ((size_t)expert * hidden + out) * group;
-                    const half *rowMins = mins + ((size_t)expert * hidden + out) * group;
+                    const size_t rowMeta =
+                        ((size_t)expert * hidden + out) * group;
+                    const half *rowScales = scales + rowMeta;
+                    const half *rowMins =
+                        PACKED_ZEROS ? nullptr : mins + rowMeta;
                     const half *routeInput = middle + (size_t)routedRow * inter;
                     const int units = inter >> 4;
                     for (int unit = lane; unit < units; unit += 32) {
                         const int x = unit << 4;
                         const int gid = x / groupCnt;
                         const float scale = __half2float(__ldg(rowScales + gid));
-                        const float minValue = __half2float(__ldg(rowMins + gid));
+                        const float minValue = PACKED_ZEROS ?
+                            FastllmCudaLoadInt4GroupPackedZero(
+                                packedZeros, rowMeta + gid) :
+                            __half2float(__ldg(rowMins + gid));
                         union_char8 packed;
                         union_half8 input0, input1;
                         packed.in = *reinterpret_cast<const uint2*>(rowWeight + (size_t)unit * 8);
@@ -1343,9 +1461,11 @@ namespace {
                             const float a1 = i < 4 ? __half2float(input0.out[pair + 1])
                                                    : __half2float(input1.out[pair + 1]);
                             acc += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                                (float)(q >> 4), scale, minValue, useZeroPoint);
+                                (float)(q >> 4), scale, minValue,
+                                PACKED_ZEROS || useZeroPoint);
                             acc += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                                (float)(q & 15), scale, minValue, useZeroPoint);
+                                (float)(q & 15), scale, minValue,
+                                PACKED_ZEROS || useZeroPoint);
                         }
                     }
                 }
@@ -1398,12 +1518,13 @@ namespace {
     // equivalent to the pre-MTP path. Speculative validation uses different
     // FP16 materialization points, but enabling it must not perturb ordinary
     // token-at-a-time decode.
-    template <int WARPS_PER_BLOCK>
+    template <int WARPS_PER_BLOCK, bool PACKED_ZEROS>
     __global__ void FastllmCudaInt4GroupMoeGateupSwigluBatch1Kernel(
             const half *input,
             const uint8_t *const *gateupWeights,
             const half *scales,
             const half *mins,
+            const uint8_t *packedZeros,
             const int32_t *indices,
             half *middle,
             int topk, int expertCount, int hidden, int inter,
@@ -1428,18 +1549,30 @@ namespace {
                 const int upRow = inter + out;
                 const uint8_t *gateWeight = weight + (size_t)gateRow * hidden / 2;
                 const uint8_t *upWeight = weight + (size_t)upRow * hidden / 2;
-                const half *gateScales = scales + ((size_t)expert * gateupRows + gateRow) * group;
-                const half *gateMins = mins + ((size_t)expert * gateupRows + gateRow) * group;
-                const half *upScales = scales + ((size_t)expert * gateupRows + upRow) * group;
-                const half *upMins = mins + ((size_t)expert * gateupRows + upRow) * group;
+                const size_t gateMeta =
+                    ((size_t)expert * gateupRows + gateRow) * group;
+                const size_t upMeta =
+                    ((size_t)expert * gateupRows + upRow) * group;
+                const half *gateScales = scales + gateMeta;
+                const half *gateMins =
+                    PACKED_ZEROS ? nullptr : mins + gateMeta;
+                const half *upScales = scales + upMeta;
+                const half *upMins =
+                    PACKED_ZEROS ? nullptr : mins + upMeta;
                 const int units = hidden >> 4;
                 for (int unit = lane; unit < units; unit += 32) {
                     const int x = unit << 4;
                     const int gid = x / groupCnt;
                     const float gateScale = __half2float(__ldg(gateScales + gid));
-                    const float gateMin = __half2float(__ldg(gateMins + gid));
                     const float upScale = __half2float(__ldg(upScales + gid));
-                    const float upMin = __half2float(__ldg(upMins + gid));
+                    const float gateMin = PACKED_ZEROS ?
+                        FastllmCudaLoadInt4GroupPackedZero(
+                            packedZeros, gateMeta + gid) :
+                        __half2float(__ldg(gateMins + gid));
+                    const float upMin = PACKED_ZEROS ?
+                        FastllmCudaLoadInt4GroupPackedZero(
+                            packedZeros, upMeta + gid) :
+                        __half2float(__ldg(upMins + gid));
                     union_char8 gatePacked, upPacked;
                     union_half8 input0, input1;
                     gatePacked.in = *reinterpret_cast<const uint2*>(gateWeight + (size_t)unit * 8);
@@ -1456,13 +1589,17 @@ namespace {
                         const uint8_t g0 = gatePacked.out[i];
                         const uint8_t u0 = upPacked.out[i];
                         gateAcc += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(g0 >> 4), gateScale, gateMin, useZeroPoint);
+                            (float)(g0 >> 4), gateScale, gateMin,
+                            PACKED_ZEROS || useZeroPoint);
                         gateAcc += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(g0 & 15), gateScale, gateMin, useZeroPoint);
+                            (float)(g0 & 15), gateScale, gateMin,
+                            PACKED_ZEROS || useZeroPoint);
                         upAcc += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(u0 >> 4), upScale, upMin, useZeroPoint);
+                            (float)(u0 >> 4), upScale, upMin,
+                            PACKED_ZEROS || useZeroPoint);
                         upAcc += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(u0 & 15), upScale, upMin, useZeroPoint);
+                            (float)(u0 & 15), upScale, upMin,
+                            PACKED_ZEROS || useZeroPoint);
                     }
                 }
             }
@@ -1479,20 +1616,21 @@ namespace {
         }
     }
 
-    template <int WARPS_PER_BLOCK>
+    template <int ROUTES_PER_BLOCK, int LANES_PER_ROUTE, bool PACKED_ZEROS>
     __global__ void FastllmCudaInt4GroupMoeDownReduceBatch1Kernel(
             const half *middle,
             const uint8_t *const *downWeights,
             const half *scales,
             const half *mins,
+            const uint8_t *packedZeros,
             const int32_t *indices,
             const float *scores,
             half *output,
             int topk, int expertCount, int hidden, int inter,
             int group, int groupCnt, bool useZeroPoint) {
-        __shared__ float routeValues[WARPS_PER_BLOCK];
-        const int route = threadIdx.x >> 5;
-        const int lane = threadIdx.x & 31;
+        __shared__ float routeValues[ROUTES_PER_BLOCK];
+        const int route = threadIdx.x / LANES_PER_ROUTE;
+        const int lane = threadIdx.x & (LANES_PER_ROUTE - 1);
         const int out = blockIdx.x;
         float acc = 0.0f;
         if (route < topk) {
@@ -1501,15 +1639,21 @@ namespace {
                 const uint8_t *weight = downWeights[expert];
                 if (weight != nullptr) {
                     const uint8_t *rowWeight = weight + (size_t)out * inter / 2;
-                    const half *rowScales = scales + ((size_t)expert * hidden + out) * group;
-                    const half *rowMins = mins + ((size_t)expert * hidden + out) * group;
+                    const size_t rowMeta =
+                        ((size_t)expert * hidden + out) * group;
+                    const half *rowScales = scales + rowMeta;
+                    const half *rowMins =
+                        PACKED_ZEROS ? nullptr : mins + rowMeta;
                     const half *routeInput = middle + (size_t)route * inter;
                     const int units = inter >> 4;
-                    for (int unit = lane; unit < units; unit += 32) {
+                    for (int unit = lane; unit < units; unit += LANES_PER_ROUTE) {
                         const int x = unit << 4;
                         const int gid = x / groupCnt;
                         const float scale = __half2float(__ldg(rowScales + gid));
-                        const float minValue = __half2float(__ldg(rowMins + gid));
+                        const float minValue = PACKED_ZEROS ?
+                            FastllmCudaLoadInt4GroupPackedZero(
+                                packedZeros, rowMeta + gid) :
+                            __half2float(__ldg(rowMins + gid));
                         union_char8 packed;
                         union_half8 input0, input1;
                         packed.in = *reinterpret_cast<const uint2*>(rowWeight + (size_t)unit * 8);
@@ -1524,9 +1668,11 @@ namespace {
                             const float a1 = i < 4 ? __half2float(input0.out[pair + 1])
                                                    : __half2float(input1.out[pair + 1]);
                             acc += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                                (float)(q >> 4), scale, minValue, useZeroPoint);
+                                (float)(q >> 4), scale, minValue,
+                                PACKED_ZEROS || useZeroPoint);
                             acc += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                                (float)(q & 15), scale, minValue, useZeroPoint);
+                                (float)(q & 15), scale, minValue,
+                                PACKED_ZEROS || useZeroPoint);
                         }
                     }
                 }
@@ -1534,8 +1680,8 @@ namespace {
         }
 
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        for (int offset = LANES_PER_ROUTE / 2; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xffffffff, acc, offset, LANES_PER_ROUTE);
         }
         if (lane == 0) {
             routeValues[route] = route < topk ? acc * __ldg(scores + route) : 0.0f;
@@ -1544,7 +1690,7 @@ namespace {
         if (threadIdx.x == 0) {
             float sum = 0.0f;
 #pragma unroll
-            for (int i = 0; i < WARPS_PER_BLOCK; i++) {
+            for (int i = 0; i < ROUTES_PER_BLOCK; i++) {
                 sum += routeValues[i];
             }
             output[out] = __float2half_rn(sum);
@@ -1593,20 +1739,52 @@ bool FastllmCudaHalfMergeMOEInt4GroupSmallBatchIndexed(
     const int gateupTasks = batch * topk * table.inter;
     const int blocks =
         (gateupTasks + INT4GROUP_MOE_WARPS - 1) / INT4GROUP_MOE_WARPS;
-    FastllmCudaInt4GroupMoeGateupSwigluSmallBatchKernel<INT4GROUP_MOE_WARPS>
-        <<< blocks, INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
-            (const half*)input.cudaData, table.gateupWeights,
-            table.gateupScales, table.gateupOffsets, indices,
-            (half*)scratch.cudaData, batch, topk, table.expertCount,
-            table.hidden, table.inter, table.gateupRows,
-            table.gateupGroup, table.gateupGroupCnt, table.useZeroPoint);
-    FastllmCudaInt4GroupMoeDownReduceSmallBatchKernel<INT4GROUP_MOE_WARPS>
-        <<< batch * table.hidden, INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
-            (const half*)scratch.cudaData, table.downWeights,
-            table.downScales, table.downOffsets, indices, scores,
-            (half*)output.cudaData, batch, topk, table.expertCount,
-            table.hidden, table.inter, table.downGroup, table.downGroupCnt,
-            table.useZeroPoint);
+    const bool usePackedZeros =
+        table.useZeroPoint && table.gateupPackedZeros != nullptr &&
+        table.downPackedZeros != nullptr;
+    if (usePackedZeros) {
+        FastllmCudaInt4GroupMoeGateupSwigluSmallBatchKernel<
+            INT4GROUP_MOE_WARPS, true>
+            <<< blocks, INT4GROUP_MOE_WARPS * 32,
+                 0, cudaStreamPerThread >>>(
+                (const half*)input.cudaData, table.gateupWeights,
+                table.gateupScales, table.gateupOffsets,
+                table.gateupPackedZeros, indices,
+                (half*)scratch.cudaData, batch, topk, table.expertCount,
+                table.hidden, table.inter, table.gateupRows,
+                table.gateupGroup, table.gateupGroupCnt, true);
+        FastllmCudaInt4GroupMoeDownReduceSmallBatchKernel<
+            INT4GROUP_MOE_WARPS, true>
+            <<< batch * table.hidden, INT4GROUP_MOE_WARPS * 32,
+                 0, cudaStreamPerThread >>>(
+                (const half*)scratch.cudaData, table.downWeights,
+                table.downScales, table.downOffsets,
+                table.downPackedZeros, indices, scores,
+                (half*)output.cudaData, batch, topk, table.expertCount,
+                table.hidden, table.inter, table.downGroup,
+                table.downGroupCnt, true);
+    } else {
+        FastllmCudaInt4GroupMoeGateupSwigluSmallBatchKernel<
+            INT4GROUP_MOE_WARPS, false>
+            <<< blocks, INT4GROUP_MOE_WARPS * 32,
+                 0, cudaStreamPerThread >>>(
+                (const half*)input.cudaData, table.gateupWeights,
+                table.gateupScales, table.gateupOffsets, nullptr, indices,
+                (half*)scratch.cudaData, batch, topk, table.expertCount,
+                table.hidden, table.inter, table.gateupRows,
+                table.gateupGroup, table.gateupGroupCnt,
+                table.useZeroPoint);
+        FastllmCudaInt4GroupMoeDownReduceSmallBatchKernel<
+            INT4GROUP_MOE_WARPS, false>
+            <<< batch * table.hidden, INT4GROUP_MOE_WARPS * 32,
+                 0, cudaStreamPerThread >>>(
+                (const half*)scratch.cudaData, table.downWeights,
+                table.downScales, table.downOffsets, nullptr,
+                indices, scores, (half*)output.cudaData,
+                batch, topk, table.expertCount, table.hidden,
+                table.inter, table.downGroup, table.downGroupCnt,
+                table.useZeroPoint);
+    }
     cudaError_t state = cudaGetLastError();
     if (state != cudaSuccess) {
         checkCudaErrors("Error: CUDA INT4_GROUP small-batch fused MoE failed.", state);
@@ -1652,21 +1830,83 @@ bool FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(const fastllm::Data &input,
     }
 
     const int gateupTasks = topk * table.inter;
-    FastllmCudaInt4GroupMoeGateupSwigluBatch1Kernel<INT4GROUP_MOE_WARPS>
-        <<< (gateupTasks + INT4GROUP_MOE_WARPS - 1) / INT4GROUP_MOE_WARPS,
-             INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
-            (const half*)input.cudaData, table.gateupWeights,
-            table.gateupScales, table.gateupOffsets, indices,
-            (half*)scratch.cudaData, topk, table.expertCount,
-            table.hidden, table.inter, table.gateupRows,
-            table.gateupGroup, table.gateupGroupCnt, table.useZeroPoint);
-    FastllmCudaInt4GroupMoeDownReduceBatch1Kernel<INT4GROUP_MOE_WARPS>
-        <<< table.hidden, INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
-            (const half*)scratch.cudaData, table.downWeights,
-            table.downScales, table.downOffsets, indices, scores,
-            (half*)output.cudaData, topk, table.expertCount,
-            table.hidden, table.inter, table.downGroup, table.downGroupCnt,
-            table.useZeroPoint);
+    const bool usePackedZeros =
+        table.useZeroPoint && table.gateupPackedZeros != nullptr &&
+        table.downPackedZeros != nullptr;
+    if (usePackedZeros) {
+        FastllmCudaInt4GroupMoeGateupSwigluBatch1Kernel<
+            INT4GROUP_MOE_WARPS, true>
+            <<< (gateupTasks + INT4GROUP_MOE_WARPS - 1) /
+                     INT4GROUP_MOE_WARPS,
+                 INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
+                (const half*)input.cudaData, table.gateupWeights,
+                table.gateupScales, table.gateupOffsets,
+                table.gateupPackedZeros, indices,
+                (half*)scratch.cudaData, topk, table.expertCount,
+                table.hidden, table.inter, table.gateupRows,
+                table.gateupGroup, table.gateupGroupCnt, true);
+    } else {
+        FastllmCudaInt4GroupMoeGateupSwigluBatch1Kernel<
+            INT4GROUP_MOE_WARPS, false>
+            <<< (gateupTasks + INT4GROUP_MOE_WARPS - 1) /
+                     INT4GROUP_MOE_WARPS,
+                 INT4GROUP_MOE_WARPS * 32, 0, cudaStreamPerThread >>>(
+                (const half*)input.cudaData, table.gateupWeights,
+                table.gateupScales, table.gateupOffsets, nullptr, indices,
+                (half*)scratch.cudaData, topk, table.expertCount,
+                table.hidden, table.inter, table.gateupRows,
+                table.gateupGroup, table.gateupGroupCnt,
+                table.useZeroPoint);
+    }
+    if (table.inter == 256) {
+        if (usePackedZeros) {
+            FastllmCudaInt4GroupMoeDownReduceBatch1Kernel<
+                INT4GROUP_MOE_WARPS, 16, true>
+                <<< table.hidden, INT4GROUP_MOE_WARPS * 16,
+                     0, cudaStreamPerThread >>>(
+                    (const half*)scratch.cudaData, table.downWeights,
+                    table.downScales, table.downOffsets,
+                    table.downPackedZeros, indices, scores,
+                    (half*)output.cudaData, topk, table.expertCount,
+                    table.hidden, table.inter, table.downGroup,
+                    table.downGroupCnt, true);
+        } else {
+            FastllmCudaInt4GroupMoeDownReduceBatch1Kernel<
+                INT4GROUP_MOE_WARPS, 16, false>
+                <<< table.hidden, INT4GROUP_MOE_WARPS * 16,
+                     0, cudaStreamPerThread >>>(
+                    (const half*)scratch.cudaData, table.downWeights,
+                    table.downScales, table.downOffsets, nullptr,
+                    indices, scores, (half*)output.cudaData, topk,
+                    table.expertCount, table.hidden, table.inter,
+                    table.downGroup, table.downGroupCnt,
+                    table.useZeroPoint);
+        }
+    } else {
+        if (usePackedZeros) {
+            FastllmCudaInt4GroupMoeDownReduceBatch1Kernel<
+                INT4GROUP_MOE_WARPS, 32, true>
+                <<< table.hidden, INT4GROUP_MOE_WARPS * 32,
+                     0, cudaStreamPerThread >>>(
+                    (const half*)scratch.cudaData, table.downWeights,
+                    table.downScales, table.downOffsets,
+                    table.downPackedZeros, indices, scores,
+                    (half*)output.cudaData, topk, table.expertCount,
+                    table.hidden, table.inter, table.downGroup,
+                    table.downGroupCnt, true);
+        } else {
+            FastllmCudaInt4GroupMoeDownReduceBatch1Kernel<
+                INT4GROUP_MOE_WARPS, 32, false>
+                <<< table.hidden, INT4GROUP_MOE_WARPS * 32,
+                     0, cudaStreamPerThread >>>(
+                    (const half*)scratch.cudaData, table.downWeights,
+                    table.downScales, table.downOffsets, nullptr,
+                    indices, scores, (half*)output.cudaData, topk,
+                    table.expertCount, table.hidden, table.inter,
+                    table.downGroup, table.downGroupCnt,
+                    table.useZeroPoint);
+        }
+    }
     cudaError_t state = cudaGetLastError();
     if (state != cudaSuccess) {
         checkCudaErrors("Error: CUDA INT4_GROUP batch-1 fused MoE failed.", state);
@@ -2190,4 +2430,440 @@ bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm:
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+// ==================== symmetric INT4_GROUP32 with inline BF16 scales ====================
+// Physical block: [up to four 16-byte packed groups] [their BF16 scales].
+// Full blocks are 72 bytes, so every 8-byte CUDA weight load stays aligned.
+// The final partial block has no padding.
+// q0 is stored in the high nibble and the implicit zero point is 8.
+
+template <typename T>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat(T value);
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat<half>(half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32ToFloat<__nv_bfloat16>(
+        __nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmInt4Group32FromFloat(float value);
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32FromFloat<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ half FastllmInt4Group32FromFloat<half>(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 FastllmInt4Group32FromFloat<__nv_bfloat16>(
+        float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename T>
+union __align__(16) FastllmInt4Group32Vector8 {
+    uint4 packed[sizeof(T) * 8 / sizeof(uint4)];
+    T values[8];
+};
+
+template <typename T, bool ALIGNED_ROWS>
+__global__ void FastllmCudaInt4Group32CompactDequantVectorKernel(
+        const uint8_t *weight, T *output, int rows, int columns) {
+    const int row = blockIdx.x;
+    const int groups = columns / 32;
+    const size_t rowBytes = (size_t)groups * 18;
+    const uint8_t *weightRow = weight + (size_t)row * rowBytes;
+    T *outputRow = output + (size_t)row * columns;
+    for (int column = threadIdx.x * 8; column < columns;
+         column += blockDim.x * 8) {
+        const int group = column / 32;
+        const int block = group / 4;
+        const int groupInBlock = group & 3;
+        const int blockGroups = ALIGNED_ROWS ? 4 :
+            min(4, groups - block * 4);
+        const uint8_t *blockData = weightRow + (size_t)block * 72;
+        const uint8_t *packedData = blockData +
+            (size_t)groupInBlock * 16 + (column & 31) / 2;
+        union_char4 packed;
+        if constexpr (ALIGNED_ROWS) {
+            packed.in = __ldg((const uint32_t*)packedData);
+        } else {
+            const uint16_t lo = __ldg((const uint16_t*)packedData);
+            const uint16_t hi = __ldg((const uint16_t*)(packedData + 2));
+            packed.in = (uint32_t)lo | ((uint32_t)hi << 16);
+        }
+        const __nv_bfloat16 *scaleData = (const __nv_bfloat16*)(
+            blockData + (size_t)blockGroups * 16 + groupInBlock * 2);
+        const float scale = __bfloat162float(__ldg(scaleData));
+        FastllmInt4Group32Vector8<T> result;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            result.values[i * 2] = FastllmInt4Group32FromFloat<T>(
+                (float)((int)(packed.out[i] >> 4) - 8) * scale);
+            result.values[i * 2 + 1] = FastllmInt4Group32FromFloat<T>(
+                (float)((int)(packed.out[i] & 0x0f) - 8) * scale);
+        }
+#pragma unroll
+        for (int i = 0; i < (int)(sizeof(T) * 8 / sizeof(uint4)); i++) {
+            reinterpret_cast<uint4*>(outputRow + column)[i] = result.packed[i];
+        }
+    }
+}
+
+template <typename T>
+static void LaunchFastllmCudaInt4Group32CompactDequantVector(
+        const uint8_t *weight, T *output, int rows, int columns) {
+    if (columns % 128 == 0) {
+        FastllmCudaInt4Group32CompactDequantVectorKernel<T, true>
+            <<<rows, 64, 0, cudaStreamPerThread>>>(
+                weight, output, rows, columns);
+    } else {
+        FastllmCudaInt4Group32CompactDequantVectorKernel<T, false>
+            <<<rows, 64, 0, cudaStreamPerThread>>>(
+                weight, output, rows, columns);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ float FastllmInt4Group32Dot16(
+        const T *input, const float *weights) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        sum += FastllmInt4Group32ToFloat(input[i]) * weights[i];
+    }
+    return sum;
+}
+
+template <>
+__device__ __forceinline__ float FastllmInt4Group32Dot16<float>(
+        const float *input, const float *weights) {
+    const float4 a0 = *reinterpret_cast<const float4*>(input);
+    const float4 a1 = *reinterpret_cast<const float4*>(input + 4);
+    const float4 a2 = *reinterpret_cast<const float4*>(input + 8);
+    const float4 a3 = *reinterpret_cast<const float4*>(input + 12);
+    return
+        a0.x * weights[0]  + a0.y * weights[1]  +
+        a0.z * weights[2]  + a0.w * weights[3]  +
+        a1.x * weights[4]  + a1.y * weights[5]  +
+        a1.z * weights[6]  + a1.w * weights[7]  +
+        a2.x * weights[8]  + a2.y * weights[9]  +
+        a2.z * weights[10] + a2.w * weights[11] +
+        a3.x * weights[12] + a3.y * weights[13] +
+        a3.z * weights[14] + a3.w * weights[15];
+}
+
+template <typename T, int WARPS_PER_BLOCK, int PART, bool ALIGNED_BLOCKS>
+__global__ void FastllmGemvInt4Group32CompactKernel(
+        const T * __restrict__ input, const uint8_t * __restrict__ weight,
+        T * __restrict__ output, const float * __restrict__ bias,
+        int m, int k) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (out >= k) {
+        return;
+    }
+    const int groups = m / 32;
+    const size_t rowBytes = (size_t)groups * 18;
+    const uint8_t *weightRow = weight + (size_t)out * rowBytes;
+    float acc[PART];
+#pragma unroll
+    for (int part = 0; part < PART; part++) {
+        acc[part] = 0.0f;
+    }
+
+    const int units = m / 16;
+    for (int unit = lane; unit < units; unit += 32) {
+        const int start = unit * 16;
+        const int group = unit / 2;
+        const int block = group / 4;
+        const int groupInBlock = group & 3;
+        const int blockGroups = ALIGNED_BLOCKS ? 4 :
+            min(4, groups - block * 4);
+        const uint8_t *blockData = weightRow + (size_t)block * 72;
+        const uint8_t *weightBlock = blockData + (size_t)groupInBlock * 16;
+        const __nv_bfloat16 *scaleData = (const __nv_bfloat16*)(
+            blockData + (size_t)blockGroups * 16 + groupInBlock * 2);
+        const float scale = __bfloat162float(__ldg(scaleData));
+        union_char8 packed;
+        const uint8_t *packedData = weightBlock + (size_t)(unit & 1) * 8;
+        if constexpr (ALIGNED_BLOCKS) {
+            packed.in = __ldg(reinterpret_cast<const uint2*>(packedData));
+        } else {
+            // A partial final block makes following rows only 2-byte aligned.
+            const uint16_t packed0 = __ldg((const uint16_t*)(packedData));
+            const uint16_t packed1 = __ldg((const uint16_t*)(packedData + 2));
+            const uint16_t packed2 = __ldg((const uint16_t*)(packedData + 4));
+            const uint16_t packed3 = __ldg((const uint16_t*)(packedData + 6));
+            packed.in.x = (uint32_t)packed0 | ((uint32_t)packed1 << 16);
+            packed.in.y = (uint32_t)packed2 | ((uint32_t)packed3 << 16);
+        }
+        float unpacked[16];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint8_t q = packed.out[i];
+            unpacked[i * 2] = (float)((int)(q >> 4) - 8);
+            unpacked[i * 2 + 1] = (float)((int)(q & 0x0f) - 8);
+        }
+#pragma unroll
+        for (int part = 0; part < PART; part++) {
+            const T *inputPart = input + (size_t)part * m + start;
+            acc[part] += FastllmInt4Group32Dot16(inputPart, unpacked) * scale;
+        }
+    }
+
+#pragma unroll
+    for (int part = 0; part < PART; part++) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[part] += __shfl_down_sync(0xffffffff, acc[part], offset);
+        }
+    }
+    if (lane == 0) {
+        const float biasValue = bias == nullptr ? 0.0f : __ldg(bias + out);
+#pragma unroll
+        for (int part = 0; part < PART; part++) {
+            output[(size_t)part * k + out] =
+                FastllmInt4Group32FromFloat<T>(acc[part] + biasValue);
+        }
+    }
+}
+
+template <typename T>
+__global__ void FastllmCudaInt4Group32CompactBiasKernel(
+        T *output, const float *bias, int total, int k) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < total) {
+        float value = FastllmInt4Group32ToFloat(output[index]) +
+                      __ldg(bias + index % k);
+        output[index] = FastllmInt4Group32FromFloat<T>(value);
+    }
+}
+
+template <typename T>
+static void LaunchFastllmGemmInt4Group32Compact(
+        const T *input, const uint8_t *weight, T *output, const float *bias,
+        int n, int m, int k) {
+    constexpr int warps = 8;
+    const int grid = (k + warps - 1) / warps;
+#define FASTLLM_LAUNCH_INT4G32(PART, OFFSET) \
+    if (m % 128 == 0) { \
+        FastllmGemvInt4Group32CompactKernel<T, warps, PART, true> \
+            <<<grid, warps * 32, 0, cudaStreamPerThread>>>( \
+                input + (size_t)(OFFSET) * m, weight, \
+                output + (size_t)(OFFSET) * k, bias, m, k); \
+    } else { \
+        FastllmGemvInt4Group32CompactKernel<T, warps, PART, false> \
+            <<<grid, warps * 32, 0, cudaStreamPerThread>>>( \
+                input + (size_t)(OFFSET) * m, weight, \
+                output + (size_t)(OFFSET) * k, bias, m, k); \
+    }
+    int offset = 0;
+    for (; offset + 7 < n; offset += 8) {
+        FASTLLM_LAUNCH_INT4G32(8, offset);
+    }
+    if (offset + 3 < n) {
+        FASTLLM_LAUNCH_INT4G32(4, offset);
+        offset += 4;
+    }
+    if (offset + 1 < n) {
+        FASTLLM_LAUNCH_INT4G32(2, offset);
+        offset += 2;
+    }
+    if (offset < n) {
+        FASTLLM_LAUNCH_INT4G32(1, offset);
+    }
+#undef FASTLLM_LAUNCH_INT4G32
+}
+
+template <typename T>
+static bool FastllmCudaMatMulInt4Group32CompactBase(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k, cudaDataType_t cudaType,
+        cudaDataType_t computeType) {
+    if (m <= 0 || m % 32 != 0 || weight.cudaData == nullptr) {
+        return false;
+    }
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+    const float *cudaBias = bias.dims.empty() ? nullptr : (const float*)bias.cudaData;
+
+    // Small decode batches are bandwidth-bound and use the compact weights
+    // directly. Above nine rows, tensor-core GEMM amortizes one compact
+    // dequantization and is faster than launching repeated multi-row GEMVs.
+    // Keeping 1-9 rows direct also preserves FLOAT32 regression precision.
+    if (n <= 9) {
+        LaunchFastllmGemmInt4Group32Compact(
+            cudaInput, (const uint8_t*)weight.cudaData, cudaOutput, cudaBias,
+            n, m, k);
+    } else {
+        if constexpr (std::is_same<T, float>::value) {
+            half *halfInput = (half*)FastllmCudaMalloc(
+                (size_t)n * m * sizeof(half));
+#ifndef CUDA_NO_TENSOR_CORE
+            half *halfOutput = (half*)FastllmCudaMalloc(
+                (size_t)n * k * sizeof(half));
+#endif
+            const int inputTotal = n * m;
+            FastllmCudaFloat2HalfKernel
+                <<<(inputTotal + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                    cudaInput, halfInput, inputTotal);
+
+            size_t scratchBytes = 0;
+            bool ownScratch = false;
+            half *dequant = (half*)FastllmBorrowDequantScratch(
+                (size_t)k * m * sizeof(half), &scratchBytes, &ownScratch);
+            const size_t bytesPerRow = (size_t)m * sizeof(half);
+            const int rowsPerChunk = (int)std::min<size_t>(
+                (size_t)k, std::max<size_t>(1, scratchBytes / bytesPerRow));
+            const size_t compactRowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, m);
+            auto handle = getFastllmCublasHandle();
+            cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+            for (int row = 0; row < k; row += rowsPerChunk) {
+                const int rows = std::min(rowsPerChunk, k - row);
+                LaunchFastllmCudaInt4Group32CompactDequantVector(
+                    (const uint8_t*)weight.cudaData +
+                        (size_t)row * compactRowBytes,
+                    dequant, rows, m);
+#ifdef CUDA_NO_TENSOR_CORE
+                float alpha = 1.0f, beta = 0.0f;
+                status = cublasGemmEx(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                    &alpha, dequant, CUDA_R_16F, m,
+                    halfInput, CUDA_R_16F, m,
+                    &beta, cudaOutput + row, CUDA_R_32F, k, CUDA_R_32F,
+                    static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#else
+                half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+                status = cublasGemmEx(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                    &alpha, dequant, CUDA_R_16F, m,
+                    halfInput, CUDA_R_16F, m,
+                    &beta, halfOutput + row, CUDA_R_16F, k, CUDA_R_16F,
+                    static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#endif
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    FastllmReleaseDequantScratch(dequant, ownScratch);
+                    FastllmCudaFree(halfInput);
+#ifndef CUDA_NO_TENSOR_CORE
+                    FastllmCudaFree(halfOutput);
+#endif
+                    printf("Error: INT4_GROUP32 compact FP16 cuBLAS error. status = %d\n",
+                           status);
+                    throw("int4_group32 compact fp16 cublas error");
+                }
+            }
+#ifndef CUDA_NO_TENSOR_CORE
+            const int outputTotal = n * k;
+            FastllmCudaHalf2FloatKernel
+                <<<(outputTotal + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                    halfOutput, cudaOutput, outputTotal);
+#endif
+            if (cudaBias != nullptr) {
+                const int outputTotal = n * k;
+                FastllmCudaInt4Group32CompactBiasKernel<float>
+                    <<<(outputTotal + 255) / 256, 256, 0,
+                       cudaStreamPerThread>>>(
+                        cudaOutput, cudaBias, outputTotal, k);
+            }
+            FastllmReleaseDequantScratch(dequant, ownScratch);
+            FastllmCudaFree(halfInput);
+#ifndef CUDA_NO_TENSOR_CORE
+            FastllmCudaFree(halfOutput);
+#endif
+        } else {
+            size_t scratchBytes = 0;
+            bool ownScratch = false;
+            T *dequant = (T*)FastllmBorrowDequantScratch(
+                (size_t)k * m * sizeof(T), &scratchBytes, &ownScratch);
+            const size_t bytesPerRow = (size_t)m * sizeof(T);
+            const int rowsPerChunk = (int)std::min<size_t>(
+                (size_t)k, std::max<size_t>(1, scratchBytes / bytesPerRow));
+            const size_t compactRowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, m);
+            auto handle = getFastllmCublasHandle();
+            cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+            for (int row = 0; row < k; row += rowsPerChunk) {
+                const int rows = std::min(rowsPerChunk, k - row);
+                LaunchFastllmCudaInt4Group32CompactDequantVector(
+                    (const uint8_t*)weight.cudaData +
+                        (size_t)row * compactRowBytes,
+                    dequant, rows, m);
+                if constexpr (std::is_same<T, half>::value) {
+                    half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+                    status = cublasGemmEx(
+                        handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                        &alpha, dequant, cudaType, m, cudaInput, cudaType, m,
+                        &beta, cudaOutput + row, cudaType, k, computeType,
+                        static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                } else {
+                    float alpha = 1.0f, beta = 0.0f;
+                    status = cublasGemmEx(
+                        handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, n, m,
+                        &alpha, dequant, cudaType, m, cudaInput, cudaType, m,
+                        &beta, cudaOutput + row, cudaType, k, computeType,
+                        static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                }
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    FastllmReleaseDequantScratch(dequant, ownScratch);
+                    printf("Error: INT4_GROUP32 compact cuBLAS error. status = %d\n",
+                           status);
+                    throw("int4_group32 compact cublas error");
+                }
+            }
+            if (cudaBias != nullptr) {
+                const int total = n * k;
+                FastllmCudaInt4Group32CompactBiasKernel<T>
+                    <<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                        cudaOutput, cudaBias, total, k);
+            }
+            FastllmReleaseDequantScratch(dequant, ownScratch);
+        }
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaHalfMatMulFloatInt4Group32(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return FastllmCudaMatMulInt4Group32CompactBase<half>(
+        input, weight, bias, output, n, m, k, CUDA_R_16F, CUDA_R_16F);
+}
+
+bool FastllmCudaBFloat16MatMulInt4Group32(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return FastllmCudaMatMulInt4Group32CompactBase<__nv_bfloat16>(
+        input, weight, bias, output, n, m, k, CUDA_R_16BF, CUDA_R_32F);
+}
+
+bool FastllmCudaMatMulFloatInt4Group32(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    return FastllmCudaMatMulInt4Group32CompactBase<float>(
+        input, weight, bias, output, n, m, k, CUDA_R_32F, CUDA_R_32F);
 }

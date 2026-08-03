@@ -42,7 +42,7 @@ namespace fastllm {
         uint8_t *inputData;       // [n * m]
         uint8_t *weightData;      // [k * m], k = interDim * 2
         uint8_t *gateUpOutputData; // [n * k], 用于暂存 GEMM 结果
-        float *swigluOutputData;  // [n * interDim], Swiglu 中间结果（仅当 dstOutputData 非 nullptr 时用作临时缓冲）
+        float *swigluOutputData;  // [n * interDim], Swiglu 中间结果；直接 group32 量化时不写入
         uint8_t *dstOutputData;   // [n * interDim] 目标类型缓冲区，swiglu 后直接转换写出；nullptr 时行为同旧版
         DataType inputDataType, weightDataType, gateUpOutputDataType, dstOutputDataType;
         int n, m, k;              // k = interDim * 2
@@ -128,6 +128,36 @@ namespace fastllm {
     void RunMultiThreadConvertFromFloat32(void *dstData, DataType dstDataType, 
                                                 const float *floatData, size_t rows, 
                                                 size_t columns, AliveThreadPool *pool);
+
+    // Convert BF16 activations without requiring a full-size FLOAT32 staging
+    // buffer. Q8_K/Q8_K32 use a direct vectorized path; other formats retain
+    // the exact ConvertFromFloat32 semantics through a row-local fallback.
+    void ConvertFromBFloat16(void *dstData, DataType dstDataType,
+                             const uint16_t *bfloat16Data, size_t rows,
+                             size_t columns);
+
+    struct MultiThreadConvertFromBFloat16Op : MultiThreadBaseOp {
+        void *dstData;
+        DataType dstDataType;
+        const uint16_t *bfloat16Data;
+        size_t columns;
+        size_t startRow, endRow;
+
+        MultiThreadConvertFromBFloat16Op(
+                void *dstData, DataType dstDataType,
+                const uint16_t *bfloat16Data, size_t columns,
+                size_t startRow, size_t endRow)
+            : dstData(dstData), dstDataType(dstDataType),
+              bfloat16Data(bfloat16Data), columns(columns),
+              startRow(startRow), endRow(endRow) {}
+
+        void Run() override;
+    };
+
+    void RunMultiThreadConvertFromBFloat16(
+        void *dstData, DataType dstDataType,
+        const uint16_t *bfloat16Data, size_t rows, size_t columns,
+        AliveThreadPool *pool);
 
     struct WorkStealingOp : MultiThreadBaseOp {
         struct alignas(64) TaskState {
@@ -392,6 +422,10 @@ namespace fastllm {
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, int group, int groupCnt,
                             AliveThreadPool *pool, int startTid, int threadNum);
+    void RunLinearFloat32Int4Group32(float *inputData, Data &weight,
+                            float *outputData, float *biasData,
+                            int n, int m, int k,
+                            AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearFloat32Int2Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, int group, int groupCnt,
                             AliveThreadPool *pool, int startTid, int threadNum);
@@ -432,6 +466,8 @@ namespace fastllm {
     bool LinearINT8PERCHANNEL_INT4PERCHANNEL_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
     bool LinearINT8GROUP128_INT4GROUP128_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    bool LinearINT8GROUP32_INT4GROUP32_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
     bool LinearQ8K_GGUF_Kernel(uint8_t *q8kInputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, DataType AType, DataType BType);

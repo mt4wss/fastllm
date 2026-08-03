@@ -224,6 +224,10 @@ namespace fastllm {
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
 
+        // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
+        virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
+                                                      int layerId) const;
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
@@ -317,6 +321,13 @@ namespace fastllm {
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
+        // Drain several already-generated tokens under one scheduler lock.
+        // Returns the number written, -1 on normal completion, or -2 when the
+        // prompt is too long.  Speculative decoders use this to publish an
+        // accepted block without one Python/ASGI round trip per token.
+        virtual int FetchResponseTokensBatch(int handleId, int *output,
+                                             int maxTokens);
+
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
         virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
@@ -340,6 +351,21 @@ namespace fastllm {
         // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
         virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
 
+        // A non-negative value marks an ordinary attention layer whose KV
+        // history is periodically compacted to a bounded tail.  AutoWarmup
+        // treats that storage as a per-request fixed cost instead of charging
+        // it once for every token in the advertised context length.
+        virtual int GetKVCacheRetainedTokens(int layer) const {
+            (void)layer;
+            return -1;
+        }
+
+        // Some direct GPU paths keep the page ids of logically bounded caches
+        // aligned with token-growing layers (for example during CUDA Graph
+        // replay).  Such caches must be charged as token-growing storage even
+        // though attention and the generic path still use a bounded tail.
+        virtual bool BoundedKVCacheUsesTokenGrowingStorage() const { return false; }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
@@ -347,6 +373,10 @@ namespace fastllm {
         // 当前运行配置是否可以使用 ForwardGPU。
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
         virtual bool CanUseGPUForward() const;
+
+        // AutoWarmup 时将实际放在 NUMA 上的 MoE 专家权重全部注册，
+        // 避免未命中的专家在正式解码路径中触发首次分配和拷贝。
+        void WarmupNumaMoeWeights();
 
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
@@ -526,6 +556,10 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+
+        // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
+        // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool isIntermediateChunkedPrefill = false;
 
         int defaultChunkedPrefillSize = 8192;
 

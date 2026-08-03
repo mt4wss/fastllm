@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -62,14 +63,33 @@ except ImportError:
 
 ConversationContent = Union[str, List[Dict[str, Any]]]
 
+_KIMI_K3_THINK_OPEN = "<|open|>think<|sep|>"
+_KIMI_K3_THINK_CLOSE = "<|close|>think<|sep|>"
+_KIMI_K3_RESPONSE_OPEN = "<|open|>response<|sep|>"
+_KIMI_K3_RESPONSE_CLOSE = "<|close|>response<|sep|>"
+_KIMI_K3_MESSAGE_CLOSE = "<|close|>message<|sep|>"
+
+_KIMI_K3_THINK_OPEN_RE = re.compile(
+    r"<\|open\|>\s*think\s*<\|sep\|>")
+_KIMI_K3_THINK_CLOSE_RE = re.compile(
+    r"<\|close\|>\s*think\s*<\|sep\|>")
+_KIMI_K3_RESPONSE_OPEN_RE = re.compile(
+    r"<\|open\|>\s*response\s*<\|sep\|>")
+_KIMI_K3_RESPONSE_CLOSE_RE = re.compile(
+    r"<\|close\|>\s*response\s*<\|sep\|>")
+_KIMI_K3_MESSAGE_CLOSE_RE = re.compile(
+    r"<\|close\|>\s*message\s*<\|sep\|>")
+
 
 class ConversationMessage:
-    def __init__(self, role:str, content:ConversationContent, tool_calls=None, tool_call_id=None, name=None):
+    def __init__(self, role:str, content:ConversationContent, tool_calls=None,
+                 tool_call_id=None, name=None, reasoning_content=None):
       self.role = role
       self.content = content
       self.tool_calls = tool_calls
       self.tool_call_id = tool_call_id
       self.name = name
+      self.reasoning_content = reasoning_content
 
 
 class LoadedMedia:
@@ -229,6 +249,229 @@ class FastLLmCompletion:
   def _is_deepseek_v4_reasoning_response(self, enable_thinking: bool) -> bool:
       return enable_thinking and self._is_deepseek_v4_model()
 
+  def _is_poolside_reasoning_response(self, enable_thinking: bool) -> bool:
+      if not enable_thinking or getattr(self.model, "force_chat_template", False):
+          return False
+      try:
+          return bool(self.model._is_laguna())
+      except Exception:
+          return False
+
+  def _is_kimi_k3_model(self) -> bool:
+      try:
+          return bool(self.model._is_kimi_k3())
+      except Exception:
+          pass
+      try:
+          return self.model.get_type() == "kimi_k3"
+      except Exception:
+          return False
+
+  def _is_kimi_k3_reasoning_response(self, enable_thinking: bool) -> bool:
+      return enable_thinking and self._is_kimi_k3_model()
+
+  def _uses_tagged_reasoning_response(self, enable_thinking: bool) -> bool:
+      return (self._is_deepseek_v4_reasoning_response(enable_thinking)
+              or self._is_poolside_reasoning_response(enable_thinking)
+              or self._is_kimi_k3_reasoning_response(enable_thinking))
+
+  def _resolve_kimi_k3_reasoning_effort(
+      self, request: ChatCompletionRequest
+  ) -> Optional[str]:
+      if not self._is_kimi_k3_model():
+          return None
+      effort = request.reasoning_effort
+      template_kwargs = request.chat_template_kwargs or {}
+      if effort is None:
+          effort = template_kwargs.get(
+              "thinking_effort", template_kwargs.get("reasoning_effort"))
+      if effort is None:
+          effort = "max"
+      if effort not in {"low", "high", "max"}:
+          raise ValueError(
+              "Kimi K3 reasoning_effort must be one of: low, high, max")
+      return effort
+
+  def _serialize_tool_choice(self, tool_choice: Any) -> Any:
+      if hasattr(tool_choice, "model_dump"):
+          return tool_choice.model_dump(exclude_none=True)
+      if hasattr(tool_choice, "dict"):
+          return tool_choice.dict(exclude_none=True)
+      return tool_choice
+
+  def _with_effective_tool_choice(
+      self,
+      request: ChatCompletionRequest,
+      tool_choice: Any,
+  ) -> ChatCompletionRequest:
+      """Return a request whose generation and parsing tool choices agree."""
+      if self._serialize_tool_choice(request.tool_choice) == tool_choice:
+          return request
+      model_copy = getattr(request, "model_copy", None)
+      if callable(model_copy):
+          return model_copy(update={"tool_choice": tool_choice})
+      return request.copy(update={"tool_choice": tool_choice})
+
+  def _resolve_kimi_k3_auto_tool_choice(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> Any:
+      """Promote explicit workspace actions to K3's native required mode."""
+      if (not self._is_kimi_k3_model() or not tools
+              or tool_choice not in (None, "auto")):
+          return tool_choice
+
+      tool_names = {
+          str((tool.get("function") or {}).get("name", "")).lower()
+          for tool in tools if isinstance(tool, dict)
+      }
+      action_tools = {
+          "write", "edit", "apply_patch", "bash", "shell", "execute",
+          "run_command", "read", "delete", "remove", "move", "rename",
+      }
+      if not tool_names.intersection(action_tools):
+          return tool_choice
+
+      # Stop an agent loop after the client has rejected two tool calls for
+      # schema/argument errors in the same user turn. K3's `required` hint is
+      # advisory, and low-bit models can otherwise repeat the identical
+      # malformed call indefinitely.
+      recent_tool_errors = 0
+      for message in reversed(messages):
+          role = message.get("role")
+          if role == "user":
+              break
+          if role != "tool":
+              continue
+          content = message.get("content")
+          if not isinstance(content, str):
+              continue
+          if re.search(
+                  r"(?:schemaerror|invalid arguments|missing key)",
+                  content, re.IGNORECASE):
+              recent_tool_errors += 1
+      if recent_tool_errors >= 2:
+          return "none"
+
+      # Only promote a fresh user turn. Once a tool result is appended, the
+      # model must be free to finish, inspect, or make a deliberate follow-up
+      # call; repeatedly forcing `required` can turn one successful write into
+      # an endless sequence of unnecessary overwrites.
+      current_message = next(
+          (message for message in reversed(messages)
+           if message.get("role") not in {"system", "developer"}),
+          None,
+      )
+      if current_message is None or current_message.get("role") != "user":
+          return tool_choice
+
+      latest_user = ""
+      content = current_message.get("content")
+      if isinstance(content, str):
+          latest_user = content
+      elif isinstance(content, list):
+          latest_user = "\n".join(
+              str(part.get("text", ""))
+              for part in content
+              if isinstance(part, dict) and part.get("type") == "text")
+      if not latest_user.strip():
+          return tool_choice
+
+      # Avoid turning explanatory questions into actions merely because they
+      # mention "write", "run", or another operational verb.
+      explanatory_question = re.search(
+          r"(?:如何|怎么|怎样|为什么|请解释|教程|原理|区别|"
+          r"\bhow\s+(?:do|can|should|would)\b|\bwhat\s+is\b|"
+          r"\bwhy\b|\bexplain\b)",
+          latest_user, re.IGNORECASE)
+      if explanatory_question:
+          return tool_choice
+
+      artifact = re.search(
+          r"(?:文件|网页|页面|代码|脚本|项目|程序|测试|命令|"
+          r"\bfile\b|html|css|javascript|\bcode\b|"
+          r"\bscript\b|\bproject\b|\bprogram\b|\btest\b|\bcommand\b)",
+          latest_user, re.IGNORECASE)
+      if not artifact:
+          return tool_choice
+
+      chinese_request = re.search(
+          r"(?:(?:帮我|请(?:你)?|麻烦|给我|替我|直接).{0,16}|^\s*)"
+          r"(?:写|创建|新建|生成|实现|制作|修改|编辑|修复|删除|"
+          r"重命名|移动|运行|执行|检查)",
+          latest_user, re.IGNORECASE)
+      english_request = re.search(
+          r"(?:\bplease\b|\bcan\s+you\b|\bcould\s+you\b|"
+          r"\bwould\s+you\b|^\s*)"
+          r"(?:.{0,24}\s)?"
+          r"\b(?:create|write|edit|modify|fix|implement|build|generate|"
+          r"make|delete|remove|rename|move|run|execute|inspect|check)\b",
+          latest_user, re.IGNORECASE)
+      if chinese_request or english_request:
+          return "required"
+      return tool_choice
+
+  def _apply_kimi_k3_auto_tool_guidance(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> List[Dict[str, Any]]:
+      if (not self._is_kimi_k3_model() or not tools
+              or tool_choice not in (None, "auto")):
+          return messages
+      guidance = (
+          "Kimi K3 tool-choice reminder: tool_choice is auto. Decide whether "
+          "the current request requires an external action. If completing it "
+          "requires creating or editing files, running commands, inspecting "
+          "workspace or external state, or otherwise acting beyond a plain-text "
+          "answer, call the appropriate available tools in this message. Do not "
+          "only say that you will do it. For file operations, use the exact "
+          "working directory or path supplied by the conversation and tool "
+          "results; never invent a placeholder path such as /tmp/opencode. "
+          "Write complete runnable content, preserve a successful file instead "
+          "of replacing it with a partial version, and verify code changes when "
+          "practical. After tools have completed the request, return the final "
+          "answer unless another concrete action is needed. For conversation "
+          "or questions that can be answered directly from the provided "
+          "context, respond without a tool.")
+      guided = [dict(message) for message in messages]
+      for index, message in enumerate(guided):
+          content = message.get("content")
+          if message.get("role") == "system" and isinstance(content, str):
+              if guidance not in content:
+                  guided[index]["content"] = content.rstrip() + "\n\n" + guidance
+              return guided
+      guided.insert(0, {"role": "system", "content": guidance})
+      return guided
+
+  def _apply_kimi_k3_required_tool_guidance(
+      self,
+      messages: List[Dict[str, Any]],
+      tools: Optional[List[Dict[str, Any]]],
+      tool_choice: Any,
+  ) -> List[Dict[str, Any]]:
+      if (not self._is_kimi_k3_model() or not tools
+              or tool_choice != "required"):
+          return messages
+      guidance = (
+          "\n\n系统动作要求：必须立即调用合适的工具完成上述操作；不要只说明"
+          "将要执行，也不要在信息足够时追问。纯文本回复无效。如果请求是"
+          "创建或写入文件，直接调用 write 工具，不要先用 bash 检查目录；"
+          "调用 write 时必须同时提供 filePath 和完整 content。")
+      guided = [dict(message) for message in messages]
+      for index in range(len(guided) - 1, -1, -1):
+          message = guided[index]
+          if message.get("role") != "user":
+              continue
+          content = message.get("content")
+          if isinstance(content, str) and guidance not in content:
+              guided[index]["content"] = content.rstrip() + guidance
+          break
+      return guided
+
   def _normalize_model_delta(self, text: str) -> str:
       if text == "[unused16]":
           return "<think>"
@@ -302,6 +545,152 @@ class FastLLmCompletion:
       if reasoning_delta:
           return [DeltaMessage(reasoning_content=reasoning_delta)], ""
       return [], ""
+
+  def _strip_kimi_k3_response_wrapper(self, text: str) -> str:
+      response_open = _KIMI_K3_RESPONSE_OPEN_RE.search(text)
+      if response_open is not None:
+          response_close = _KIMI_K3_RESPONSE_CLOSE_RE.search(
+              text, response_open.end())
+          if response_close is not None:
+              text = text[response_open.end():response_close.start()]
+          else:
+              text = text[response_open.end():]
+      else:
+          response_close = _KIMI_K3_RESPONSE_CLOSE_RE.search(text)
+          if response_close is not None:
+              text = text[:response_close.start()]
+          text = _KIMI_K3_RESPONSE_OPEN_RE.sub("", text)
+          text = _KIMI_K3_RESPONSE_CLOSE_RE.sub("", text)
+      text = _KIMI_K3_MESSAGE_CLOSE_RE.sub("", text)
+      return text.replace("<|end_of_msg|>", "")
+
+  def _split_kimi_k3_reasoning(
+      self,
+      result: str,
+      emit_reasoning_content: bool,
+      preserve_xtml: bool,
+  ) -> Tuple[str, Optional[str]]:
+      if not emit_reasoning_content:
+          return result, None
+
+      think_open = _KIMI_K3_THINK_OPEN_RE.search(result)
+      reasoning_start = think_open.end() if think_open is not None else 0
+      think_close = _KIMI_K3_THINK_CLOSE_RE.search(
+          result, reasoning_start)
+      if think_close is None:
+          # The official K3 generation prompt ends inside the think channel,
+          # so an output truncated before think_close is reasoning-only.
+          return "", result[reasoning_start:] or None
+
+      reasoning_content = result[reasoning_start:think_close.start()]
+      content = result[think_close.end():]
+      if not preserve_xtml:
+          content = self._strip_kimi_k3_response_wrapper(content)
+      return content, reasoning_content or None
+
+  def _consume_kimi_k3_content_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> str:
+      if state.get("content_done"):
+          return ""
+      state["content_buffer"] = (
+          state.get("content_buffer", "") + delta_text)
+      buffer = state["content_buffer"]
+
+      if not state.get("content_started"):
+          response_open = _KIMI_K3_RESPONSE_OPEN_RE.search(buffer)
+          if response_open is not None:
+              buffer = buffer[response_open.end():]
+              state["content_started"] = True
+          elif _KIMI_K3_RESPONSE_OPEN.startswith(buffer):
+              return ""
+          else:
+              # Support a serving path that consumed response_open as a
+              # generation prefix.  K3 normally emits the marker after think.
+              state["content_started"] = True
+
+      response_close = _KIMI_K3_RESPONSE_CLOSE_RE.search(buffer)
+      if response_close is not None:
+          content = buffer[:response_close.start()]
+          state["content_buffer"] = ""
+          state["content_done"] = True
+          return content
+
+      overlap = self._partial_tag_overlap(
+          buffer, _KIMI_K3_RESPONSE_CLOSE)
+      if overlap:
+          content = buffer[:-overlap]
+          state["content_buffer"] = buffer[-overlap:]
+      else:
+          content = buffer
+          state["content_buffer"] = ""
+      return content
+
+  def _consume_kimi_k3_reasoning_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> Tuple[List[DeltaMessage], str]:
+      if state.get("phase") != "reasoning":
+          if state.get("preserve_xtml"):
+              return [], delta_text
+          return [], self._consume_kimi_k3_content_delta(
+              delta_text, state)
+
+      state["buffer"] = state.get("buffer", "") + delta_text
+      buffer = state["buffer"]
+
+      if not state.get("reasoning_started"):
+          think_open = _KIMI_K3_THINK_OPEN_RE.match(buffer)
+          if think_open is not None:
+              buffer = buffer[think_open.end():]
+              state["reasoning_started"] = True
+          elif _KIMI_K3_THINK_OPEN.startswith(buffer):
+              return [], ""
+          else:
+              # In the normal path think_open is part of the prompt.
+              state["reasoning_started"] = True
+
+      think_close = _KIMI_K3_THINK_CLOSE_RE.search(buffer)
+      if think_close is not None:
+          reasoning_delta = buffer[:think_close.start()]
+          trailing = buffer[think_close.end():]
+          state["buffer"] = ""
+          state["phase"] = "content"
+          state["active"] = False
+          messages = (
+              [DeltaMessage(reasoning_content=reasoning_delta)]
+              if reasoning_delta else [])
+          if state.get("preserve_xtml"):
+              return messages, trailing
+          return messages, self._consume_kimi_k3_content_delta(
+              trailing, state)
+
+      overlap = self._partial_tag_overlap(
+          buffer, _KIMI_K3_THINK_CLOSE)
+      if overlap:
+          reasoning_delta = buffer[:-overlap]
+          state["buffer"] = buffer[-overlap:]
+      else:
+          reasoning_delta = buffer
+          state["buffer"] = ""
+      if reasoning_delta:
+          return [DeltaMessage(
+              reasoning_content=reasoning_delta)], ""
+      return [], ""
+
+  def _consume_tagged_reasoning_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> Tuple[List[DeltaMessage], str]:
+      if state.get("format") == "kimi_k3":
+          return self._consume_kimi_k3_reasoning_delta(
+              delta_text, state)
+      return self._consume_deepseek_v4_reasoning_delta(
+          delta_text, state)
 
   async def _check_model(self, request: ChatCompletionRequest):
     if request.model != self.model_name:
@@ -566,13 +955,40 @@ class FastLLmCompletion:
       images: Optional[List[Image.Image]],
       videos: Optional[List[Any]],
       tools: Optional[List[Dict[str, Any]]] = None,
+      thinking_effort: Optional[str] = None,
+      tool_choice: Any = None,
+      chat_template_kwargs: Optional[Dict[str, Any]] = None,
   ) -> int:
       token_len_messages = messages
       if tools and self._is_deepseek_v4_model():
           token_len_messages = self.model._inject_deepseek_v4_tools(messages, tools)
-      if not images and not videos:
+      def call_model_token_len(extra_kwargs: Optional[Dict[str, Any]] = None):
+          kwargs = {
+              "enable_thinking": enable_thinking,
+              "tools": tools,
+              "thinking_effort": thinking_effort,
+              "tool_choice": tool_choice,
+              "chat_template_kwargs": chat_template_kwargs,
+          }
+          if extra_kwargs:
+              kwargs.update(extra_kwargs)
+          try:
+              signature = inspect.signature(self.model.get_input_token_len)
+              accepts_kwargs = any(
+                  parameter.kind == inspect.Parameter.VAR_KEYWORD
+                  for parameter in signature.parameters.values())
+              if not accepts_kwargs:
+                  kwargs = {
+                      key: value for key, value in kwargs.items()
+                      if key in signature.parameters
+                  }
+          except (TypeError, ValueError):
+              pass
           return self.model.get_input_token_len(
-              token_len_messages, enable_thinking = enable_thinking)
+              token_len_messages, **kwargs)
+
+      if not images and not videos:
+          return call_model_token_len()
 
       try:
           signature = inspect.signature(self.model.get_input_token_len)
@@ -582,6 +998,14 @@ class FastLLmCompletion:
                   kwargs["images"] = images
               if "videos" in signature.parameters:
                   kwargs["videos"] = videos
+              if "tools" in signature.parameters:
+                  kwargs["tools"] = tools
+              if "thinking_effort" in signature.parameters:
+                  kwargs["thinking_effort"] = thinking_effort
+              if "tool_choice" in signature.parameters:
+                  kwargs["tool_choice"] = tool_choice
+              if "chat_template_kwargs" in signature.parameters:
+                  kwargs["chat_template_kwargs"] = chat_template_kwargs
               return self.model.get_input_token_len(token_len_messages, **kwargs)
       except (TypeError, ValueError):
           pass
@@ -645,8 +1069,7 @@ class FastLLmCompletion:
           )
           return len(native_inputs["input_ids"])
 
-      return self.model.get_input_token_len(
-          token_len_messages, enable_thinking = enable_thinking)
+      return call_model_token_len()
 
   def _parse_chat_message_content(
       self,
@@ -656,6 +1079,7 @@ class FastLLmCompletion:
       tool_calls=None,
       tool_call_id=None,
       name=None,
+      reasoning_content=None,
   ) -> Tuple[List[ConversationMessage], LoadedMedia]:
       empty_media = LoadedMedia()
       if content is None and tool_calls is None and tool_call_id is None:
@@ -664,13 +1088,15 @@ class FastLLmCompletion:
           return [ConversationMessage(role=role, content=content or "",
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], empty_media
+                                      name=name,
+                                      reasoning_content=reasoning_content)], empty_media
       if isinstance(content, list):
           parsed_content, media = self._parse_openai_content_parts(content)
           return [ConversationMessage(role=role, content=parsed_content,
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], media
+                                      name=name,
+                                      reasoning_content=reasoning_content)], media
       raise NotImplementedError("Complex input not supported yet")
 
   def _stringify_anthropic_block_content(self, content: Any) -> str:
@@ -770,7 +1196,8 @@ class FastLLmCompletion:
       force_type = getattr(self.model, "tool_call_parser", "auto")
       allow_without_chat_template = (
           model_type == "deepseek_v4" or
-          force_type in ("deepseek_v4",)
+          model_type == "kimi_k3" or
+          force_type in ("deepseek_v4", "kimi_k3")
       )
       if tokenizer is None and allow_without_chat_template:
           tokenizer = _EmptyToolTokenizer()
@@ -814,7 +1241,26 @@ class FastLLmCompletion:
           return None
       from .toolcall_constraints import compile_tool_call_constraint
       spec = compile_tool_call_constraint(descriptor)
-      return spec.to_dict() if spec is not None else None
+      if spec is None:
+          return None
+      payload = spec.to_dict()
+      if (self._is_kimi_k3_model()
+              and request.temperature is None
+              and request.top_p is None
+              and request.top_k is None):
+          # K3's greedy path is reliable for tool and parameter structure, but
+          # long content-like string values can degenerate and never close
+          # their XTML tags. Keep structure deterministic and apply a mild
+          # repetition penalty only after an argument grows beyond the backend
+          # threshold.
+          payload["content_sampling"] = {
+              "type": "tool_content_sampling",
+              "format": "kimi_k3_xtml",
+              "top_k": 1,
+              "top_p": 1.0,
+              "temperature": 1.0,
+          }
+      return payload
 
   def _model_supports_tool_call_constraint(self) -> bool:
       launch_fn = getattr(self.model, "launch_stream_response", None)
@@ -1319,6 +1765,9 @@ class FastLLmCompletion:
       max_tokens = request.max_output_tokens
       if max_tokens is None:
           max_tokens = request.max_tokens
+      reasoning_effort = None
+      if isinstance(request.reasoning, dict):
+          reasoning_effort = request.reasoning.get("effort")
       return ChatCompletionRequest(
           model = request.model,
           messages = messages,
@@ -1330,6 +1779,7 @@ class FastLLmCompletion:
           stream = request.stream,
           tools = self._convert_responses_tools(request.tools),
           tool_choice = self._convert_responses_tool_choice(request.tool_choice),
+          reasoning_effort = reasoning_effort,
       )
 
   def _response_token_counts(
@@ -1340,8 +1790,18 @@ class FastLLmCompletion:
       fallback_output_tokens: int,
   ) -> Tuple[int, int, int, int]:
       statistics = dict(response_statistics or {})
+      # FetchResponseTokens removes a finished context, and handle ids are
+      # reused immediately.  The streaming adapter captures the terminal
+      # counters before that removal, so a complete captured snapshot is more
+      # authoritative than a later lookup by handle.  Looking the handle up
+      # again can otherwise read counters from an unrelated, newly launched
+      # request (the classic handle ABA problem).
+      has_captured_statistics = all(
+          key in statistics for key in (
+              "cached_input_tokens", "missed_input_tokens", "output_tokens"))
       get_statistics = getattr(self.model, "get_response_statistics", None)
-      if handle is not None and callable(get_statistics):
+      if (not has_captured_statistics and handle is not None
+              and callable(get_statistics)):
           latest = get_statistics(handle)
           if latest is not None:
               statistics.update(latest)
@@ -2131,7 +2591,9 @@ class FastLLmCompletion:
                   m["role"], m.get("content"),
                   tool_calls=m.get("tool_calls"),
                   tool_call_id=m.get("tool_call_id"),
-                  name=m.get("name"))
+                  name=m.get("name"),
+                  reasoning_content=m.get(
+                      "reasoning_content", m.get("reasoning")))
 
               conversation.extend(messages)
               media.extend(message_media)
@@ -2161,6 +2623,8 @@ class FastLLmCompletion:
                 msg_dict["tool_call_id"] = msg.tool_call_id
             if msg.name is not None:
                 msg_dict["name"] = msg.name
+            if msg.reasoning_content is not None:
+                msg_dict["reasoning_content"] = msg.reasoning_content
             messages.append(msg_dict)
 
       except Exception as e:
@@ -2188,6 +2652,12 @@ class FastLLmCompletion:
       enable_thinking = self.enable_thinking
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
+      try:
+          thinking_effort = self._resolve_kimi_k3_reasoning_effort(request)
+      except ValueError as error:
+          self._cleanup_temp_paths(media.temp_paths)
+          return self.create_error_response(str(error))
+      tool_choice = self._serialize_tool_choice(request.tool_choice)
 
       #logging.info(request)
       if (not(self.hide_input)):
@@ -2198,6 +2668,14 @@ class FastLLmCompletion:
       model_videos = media.videos if media.videos else None
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
+      messages = self._apply_kimi_k3_auto_tool_guidance(
+          messages, tools, tool_choice)
+      tool_choice = self._resolve_kimi_k3_auto_tool_choice(
+          messages, tools, tool_choice)
+      messages = self._apply_kimi_k3_required_tool_guidance(
+          messages, tools, tool_choice)
+      effective_request = self._with_effective_tool_choice(
+          request, tool_choice)
 
       launch_kwargs = {
           "max_length": max_length,
@@ -2214,8 +2692,14 @@ class FastLLmCompletion:
           "videos": model_videos,
           "stop_token_ids": stop_token_ids,
       }
+      if self._is_kimi_k3_model():
+          launch_kwargs.update({
+              "thinking_effort": thinking_effort,
+              "tool_choice": tool_choice,
+              "chat_template_kwargs": request.chat_template_kwargs,
+          })
       self._attach_tool_call_constraint_if_supported(
-          launch_kwargs, request)
+          launch_kwargs, effective_request)
 
       def prepare_and_launch_text_request():
           # Token counting and launch both apply the chat template.  Keep them
@@ -2227,7 +2711,10 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
               images = model_images,
               videos = model_videos,
-              tools = tools)
+              tools = tools,
+              thinking_effort = thinking_effort,
+              tool_choice = tool_choice,
+              chat_template_kwargs = request.chat_template_kwargs)
           launched_handle = self.model.launch_stream_response(
               messages, **launch_kwargs)
           return input_len, launched_handle
@@ -2252,11 +2739,11 @@ class FastLLmCompletion:
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
-      emit_reasoning_content = self._is_deepseek_v4_reasoning_response(enable_thinking)
+      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(
-              request, raw_request, result_generator, request_id,
+              effective_request, raw_request, result_generator, request_id,
               input_token_len, think = need_think_prefix,
               emit_reasoning_content = emit_reasoning_content,
               handle = handle, response_statistics = response_statistics),
@@ -2264,25 +2751,39 @@ class FastLLmCompletion:
       else:
           try:
               return await self.chat_completion_full_generator(
-                  request, raw_request, handle, result_generator, request_id,
+                  effective_request, raw_request, handle, result_generator,
+                  request_id,
                   input_token_len, think = need_think_prefix,
                   emit_reasoning_content = emit_reasoning_content,
                   response_statistics = response_statistics)
           except ValueError as e:
               return self.create_error_response(str(e))
 
-  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
-    # 进入BackgroundTask之后，说明流式请求已经断开了，那么这里直接abort
+  def _release_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    if handle is None or self.conversation_handles.get(request_id) != handle:
+      return False
+    self.conversation_handles.pop(request_id, None)
+    return True
+
+  def _abort_conversation_handle(
+      self, request_id: str, handle: Optional[int]
+  ) -> bool:
+    if not self._release_conversation_handle(request_id, handle):
+      return False
     self.model.abort_handle(handle)
-    logging.info(f"Abort request: {request_id}")
-    return
-  
-    while True:
-      if await raw_request.is_disconnected():
-        self.model.abort_handle(handle)
-        logging.info(f"Abort request: {request_id}")
-        return
-      await asyncio.sleep(1)  # 检查间隔
+    return True
+
+  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
+    # Starlette runs a StreamingResponse BackgroundTask after both a normal
+    # completion and a client disconnect.  A naturally exhausted generator
+    # releases ownership before its terminal SSE is yielded.  Only an
+    # interrupted generator remains active here, so abort it while the
+    # request_id still owns the integer handle.
+    if not self._abort_conversation_handle(request_id, handle):
+      return
+    logging.info(f"Abort disconnected request: {request_id}")
       
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
@@ -2308,8 +2809,19 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
-      result, reasoning_content = self._split_deepseek_v4_reasoning(
-          result, emit_reasoning_content)
+      if self._is_kimi_k3_model():
+          if emit_reasoning_content:
+              result, reasoning_content = self._split_kimi_k3_reasoning(
+                  result,
+                  emit_reasoning_content,
+                  preserve_xtml=bool(request.tools))
+          else:
+              reasoning_content = None
+              if not request.tools:
+                  result = self._strip_kimi_k3_response_wrapper(result)
+      else:
+          result, reasoning_content = self._split_deepseek_v4_reasoning(
+              result, emit_reasoning_content)
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
       usage = self._chat_usage(
@@ -2449,18 +2961,27 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
         reasoning_state = {
             "active": emit_reasoning_content,
             "buffer": "",
             "started": False,
+            "format": reasoning_format,
+            "phase": "reasoning" if emit_reasoning_content else "content",
+            "reasoning_started": False,
+            "preserve_xtml": bool(request.tools),
+            "content_buffer": "",
+            "content_started": False,
+            "content_done": False,
         }
 
+        stream_exhausted = False
         async for res in result_generator:
             res = self._normalize_model_delta(res)
             completion_tokens += 1
             delta_text = res
 
-            reasoning_delta_messages, delta_text = self._consume_deepseek_v4_reasoning_delta(
+            reasoning_delta_messages, delta_text = self._consume_tagged_reasoning_delta(
                 delta_text, reasoning_state)
             for reasoning_delta_message in reasoning_delta_messages:
                 choice_data = ChatCompletionResponseStreamChoice(
@@ -2556,6 +3077,18 @@ class FastLLmCompletion:
             if stopped_by_stop_string:
                 break
             #await asyncio.sleep(0)
+        else:
+            stream_exhausted = True
+
+        # FetchResponseTokens removes a terminal backend context, so its
+        # integer handle can be reused immediately.  Drop request ownership in
+        # the same event-loop turn, before yielding any final content/usage
+        # event.  An early server-side stop has not exhausted the backend and
+        # must be aborted explicitly before ownership is released.
+        if stream_exhausted:
+            self._release_conversation_handle(request_id, handle)
+        elif self._abort_conversation_handle(request_id, handle):
+            logging.info(f"Abort early-terminated request: {request_id}")
 
         if (not request.tools) and not stopped_by_stop_string:
             delta_text = self._flush_stop_buffer(stop_strings, stop_filter_state)
@@ -2588,7 +3121,9 @@ class FastLLmCompletion:
                     data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
 
-        if (emit_reasoning_content and reasoning_state.get("active")
+        if (emit_reasoning_content
+                and reasoning_state.get("format") != "kimi_k3"
+                and reasoning_state.get("active")
                 and reasoning_state.get("buffer")):
             choice_data = ChatCompletionResponseStreamChoice(
                 index = 0,
@@ -2619,6 +3154,15 @@ class FastLLmCompletion:
                     final_diagnostics)
                 logging.warning("Invalid stream tool call final state: %s",
                                 diagnostics)
+                if os.environ.get(
+                        "FT_TOOLCALL_DEBUG_OUTPUT", "").strip().upper() in (
+                            "1", "ON", "TRUE", "YES"):
+                    logging.warning(
+                        "Invalid stream raw output: chars=%d head=%r tail=%r",
+                        len(current_text),
+                        current_text[:2048],
+                        current_text[-2048:],
+                    )
                 final_stream_error_data = self.create_streaming_error_response(
                     f"Invalid tool call: {diagnostics}",
                     err_type = "invalid_tool_call",
@@ -2678,15 +3222,12 @@ class FastLLmCompletion:
                 yield f"data: {flush_data}\n\n"
         yield f"data: {data}\n\n"
       except ValueError as e:
+        if self._abort_conversation_handle(request_id, handle):
+          logging.info(f"Abort failed streaming request: {request_id}")
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
-      
-      # After completion, remove the conversation from tracking dictionary
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
-          # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
-      
+
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
 
@@ -2883,6 +3424,11 @@ class FastLLmCompletion:
                                   partial_json = tool_delta.function.arguments),
                           ))
 
+          # Release the terminal handle before any closing SSE is yielded.  A
+          # client cancellation after message_delta/message_stop must not let
+          # the old BackgroundTask abort a newly recycled numeric handle.
+          self._release_conversation_handle(request_id, handle)
+
           if text_block_index is not None:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",
@@ -2910,6 +3456,8 @@ class FastLLmCompletion:
               "message_stop",
               MessageStopEvent())
       except ValueError as e:
+          if self._abort_conversation_handle(request_id, handle):
+              logging.info(f"Abort failed Anthropic streaming request: {request_id}")
           error_data = json.dumps({
               "type": "error",
               "error": {
@@ -2919,9 +3467,6 @@ class FastLLmCompletion:
           })
           yield f"event: error\ndata: {error_data}\n\n"
           await asyncio.sleep(0)
-
-      if request_id in self.conversation_handles:
-          del self.conversation_handles[request_id]
 
       await asyncio.sleep(0)
       

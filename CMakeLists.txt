@@ -209,10 +209,10 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/kimi_k3.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/gpt_oss.cpp
-        src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp
+        src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
         third_party/json11/json11.cpp
         third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
         third_party/gguf/gguf-adapter.cpp
@@ -333,6 +333,41 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-marlin.cu
         src/devices/cuda/linear/fastllm-linear-int4nozero.cu
         src/devices/cuda/models/deepseekv4-kernels.cu)
+
+    # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
+    # block-scaled FP8 MMA instructions.  Compile it as a separate fatbin so a
+    # multi-architecture FastLLM build keeps the generic sparse-attention path
+    # for older GPUs instead of embedding unsupported PTX in their code.
+    if (FASTLLM_CUTLASS_FP8_SM120_ENABLED AND
+        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        include_directories(
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm/include")
+        set(FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE
+            src/devices/cuda/models/fastllm-deepseekv4-sparse-mla-sm120.cu)
+        set(FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE
+            src/devices/cuda/moe/fastllm-moe-deepgemm-sm120.cu)
+        set(FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE
+            src/devices/cuda/models/fastllm-deepseekv4-woa-deepgemm-sm120.cu)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
+            ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE})
+        set_source_files_properties(
+            ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
+            ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
+            PROPERTIES CUDA_ARCHITECTURES "120f")
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_SPARSE_MLA_SM120)
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120)
+        add_compile_definitions(FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120)
+        message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: ON")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: ON")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: ON")
+    else()
+        message(STATUS "DeepSeek-V4 SM120 sparse MLA kernel: OFF")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF")
+        message(STATUS "DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF")
+    endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
     # 运行期再根据设备算力回退到朴素 int4 linear，因此这里始终编译 marlin.cu 以兼容多 CUDA_ARCH 打包。
@@ -530,6 +565,12 @@ if (UNIT_TEST)
     target_link_libraries(regressionOps fastllm)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
+
+    if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
+        target_link_libraries(cudaGraphPoolMissRegression fastllm)
+        target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
 endif()
 

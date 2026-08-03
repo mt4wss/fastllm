@@ -171,6 +171,14 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        bool tool_call_content_sampling_enabled = false;
+        // Set on the per-step config after Kimi-K3 has drained DSpark's
+        // scheduler-ahead queue. DSpark then samples from its batched target
+        // verification logits while keeping target and draft caches aligned.
+        bool tool_call_content_sampling_active = false;
+        int tool_call_content_top_k = 1;
+        float tool_call_content_top_p = 1.0f;
+        float tool_call_content_temperature = 1.0f;
 
         bool IsSimpleGreedy() const {
             if (!tool_call_allowed_token_ids.empty()) {
@@ -315,8 +323,13 @@ namespace fastllm {
         INT8_PERCHANNEL = 1005, // int8, per channel量化
         NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1, blockM = 16, inline float scale per block
         NVFP4_BLOCK_16_E8M0 = 1007, // packed fp4 e2m1, blockM = 16, inline e8m0 scale per block
+        // Symmetric group-32 INT4. Four groups form one compact block:
+        // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
+        // The final partial block has no padding. The implicit zero point is 8.
+        INT4_GROUP32 = 1008,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
+        INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
@@ -325,6 +338,33 @@ namespace fastllm {
     std::string GetDataTypeName(DataType type);
 
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
+    constexpr size_t INT4_GROUP32_GROUP_SIZE = 32;
+    constexpr size_t INT4_GROUP32_PACKED_BYTES = 16;
+    constexpr size_t INT4_GROUP32_BLOCK_GROUPS = 4;
+
+    // INT4_GROUP32 keeps four packed groups together before their four scales.
+    // These helpers also handle the final 1-3 group block without padding.
+    inline size_t GetInt4Group32DataOffset(size_t group, size_t groups) {
+        (void)groups;
+        const size_t block = group / INT4_GROUP32_BLOCK_GROUPS;
+        const size_t inBlock = group % INT4_GROUP32_BLOCK_GROUPS;
+        return block * INT4_GROUP32_BLOCK_GROUPS *
+                   (INT4_GROUP32_PACKED_BYTES + sizeof(uint16_t)) +
+               inBlock * INT4_GROUP32_PACKED_BYTES;
+    }
+
+    inline size_t GetInt4Group32ScaleOffset(size_t group, size_t groups) {
+        const size_t block = group / INT4_GROUP32_BLOCK_GROUPS;
+        const size_t inBlock = group % INT4_GROUP32_BLOCK_GROUPS;
+        const size_t blockBegin = block * INT4_GROUP32_BLOCK_GROUPS;
+        const size_t blockGroups = std::min(
+            INT4_GROUP32_BLOCK_GROUPS, groups - blockBegin);
+        return block * INT4_GROUP32_BLOCK_GROUPS *
+                   (INT4_GROUP32_PACKED_BYTES + sizeof(uint16_t)) +
+               blockGroups * INT4_GROUP32_PACKED_BYTES +
+               inBlock * sizeof(uint16_t);
+    }
+
     size_t GetNVFP4WeightBytes(size_t rows, size_t columns);
     size_t GetNVFP4ScaleBytes(size_t rows, size_t columns, int blockK, int blockM);
     size_t GetNVFP4StorageBytes(size_t rows, size_t columns, int blockK, int blockM);
@@ -485,6 +525,7 @@ namespace fastllm {
         int tpQHeads = 0;
         int tpKVHeads = 0;
         int tpHeadDim = 0;
+        int tpSplitUnit = 0;
 
         int weightId;
         bool isRegistered = false;
@@ -854,6 +895,8 @@ namespace fastllm {
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &weights,
+                        std::vector <Data*> &biass);
     enum MoeGateType {
         MoeGateSwiglu = 0,
         MoeGateGeglu = 1
@@ -861,7 +904,8 @@ namespace fastllm {
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
-                bool expertParallel = false);
+                bool expertParallel = false, float swigluLimit = 0.0f,
+                bool deepSeekV4Mode = false);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,
@@ -870,7 +914,9 @@ namespace fastllm {
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale);
 
     // MLA with paged KV cache: kvCache (kpe) and peCache (ckv) are stored in paged form (isPagedKVCache, pageIndex, lastPageLen, pagedKVCacheData).
-    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale);
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged,
+                       Data &peCachePaged, Data &output,
+                       float softmaxScale, int kvLen = -1);
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType);
@@ -891,6 +937,71 @@ namespace fastllm {
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
+
+    // Kimi-K3 operators.  These are dispatched through the regular FastLLM
+    // executor; the CPU backend is the first implementation.
+    void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
+                       Data &output);
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &output);
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &cache, Data &output);
+
+    // Updates the packed Q/K/V short-convolution cache from a prefix of the
+    // projected inputs without evaluating convolution outputs.
+    void KimiK3UpdatePackedConvCache(
+            const Data &q, const Data &k, const Data &v,
+            int history, int tokens, Data &cache);
+
+    void KimiK3L2Norm(const Data &input, float eps, Data &output);
+
+    void KimiK3RecurrentKDA(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output, Data &decay, Data &beta);
+
+    // Inference only consumes the recurrent output and updated state.  Avoid
+    // materializing the full-sequence float32 decay/beta diagnostics on that
+    // path while retaining KimiK3RecurrentKDA for validation and tooling.
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output);
+
+    // Replays only the recurrent-state transition for the first `tokens`
+    // rows of a captured verification batch.
+    void KimiK3RecurrentKDAUpdateState(
+            const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            int tokens, Data &state);
+
+    void KimiK3RMSNormSigmoidGate(
+            const Data &input, const Data &gate, const Data &weight,
+            float eps, Data &output);
+
+    void KimiK3AttnRes(
+            const Data &prefixSum, const Data &blockResidual,
+            const Data &projection, const Data &norm, float eps,
+            Data &output);
+
+    void KimiK3SiTUAndMul(
+            const Data &gate, const Data &up, float beta,
+            float linearBeta, Data &output);
+
+    void KimiK3RoutedExperts(
+            const Data &input, const Data &index, const Data &score,
+            std::vector<Data*> &w1s, std::vector<Data*> &w2s,
+            std::vector<Data*> &w3s, float beta, float linearBeta,
+            Data &output);
+
+    void KimiK3CausalAttention(
+            const Data &q, const Data &k, const Data &v,
+            float scale, Data &output);
 
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
@@ -1049,6 +1160,11 @@ namespace fastllm {
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,
                             float lowFreqFactor, float highFreqFactor);
+
+    // YaRN RoPE encoding computed directly from positions, without a sin/cos cache.
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor);
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,

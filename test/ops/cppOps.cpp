@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "executor.h"
+#include "utils/utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -186,6 +187,51 @@ namespace {
             weight.Resize({out, in});
             weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
                                      (uint8_t *) fp32Weight.cpuData, nullptr, nullptr, groupCnt);
+            return;
+        }
+        if (weightType == "int4group32") {
+            constexpr int groupCnt = 32;
+            if (in % groupCnt != 0) {
+                throw std::runtime_error("int4group32 input features must be divisible by 32");
+            }
+            weight.dataType = fastllm::DataType::INT4_GROUP32;
+            weight.Resize({out, in});
+            weight.Allocate(true);
+            const int groups = in / groupCnt;
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, in);
+            const float *source = (const float*)fp32Weight.cpuData;
+            for (int row = 0; row < out; row++) {
+                uint8_t *rowData = weight.cpuData + (size_t)row * rowBytes;
+                for (int group = 0; group < groups; group++) {
+                    const float *sourceBlock = source +
+                        (size_t)row * in + group * groupCnt;
+                    float absMax = 0.0f;
+                    for (int column = 0; column < groupCnt; column++) {
+                        absMax = std::max(absMax, std::fabs(sourceBlock[column]));
+                    }
+                    uint8_t *block = rowData +
+                        fastllm::GetInt4Group32DataOffset(group, groups);
+                    const uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(
+                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
+                    std::memcpy(rowData +
+                                    fastllm::GetInt4Group32ScaleOffset(group, groups),
+                                &scaleBits, sizeof(scaleBits));
+                    const float scale = fastllm::BFloat16BitsToFloat32(scaleBits);
+                    for (int column = 0; column < groupCnt; column += 2) {
+                        auto quantize = [scale](float value) {
+                            if (scale == 0.0f) {
+                                return 8;
+                            }
+                            return std::max(0, std::min(15,
+                                (int)std::lround(value / scale) + 8));
+                        };
+                        const int high = quantize(sourceBlock[column]);
+                        const int low = quantize(sourceBlock[column + 1]);
+                        block[column / 2] = (uint8_t)((high << 4) | low);
+                    }
+                }
+            }
             return;
         }
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
@@ -792,22 +838,25 @@ namespace {
         };
     }
 
-    struct RmsNormFp16BenchState {
+    struct RmsNormSpecializedBenchState {
         std::string kind;
         std::string path;
+        fastllm::DataType dataType = fastllm::DataType::FLOAT16;
         int threads = 0;
         float eps = 1.0e-6f;
         fastllm::Data input, weight, gate;
         fastllm::Data legacyOutput, fastOutput;
 
-        static void PrepareFp16Tensor(fastllm::Data &data, const std::vector<int> &dims, float seed) {
+        static void PrepareTensor(fastllm::Data &data, const std::vector<int> &dims,
+                                  float seed, fastllm::DataType dataType) {
             data.CopyFrom(MakeTensor(dims, seed, 0.25f));
-            fastllm::ToDataType(data, fastllm::DataType::FLOAT16);
+            fastllm::ToDataType(data, dataType);
             data.ToDevice(fastllm::DataDevice::CUDA);
         }
 
-        static void PrepareOutput(fastllm::Data &data, const std::vector<int> &dims) {
-            data.dataType = fastllm::DataType::FLOAT16;
+        static void PrepareOutput(fastllm::Data &data, const std::vector<int> &dims,
+                                  fastllm::DataType dataType) {
+            data.dataType = dataType;
             data.UpdateUnitSize();
             data.Resize(dims);
             data.Allocate(false);
@@ -816,17 +865,22 @@ namespace {
 
         void RunOne(const fastllm::Data &source, fastllm::Data &output, int threadCount) {
             bool ok = false;
-            if (kind == "rmsnorm") {
+            if (dataType == fastllm::DataType::BFLOAT16 && kind == "rmsnorm") {
+                ok = FastllmCudaRMSNormBFloat16WithThreadCount(
+                    source, weight, output, eps, threadCount);
+            } else if (dataType == fastllm::DataType::FLOAT16 && kind == "rmsnorm") {
                 ok = FastllmCudaRMSNormFloat16WithThreadCount(
                     source, weight, output, eps, threadCount);
-            } else if (kind == "rmsnorm_silu_mul") {
+            } else if (dataType == fastllm::DataType::FLOAT16 &&
+                       kind == "rmsnorm_silu_mul") {
                 ok = FastllmCudaRMSNormSiluMulFloat16WithThreadCount(
                     source, weight, gate, output, eps, threadCount);
             } else {
-                throw std::runtime_error("kind must be rmsnorm or rmsnorm_silu_mul");
+                throw std::runtime_error(
+                    "BF16 supports rmsnorm; FP16 supports rmsnorm and rmsnorm_silu_mul");
             }
             if (!ok) {
-                throw std::runtime_error("FP16 RMSNorm specialized launch failed");
+                throw std::runtime_error("RMSNorm specialized launch failed");
             }
         }
 
@@ -853,15 +907,15 @@ namespace {
             RunOne(input, legacyOutput, 0);
             RunOne(input, fastOutput, threads);
             ForceDeviceSync();
-            ExpectExact(legacyOutput, fastOutput, "out-of-place FP16 RMSNorm");
+            ExpectExact(legacyOutput, fastOutput, "out-of-place RMSNorm");
 
             fastllm::Data legacyInplace, fastInplace;
-            PrepareFp16Tensor(legacyInplace, dims, 0.413f);
-            PrepareFp16Tensor(fastInplace, dims, 0.413f);
+            PrepareTensor(legacyInplace, dims, 0.413f, dataType);
+            PrepareTensor(fastInplace, dims, 0.413f, dataType);
             RunOne(legacyInplace, legacyInplace, 0);
             RunOne(fastInplace, fastInplace, threads);
             ForceDeviceSync();
-            ExpectExact(legacyInplace, fastInplace, "in-place FP16 RMSNorm");
+            ExpectExact(legacyInplace, fastInplace, "in-place RMSNorm");
         }
 
         void Init(const OpTestParams &params) {
@@ -869,21 +923,29 @@ namespace {
             FastllmCudaSetDevice(0);
             kind = params.GetString("kind");
             path = params.GetString("path");
+            std::string dtype = params.GetString("dtype");
+            if (dtype == "fp16") {
+                dataType = fastllm::DataType::FLOAT16;
+            } else if (dtype == "bf16") {
+                dataType = fastllm::DataType::BFLOAT16;
+            } else {
+                throw std::runtime_error("dtype must be fp16 or bf16");
+            }
             threads = params.GetInt("threads");
             eps = params.GetFloat("eps");
             int outer = params.GetInt("outer");
             int hidden = params.GetInt("hidden");
             std::vector<int> dims = {outer, hidden};
-            PrepareFp16Tensor(input, dims, 0.413f);
-            PrepareFp16Tensor(gate, dims, 0.927f);
+            PrepareTensor(input, dims, 0.413f, dataType);
+            PrepareTensor(gate, dims, 0.927f, dataType);
             weight.CopyFrom(MakeRampTensor({hidden}, 0.731f));
             weight.ToDevice(fastllm::DataDevice::CUDA);
-            PrepareOutput(legacyOutput, dims);
-            PrepareOutput(fastOutput, dims);
+            PrepareOutput(legacyOutput, dims, dataType);
+            PrepareOutput(fastOutput, dims, dataType);
             Check(dims);
 #else
             (void)params;
-            throw std::runtime_error("rmsnorm_fp16_specialized benchmark requires USE_CUDA");
+            throw std::runtime_error("RMSNorm specialized benchmark requires USE_CUDA");
 #endif
         }
 
@@ -898,11 +960,11 @@ namespace {
         }
     };
 
-    static BenchmarkResult BenchmarkRmsNormFp16Cuda(
+    static BenchmarkResult BenchmarkRmsNormSpecializedCuda(
             const OpTestParams &params, const std::string &device, int warmup, int iters) {
 #ifdef USE_CUDA
         ScopedFirstDevice guard(device);
-        auto state = std::make_shared<RmsNormFp16BenchState>();
+        auto state = std::make_shared<RmsNormSpecializedBenchState>();
         state->Init(params);
         for (int i = 0; i < warmup; i++) {
             state->Run();
@@ -923,18 +985,19 @@ namespace {
         (void)device;
         (void)warmup;
         (void)iters;
-        throw std::runtime_error("rmsnorm_fp16_specialized benchmark requires USE_CUDA");
+        throw std::runtime_error("RMSNorm specialized benchmark requires USE_CUDA");
 #endif
     }
 
-    static OpCase MakeRmsNormFp16SpecializedCase() {
+    static OpCase MakeRmsNormSpecializedCase() {
         return {
             "rmsnorm_fp16_specialized",
-            "benchmark exact FP16 RMSNorm and RMSNorm+SiLU+mul specializations",
+            "benchmark exact FP16/BF16 RMSNorm and FP16 RMSNorm+SiLU+mul specializations",
             []() {
                 OpTestParams params;
                 params.Add("kind", "rmsnorm", "rmsnorm or rmsnorm_silu_mul");
                 params.Add("path", "fast", "legacy or fast");
+                params.Add("dtype", "fp16", "fp16 or bf16");
                 params.Add("outer", "16", "number of rows");
                 params.Add("hidden", "128", "channels per row");
                 params.Add("threads", "32", "fast thread count");
@@ -949,7 +1012,7 @@ namespace {
                 marker.Allocate(0.0f);
                 return marker;
             },
-            BenchmarkRmsNormFp16Cuda,
+            BenchmarkRmsNormSpecializedCuda,
             [](const OpTestParams &params) {
                 int outer = params.GetInt("outer"), hidden = params.GetInt("hidden");
                 return (double)(outer * hidden * 2 * 2 + hidden * 4);
@@ -1008,9 +1071,9 @@ namespace {
             RunOne(legacyState, legacyOutput, 8, false);
             RunOne(candidateState, candidateOutput, tileV, exactNorm);
             ForceDeviceSync();
-            RmsNormFp16BenchState::ExpectExact(
+            RmsNormSpecializedBenchState::ExpectExact(
                 legacyOutput, candidateOutput, "recurrent output");
-            RmsNormFp16BenchState::ExpectExact(
+            RmsNormSpecializedBenchState::ExpectExact(
                 legacyState, candidateState, "recurrent state");
         }
 
@@ -1133,7 +1196,7 @@ namespace {
                 params.Add("batch", "4", "batch size");
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
-                params.Add("weight_type", "float32", "weight datatype: float32 or int4group");
+                params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
@@ -1173,7 +1236,13 @@ namespace {
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
-                return FloatBytes({batch, in}) + FloatBytes({out, in}) + FloatBytes({out}) + FloatBytes({batch, out});
+                double weightBytes = FloatBytes({out, in});
+                if (params.GetString("weight_type") == "int4group32") {
+                    weightBytes = (double)fastllm::GetDataBytes(
+                        fastllm::DataType::INT4_GROUP32, out, in);
+                }
+                return FloatBytes({batch, in}) + weightBytes +
+                       FloatBytes({out}) + FloatBytes({batch, out});
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
@@ -1618,6 +1687,69 @@ namespace {
         }
     }
 
+    static void CheckLinearFp8RawBatchOneCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "separate" ||
+            params.GetString("input_type") != "fp16" ||
+            params.GetInt("batch") < 2) {
+            throw std::runtime_error(
+                "raw FP8 batch-one check requires separate fp16 weight and batch >= 2");
+        }
+
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+
+        // Keep the weight in its original row-major layout through the public
+        // dispatch policy. This exercises the raw batch-one GEMV without
+        // adding test-only state to Data or production operator metadata.
+        struct ScopedNcclForceSync {
+            bool previous = FastllmCudaGetNcclForceSync();
+            ~ScopedNcclForceSync() {
+                FastllmCudaSetNcclForceSync(previous);
+            }
+        } restoreForceSync;
+        FastllmCudaSetNcclForceSync(false);
+
+        fastllm::Data reference = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        fastllm::Data single = MakeCudaOutputLike(
+            state->input.dataType, 1, state->out);
+        bool ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, reference,
+            state->batch, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("raw FP8 multi-row reference path failed");
+        }
+        ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, single,
+            1, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("raw FP8 batch-one path failed");
+        }
+        ForceDeviceSync();
+
+        std::vector<float> expected =
+            ToFloatVector(ConvertToFloat32Data(reference));
+        expected.resize(state->out);
+        std::vector<float> observed =
+            ToFloatVector(ConvertToFloat32Data(single));
+        PrintLinearFp8Block128CheckStats(
+            expected, observed, 1, state->out);
+
+        int mismatches = 0;
+        for (size_t i = 0; i < expected.size(); i++) {
+            float diff = std::fabs(expected[i] - observed[i]);
+            float tolerance = 0.1f + 0.05f * std::fabs(expected[i]);
+            if (!std::isfinite(observed[i]) || diff > tolerance) {
+                mismatches++;
+            }
+        }
+        if (mismatches != 0) {
+            throw std::runtime_error(
+                "raw FP8 batch-one mismatch count: " +
+                std::to_string(mismatches));
+        }
+    }
+
     static void CheckLinearFp8MarlinCuda(const OpTestParams &params) {
         if (params.GetString("weight_layout") != "separate" ||
             params.GetString("input_type") != "fp16") {
@@ -1717,6 +1849,88 @@ namespace {
         }
     }
 
+    static void CheckLinearFp8LayoutSafetyCuda(const OpTestParams &params) {
+        if (params.GetString("weight_layout") != "separate" ||
+            params.GetString("input_type") != "fp16") {
+            throw std::runtime_error(
+                "FP8 layout safety check requires weight_layout=separate and input_type=fp16");
+        }
+        int arch = FastllmCudaRuntimeArch();
+        if (arch != 120 && arch != 121) {
+            throw std::runtime_error("FP8 layout safety check targets SM120/SM121");
+        }
+        const char *marlinEnv = std::getenv("FASTLLM_CUDA_FP8_MARLIN");
+        if (marlinEnv != nullptr && marlinEnv[0] != '\0') {
+            throw std::runtime_error(
+                "FP8 layout safety check requires FASTLLM_CUDA_FP8_MARLIN to be unset");
+        }
+
+        auto state = std::make_shared<LinearFp8Block128BenchState>();
+        state->Init(params);
+
+        struct ScopedNcclForceSync {
+            bool previous = FastllmCudaGetNcclForceSync();
+            ScopedNcclForceSync() {
+                FastllmCudaSetNcclForceSync(true);
+            }
+            ~ScopedNcclForceSync() {
+                FastllmCudaSetNcclForceSync(previous);
+            }
+        } forceSync;
+
+        fastllm::Data warmup = MakeCudaOutputLike(
+            state->input.dataType, 2, state->out);
+        bool ok = FastllmCudaHalfMatMulFloatFP8E4M3(
+            state->input, state->weight, state->bias, warmup,
+            2, state->in, state->out);
+        if (!ok) {
+            throw std::runtime_error("FP8 layout safety warmup failed");
+        }
+        ForceDeviceSync();
+        if (FastllmCudaHasFp8MarlinLayout(state->weight)) {
+            throw std::runtime_error(
+                "SM120/SM121 warmup must preserve row-major FP8 weights");
+        }
+
+        // Also verify the defensive CUTLASS check independently of the SM120
+        // default policy. The fake non-null metadata is restored before Data
+        // destruction and is never dereferenced by the expected reject path.
+        struct ScopedFakeMarlinLayout {
+            fastllm::Data &weight;
+            std::vector<void*> oldExtraCudaData;
+            std::vector<void*> oldExtraCudaHalfData;
+
+            explicit ScopedFakeMarlinLayout(fastllm::Data &weight)
+                : weight(weight),
+                  oldExtraCudaData(weight.extraCudaData),
+                  oldExtraCudaHalfData(weight.extraCudaHalfData) {
+                weight.extraCudaData.resize(4, nullptr);
+                weight.extraCudaHalfData.resize(2, nullptr);
+                weight.extraCudaData[3] = weight.cudaData;
+                weight.extraCudaHalfData[1] = weight.cudaData;
+            }
+
+            ~ScopedFakeMarlinLayout() {
+                weight.extraCudaData = std::move(oldExtraCudaData);
+                weight.extraCudaHalfData = std::move(oldExtraCudaHalfData);
+            }
+        } fakeLayout(state->weight);
+
+        if (!FastllmCudaHasFp8MarlinLayout(state->weight)) {
+            throw std::runtime_error("FP8 layout safety test metadata setup failed");
+        }
+        fastllm::Data cutlass = MakeCudaOutputLike(
+            state->input.dataType, state->batch, state->out);
+        ok = FastllmCudaCutlassLinearFP8E4M3Block128(
+            state->input, state->weight, state->bias, cutlass,
+            state->batch, state->in, state->out);
+        if (ok) {
+            ForceDeviceSync();
+            throw std::runtime_error(
+                "CUTLASS must reject FP8 weights already repacked for Marlin");
+        }
+    }
+
     static void CheckLinearFp8Block128SwigluCuda(const OpTestParams &params) {
         if (params.GetString("weight_layout") != "separate") {
             throw std::runtime_error("linear_fp8_block128 swiglu check targets separate FP8_E4M3 scale layout");
@@ -1798,6 +2012,12 @@ namespace {
         } else if (params.GetInt("check") == 3) {
             CheckLinearFp8MarlinCuda(params);
             return BenchmarkResult();
+        } else if (params.GetInt("check") == 4) {
+            CheckLinearFp8RawBatchOneCuda(params);
+            return BenchmarkResult();
+        } else if (params.GetInt("check") == 5) {
+            CheckLinearFp8LayoutSafetyCuda(params);
+            return BenchmarkResult();
         }
 
         auto state = std::make_shared<LinearFp8Block128BenchState>();
@@ -1871,7 +2091,9 @@ namespace {
                 params.Add("weight_layout", "packed", "packed or separate");
                 params.Add("has_bias", "1", "1 to include a float32 bias, 0 for no bias");
                 params.Add("kernel", "auto", "auto, legacy, or marlin_batch1");
-                params.Add("check", "0", "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail check");
+                params.Add("check", "0",
+                           "1 linear, 2 fused swiglu+quant, 3 Marlin bulk/tail, "
+                           "4 raw batch-one, 5 Marlin/CUTLASS layout safety");
                 params.Add("print", "0", "1 to print debug tensors when check=1");
                 return params;
             },
@@ -2502,13 +2724,16 @@ namespace {
 
     struct FusedRouterTopKBenchState {
         int batch = 1;
+        int topk = 8;
         bool withBias = true;
         bool needNorm = true;
+        bool sigmoid = false;
         float routeScale = 1.0f;
         std::string path;
         fastllm::Data logits, bias;
         fastllm::Data fusedIndex, fusedScore;
-        fastllm::Data referenceLogits, referenceProb, referenceIndex, referenceScore;
+        fastllm::Data referenceLogits, referenceProb, referenceBias;
+        fastllm::Data referenceIndex, referenceScore;
 
         static void PrepareOutput(fastllm::Data &data, fastllm::DataType type,
                                   const std::vector<int> &dims) {
@@ -2521,15 +2746,24 @@ namespace {
 
         void RunReference() {
             fastllm::ToDataType(logits, referenceLogits, fastllm::DataType::FLOAT32);
-            fastllm::Softmax(referenceLogits, referenceProb, -1);
-            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, 8,
-                                  needNorm, routeScale, withBias ? &bias : nullptr);
+            if (sigmoid) {
+                fastllm::Sigmoid(referenceLogits, referenceProb);
+            } else {
+                fastllm::Softmax(referenceLogits, referenceProb, -1);
+            }
+            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, topk,
+                                  needNorm, routeScale,
+                                  withBias ? &referenceBias : nullptr);
         }
 
         void RunFused() {
-            bool ok = FastllmCudaFusedSoftmaxSelectExpert(
-                logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
-                8, needNorm, routeScale);
+            bool ok = sigmoid
+                ? FastllmCudaFusedSigmoidSelectExpert(
+                    logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                    topk, needNorm, routeScale)
+                : FastllmCudaFusedSoftmaxSelectExpert(
+                    logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                    topk, needNorm, routeScale);
             if (!ok) {
                 throw std::runtime_error("fused router top-k launch failed");
             }
@@ -2553,19 +2787,19 @@ namespace {
                         break;
                     }
                 }
-                size_t tokenStart = (mismatch / 8) * 8;
-                os << " expected_top8=";
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                size_t tokenStart = (mismatch / topk) * topk;
+                os << " expected_topk=";
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",") << expectedIndex[i];
                 }
-                os << "] actual_top8=";
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                os << "] actual_topk=";
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",") << actualIndex[i];
                 }
                 os << "] expected_prob=";
                 std::vector<float> referenceProbValues = ToFloatVector(referenceProb);
-                size_t probStart = (mismatch / 8) * 256;
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                size_t probStart = (mismatch / topk) * 256;
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",")
                        << referenceProbValues[probStart + expectedIndex[i]];
                 }
@@ -2578,7 +2812,11 @@ namespace {
             for (size_t i = 0; i < expectedScore.size(); i++) {
                 maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
             }
-            if (maxAbsDiff > 0.0f) {
+            const bool selectedLogitFastPath =
+                !sigmoid && !withBias && needNorm;
+            const float scoreTolerance = sigmoid ? 1.0e-6f :
+                (selectedLogitFastPath ? 2.0e-6f : 0.0f);
+            if (maxAbsDiff > scoreTolerance) {
                 std::ostringstream os;
                 os << "fused router score mismatch: max_abs_diff=" << maxAbsDiff;
                 throw std::runtime_error(os.str());
@@ -2589,6 +2827,8 @@ namespace {
 #ifdef USE_CUDA
             FastllmCudaSetDevice(0);
             batch = params.GetInt("batch");
+            sigmoid = params.GetString("activation") == "sigmoid";
+            topk = sigmoid ? 10 : 8;
             withBias = params.GetInt("bias") != 0;
             needNorm = params.GetInt("norm") != 0;
             routeScale = params.GetFloat("route_scale");
@@ -2638,9 +2878,20 @@ namespace {
                 fp32Bias.CopyFrom(generated);
             }
             bias.CopyFrom(fp32Bias);
+            std::string biasType = params.GetString("bias_type");
+            if (biasType == "fp16") {
+                fastllm::ToDataType(bias, fastllm::DataType::FLOAT16);
+            } else if (biasType == "bf16") {
+                fastllm::ToDataType(bias, fastllm::DataType::BFLOAT16);
+            } else if (biasType != "fp32") {
+                throw std::runtime_error("bias_type must be fp16, bf16 or fp32");
+            }
+            referenceBias.CopyFrom(bias);
+            fastllm::ToDataType(referenceBias, fastllm::DataType::FLOAT32);
+            referenceBias.ToDevice(fastllm::DataDevice::CUDA);
             bias.ToDevice(fastllm::DataDevice::CUDA);
-            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, 8});
-            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, 8});
+            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, topk});
+            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, topk});
             Check();
 #else
             (void)params;
@@ -2691,11 +2942,13 @@ namespace {
     static OpCase MakeFusedRouterTopKCase() {
         return {
             "fused_router_topk",
-            "benchmark and validate fused softmax + SelectExpert top8/256",
+            "benchmark and validate fused softmax/sigmoid + SelectExpert for 256 experts",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
                 params.Add("input_type", "fp16", "fp16, bf16 or fp32");
+                params.Add("bias_type", "fp32", "fp16, bf16 or fp32");
+                params.Add("activation", "softmax", "softmax/top8 or sigmoid/top10");
                 params.Add("bias", "1", "whether correction bias is present");
                 params.Add("norm", "1", "normalize selected probabilities");
                 params.Add("route_scale", "1.0", "router score scale");
@@ -2734,7 +2987,7 @@ namespace {
             MakeGeluNewCase(),
             MakeSwigluCase(),
             MakeAttentionCase(),
-            MakeRmsNormFp16SpecializedCase(),
+            MakeRmsNormSpecializedCase(),
             MakeRecurrentFromConvFp16Case(),
             MakeLinearFp8Block128Case(),
             MakeMergeMoeFp8Case(),

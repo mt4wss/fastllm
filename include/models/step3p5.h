@@ -17,9 +17,13 @@
 #include <vector>
 
 namespace fastllm {
+    void Step3p5MakeGateUpWeight(Data &dst, const Data &gate, const Data &up,
+                                 const std::string &name);
+
     class Step3p5Model: public basellm {
     public:
         Step3p5Model();
+        ~Step3p5Model() override;
 
         virtual void InitParams();
 
@@ -187,7 +191,8 @@ namespace fastllm {
                 bool tensorParallel,
                 bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
-                Data &logits);
+                Data &logits,
+                bool *pagedCacheAllocationDiverged);
         Data &GetThreadTensorParallelBias(const std::string &name);
 
         std::unordered_map <std::string, Data> threadTpEmptyBiases;
@@ -195,6 +200,7 @@ namespace fastllm {
         std::mutex threadTpWeightPrepareLock;
         std::atomic<bool> singleGpuWeightsPrepared{false};
         std::atomic<bool> threadTpWeightsPrepared{false};
+        mutable std::atomic<int> gpuForwardTargetsFlashInferSupportCache{-1};
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
@@ -218,8 +224,33 @@ namespace fastllm {
         bool IsFullAttentionLayer(int layer) const;
         bool IsMoeLayer(int layer) const;
         bool UseLlama3Rope(int layer) const;
-        void PrepareMoeWeights();
-        void ApplyStepRotary(Data &input, const Data &positionIds, int layer);
+        virtual DataType GPUForwardComputeType() const;
+        virtual DataType GPUForwardCacheType(int layer, DataType requestedType,
+                                             DataType computeType) const;
+        bool GPUForwardTargetsSupportFlashInfer() const;
+        virtual bool GPUForwardUseYarnRope(int layer) const;
+        virtual void GPUForwardYarnRopeParams(int layer, float &factor,
+                                              float &attentionFactor,
+                                              float &correctionLow,
+                                              float &correctionHigh) const;
+        virtual int GPUForwardAttentionWindowLeft(int layer) const;
+        virtual int GPUForwardPagedCacheMaxPages(int layer) const;
+        virtual bool GPUForwardPreferNativeNccl(bool isPrefill,
+                                                uint64_t tensorBytes,
+                                                int tensorParallelSize) const;
+        virtual bool GPUForwardUseMambaSoftplusGate(int layer) const;
+        virtual Data *GPUForwardMambaSoftplusALog();
+        virtual Data *GPUForwardMambaSoftplusDtBias();
+        virtual void PrepareMoeWeights();
+        virtual void PrepareRuntimeWeights();
+        virtual void ApplyStepRotary(Data &input, const Data &positionIds, int layer);
+        virtual void ApplyAttentionGateActivation(Data &gate, int layer);
+        virtual bool UsePagedAttention(int layer) const;
+        virtual DataType NonPagedAttentionDataType(DataType inputType) const;
+        virtual bool UseHostMergeMoe() const;
+        virtual Data *PrepareAttentionMask(int layer, int pastLen, int qLen,
+                                           DataType attentionType, Data *inputMask,
+                                           Data &generatedMask);
         void PrepareStep3p7Vision();
         void ReleaseStep3p7VisionCuda();
         void BuildStep3p7VisionPositionData(int gridH, int gridW,

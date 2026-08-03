@@ -106,14 +106,20 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes);
+                return FastllmCudaMallocModelWeight(bytes, data.name);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
 
-        static void CheckCudaMallocForData(const Data &data, void *ptr, uint64_t bytes, const char *context) {
+        static bool CheckCudaMallocForData(const Data &data, void *&ptr,
+                                           uint64_t bytes, const char *context,
+                                           bool allowGraphCapturePlaceholder = false) {
             if (ptr != nullptr) {
-                return;
+                return true;
+            }
+            if (allowGraphCapturePlaceholder &&
+                FastllmCudaGraphGetAllocationFailurePlaceholder(&ptr)) {
+                return false;
             }
             std::string msg = "Error: cuda malloc failed in " + std::string(context) +
                               ". requestBytes = " + std::to_string(bytes) +
@@ -127,6 +133,7 @@ namespace fastllm {
             }
             msg += ".\n";
             ErrorInFastLLM(msg);
+            return false;
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
@@ -524,7 +531,9 @@ namespace fastllm {
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
+        {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
+        {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
         {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}},
         {DataType::DATA_AUTO_SOURCE, {"auto"}}
@@ -620,6 +629,12 @@ namespace fastllm {
             rows *= (columns / 128);
             columns = 128;
             return rows * (columns / 2 + 2 * sizeof(float));
+        } else if (type == DataType::INT4_GROUP32) {
+            AssertInFastLLM(columns % 32 == 0,
+                            "INT4_GROUP32 columns should be divisible by 32.\n");
+            // Four groups per block: [packed INT4] [BF16 scales], without
+            // padding in the final partial block. This is still 18 bytes/group.
+            return rows * (columns / 2 + columns / 32 * sizeof(uint16_t));
         } else if (type == DataType::AWQ_4BIT_128) {
             int groups = (columns - 1) / 128 + 1;
             size_t colBytes = columns / 2 + groups + groups * sizeof(float);
@@ -629,6 +644,9 @@ namespace fastllm {
             return rows * colBytes;
         } else if (type == DataType::INF_INT8_GROUP128) {
             size_t colBytes = (columns / 128) * (128 + sizeof(float) + sizeof(int)); // [int8 values] + scale + sum
+            return rows * colBytes;
+        } else if (type == DataType::INF_INT8_GROUP32) {
+            size_t colBytes = (columns / 32) * (32 + sizeof(float) + sizeof(int));
             return rows * colBytes;
         } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
             size_t colBytes = ggml_row_size((ggml_type)(type - DataType::DATA_GGUF_FORMAT), columns);
@@ -941,6 +959,7 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        this->tpSplitUnit = ori.tpSplitUnit;
         bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
                                      (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
         this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
@@ -1283,11 +1302,19 @@ namespace fastllm {
         data.weightType = weightType;
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
-             dataType == DataType::NVFP4_BLOCK_16_E8M0)) {
+             dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             dataType == DataType::INT4_GROUP32)) {
             this->blockK = blockK;
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
+            }
+            if (dataType == DataType::INT4_GROUP32) {
+                AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
+                                "INT4_GROUP32 requires a 2D weight with columns divisible by 32.\n");
+                this->perChannelAxis = 0;
+                this->groupCnt = 32;
+                this->group = this->dims[1] / 32;
             }
             data.UpdateUnitSize();
             data.Allocate(false);
@@ -1542,6 +1569,14 @@ namespace fastllm {
     }
 
     void Data::UpdateUnitSize() {
+        if (this->dataType == DataType::INT4_GROUP32 && this->dims.size() >= 2) {
+            const int columns = this->dims.back();
+            AssertInFastLLM(columns % 32 == 0,
+                            "INT4_GROUP32 columns should be divisible by 32.\n");
+            this->perChannelAxis = 0;
+            this->groupCnt = 32;
+            this->group = columns / 32;
+        }
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
@@ -1559,7 +1594,8 @@ namespace fastllm {
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
-                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
+                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::INT4_GROUP32) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
@@ -1586,7 +1622,8 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -1809,7 +1846,8 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             return GetDataBytes(this->dataType, rows, columns);
@@ -1826,7 +1864,8 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -1846,7 +1885,18 @@ namespace fastllm {
 #ifdef USE_CUDA
             this->cudaData = CudaMallocForData(*this, this->expansionBytes);
             this->cudaDataBorrowed = false;
-            CheckCudaMallocForData(*this, this->cudaData, this->expansionBytes, "Data::MallocSpace");
+            bool allocated = CheckCudaMallocForData(
+                *this, this->cudaData, this->expansionBytes,
+                "Data::MallocSpace", true);
+            if (!allocated) {
+                // The placeholder keeps host-side operator setup and TP/NCCL
+                // sequencing intact until every rank reaches the common graph
+                // abort barrier. Mark it borrowed and force the next eager
+                // Allocate() to replace it with real storage.
+                this->cudaDataBorrowed = true;
+                this->expansionSize = 0;
+                return;
+            }
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
@@ -2031,9 +2081,16 @@ namespace fastllm {
         // Retire routed-expert caches owned by this Data before its address can
         // be reused by a subsequently loaded model. These calls are no-ops for
         // weights that were never used as cache keys.
-        if (this->dataType == DataType::NVFP4 && this->isModelWeight &&
-            this->directMemory) {
-            MultiCudaReleaseMoeWeightCaches(this);
+        if (this->dataType == DataType::NVFP4 && this->isModelWeight) {
+            if (this->directMemory) {
+                MultiCudaReleaseMoeWeightCaches(this);
+                FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
+            }
+#ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
+            FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(this);
+#endif
+        } else if (this->dataType == DataType::INT4_GROUP &&
+                   this->isModelWeight) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif
@@ -2684,6 +2741,8 @@ namespace fastllm {
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             ret += k * this->group * 2 * sizeof(float);
             ret += this->GetBytes();
+        } else if (this->dataType == INT4_GROUP32) {
+            ret += this->GetBytes();
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             ret += sizeof(int);
             ret += this->GetBytes();
@@ -2741,6 +2800,8 @@ namespace fastllm {
                 writer.WriteFloat(this->mins[i]);
                 writer.WriteFloat(this->scales[i]);
             }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT4_GROUP32) {
             writer.WriteBytes(this->cpuData, this->GetBytes());
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             writer.WriteInt(this->ggmlType);
@@ -2818,6 +2879,13 @@ namespace fastllm {
                     // this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
                 }
                 reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT4_GROUP32) {
+                AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
+                                "CreateFromFastllmFormat: invalid INT4_GROUP32 shape.\n");
+                this->perChannelAxis = 0;
+                this->groupCnt = 32;
+                this->group = this->dims[1] / 32;
+                reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == DATA_GGUF_FORMAT) {
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == INT32 || this->dataType == INT32PARAM) {
@@ -2872,6 +2940,8 @@ namespace fastllm {
             return DataType::INF_INT8_PERCHANNEL;
         } else if (this->dataType == DataType::INT4_GROUP128) {
             return DataType::INF_INT8_GROUP128;
+        } else if (this->dataType == DataType::INT4_GROUP32) {
+            return DataType::INF_INT8_GROUP32;
         } else if (this->dataType == DataType::BFLOAT16 || 
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
@@ -3785,23 +3855,39 @@ namespace fastllm {
     }
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass) {
-        return curExecutor->CanRunOnFirstDevice("MergeMOE", {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}}, {}, {});
+        return curExecutor->CanRunOnFirstDevice(
+            "MergeMOE",
+            {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}},
+            {},
+            {{"biass___batch", (int)biass.size()}});
+    }
+
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &weights,
+                        std::vector <Data*> &biass) {
+        return curExecutor->CanRunOnFirstDevice(
+            "MergeMOE",
+            {{"input", (Data*)&input}, {"weights", (Data*)weights.data()},
+             {"biass", (Data*)biass.data()}},
+            {},
+            {{"weights___batch", (int)weights.size()},
+             {"biass___batch", (int)biass.size()}});
     }
 
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
-                bool expertParallel) {
+                bool expertParallel, float swigluLimit, bool deepSeekV4Mode) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}}, 
+        }, {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
                                          {"layer", layer}, {"gateType", (int)gateType},
-                                         {"expertParallel", expertParallel ? 1 : 0}});
+                                         {"expertParallel", expertParallel ? 1 : 0},
+                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
@@ -3821,11 +3907,13 @@ namespace fastllm {
         }, {{"softmaxScale", softmaxScale}}, {});
     }
 
-    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale) {
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged,
+                       Data &peCachePaged, Data &output,
+                       float softmaxScale, int kvLen) {
         curExecutor->Run("MergeMLAPaged", {
             {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCachePaged", (Data*)&kvCachePaged}, {"peCachePaged", (Data*)&peCachePaged},
             {"output", (Data*)&output}
-        }, {{"softmaxScale", softmaxScale}}, {});
+        }, {{"softmaxScale", softmaxScale}}, {{"kvLen", kvLen}});
     }
 
     // attentionType
@@ -3881,6 +3969,155 @@ namespace fastllm {
         curExecutor->Run("RMSNormPart", {
                 {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
         }, {{"eps", eps}}, {{"start", start}, {"end", end}});
+    }
+
+    void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
+                       Data &output) {
+        curExecutor->Run("KimiK3RMSNorm", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &output) {
+        curExecutor->Run("KimiK3CausalConv1D", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"output", &output}
+        }, {}, {{"kernelSize", kernelSize}});
+    }
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &cache, Data &output) {
+        curExecutor->Run("KimiK3CausalConv1D", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight},
+                {"cache", &cache}, {"output", &output}
+        }, {}, {{"kernelSize", kernelSize}});
+    }
+
+    void KimiK3UpdatePackedConvCache(
+            const Data &q, const Data &k, const Data &v,
+            int history, int tokens, Data &cache) {
+        curExecutor->Run("KimiK3UpdatePackedConvCache", {
+                {"q", (Data*)&q}, {"k", (Data*)&k},
+                {"v", (Data*)&v}, {"cache", &cache}
+        }, {}, {{"history", history}, {"tokens", tokens}});
+    }
+
+    void KimiK3L2Norm(const Data &input, float eps, Data &output) {
+        curExecutor->Run("KimiK3L2Norm", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3RecurrentKDA(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output, Data &decay, Data &beta) {
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate}, {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output},
+                {"decay", &decay}, {"beta", &beta}
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 1}});
+    }
+
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output) {
+        Data unusedDecay, unusedBeta;
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate},
+                {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &output},
+                {"decay", &unusedDecay}, {"beta", &unusedBeta}
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", -1}, {"stateOnly", 0}, {"outputAux", 0}});
+    }
+
+    void KimiK3RecurrentKDAUpdateState(
+            const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            int tokens, Data &state) {
+        Data unusedOutput, unusedDecay, unusedBeta;
+        curExecutor->Run("KimiK3RecurrentKDA", {
+                // Query contributes only to the emitted attention output; the
+                // recurrent state transition depends on K/V/gate/beta.  Reuse
+                // K for the shape-only q slot in state-only mode.
+                {"q", (Data*)&k}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"rawGate", (Data*)&rawGate},
+                {"rawBeta", (Data*)&rawBeta},
+                {"aLog", (Data*)&aLog}, {"dtBias", (Data*)&dtBias},
+                {"state", &state}, {"output", &unusedOutput},
+                {"decay", &unusedDecay}, {"beta", &unusedBeta}
+        }, {{"lowerBound", lowerBound}},
+        {{"tokenLimit", tokens}, {"stateOnly", 1}, {"outputAux", 0}});
+    }
+
+    void KimiK3RMSNormSigmoidGate(
+            const Data &input, const Data &gate, const Data &weight,
+            float eps, Data &output) {
+        curExecutor->Run("KimiK3RMSNormSigmoidGate", {
+                {"input", (Data*)&input}, {"gate", (Data*)&gate},
+                {"weight", (Data*)&weight}, {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3AttnRes(
+            const Data &prefixSum, const Data &blockResidual,
+            const Data &projection, const Data &norm, float eps,
+            Data &output) {
+        curExecutor->Run("KimiK3AttnRes", {
+                {"prefixSum", (Data*)&prefixSum},
+                {"blockResidual", (Data*)&blockResidual},
+                {"projection", (Data*)&projection},
+                {"norm", (Data*)&norm}, {"output", &output}
+        }, {{"eps", eps}}, {});
+    }
+
+    void KimiK3SiTUAndMul(
+            const Data &gate, const Data &up, float beta,
+            float linearBeta, Data &output) {
+        curExecutor->Run("KimiK3SiTUAndMul", {
+                {"gate", (Data*)&gate}, {"up", (Data*)&up},
+                {"output", &output}
+        }, {{"beta", beta}, {"linearBeta", linearBeta}}, {});
+    }
+
+    void KimiK3RoutedExperts(
+            const Data &input, const Data &index, const Data &score,
+            std::vector<Data*> &w1s, std::vector<Data*> &w2s,
+            std::vector<Data*> &w3s, float beta, float linearBeta,
+            Data &output) {
+        AssertInFastLLM(w1s.size() == w2s.size() && w1s.size() == w3s.size(),
+                        "KimiK3RoutedExperts weight table size mismatch.");
+        curExecutor->Run("KimiK3RoutedExperts", {
+                {"input", (Data*)&input}, {"index", (Data*)&index},
+                {"score", (Data*)&score}, {"w1s", (Data*)w1s.data()},
+                {"w2s", (Data*)w2s.data()}, {"w3s", (Data*)w3s.data()},
+                {"output", &output}
+        }, {{"beta", beta}, {"linearBeta", linearBeta}},
+           {{"experts___batch", (int)w1s.size()},
+            {"w1s___batch", (int)w1s.size()},
+            {"w2s___batch", (int)w2s.size()},
+            {"w3s___batch", (int)w3s.size()}});
+    }
+
+    void KimiK3CausalAttention(
+            const Data &q, const Data &k, const Data &v,
+            float scale, Data &output) {
+        curExecutor->Run("KimiK3CausalAttention", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"output", &output}
+        }, {{"scale", scale}}, {});
     }
 
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output) {
@@ -4321,6 +4558,33 @@ namespace fastllm {
         }, {{"ropeTheta", ropeTheta}, {"factor", factor},
             {"originalMaxPosition", originalMaxPosition},
             {"lowFreqFactor", lowFreqFactor}, {"highFreqFactor", highFreqFactor}},
+           {{"rotaryDim", rotaryDim}});
+    }
+
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor) {
+        AssertInFastLLM(rotaryDim > 0 && rotaryDim % 2 == 0,
+                        "YaRN rotary_dim must be a positive even number.");
+        AssertInFastLLM(ropeTheta > 0.0f && factor > 0.0f && originalMaxPosition > 0.0f &&
+                        betaFast > 0.0f && betaSlow > 0.0f,
+                        "YaRN theta, factor, original_max_position, beta_fast and beta_slow must be positive.");
+        auto findCorrectionDim = [&](float rotations) {
+            return (rotaryDim * std::log(originalMaxPosition /
+                    (rotations * 2.0f * (float)M_PI))) /
+                   (2.0f * std::log(ropeTheta));
+        };
+        float correctionLow = std::max(0.0f, std::floor(findCorrectionDim(betaFast)));
+        float correctionHigh = std::min((float)rotaryDim - 1.0f,
+                                        std::ceil(findCorrectionDim(betaSlow)));
+        if (correctionLow == correctionHigh) {
+            correctionHigh += 0.001f;
+        }
+        curExecutor->Run("YarnRopeEncoding", {
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"factor", factor},
+            {"attentionFactor", attentionFactor},
+            {"correctionLow", correctionLow}, {"correctionHigh", correctionHigh}},
            {{"rotaryDim", rotaryDim}});
     }
 
