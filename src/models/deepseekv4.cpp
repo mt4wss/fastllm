@@ -17,6 +17,7 @@
 #include "deepseekv4.h"
 
 #include "baseblock.h"
+#include "devices/cpu/computeutils.h"
 #include "executor.h"
 #include "utils.h"
 
@@ -58,6 +59,7 @@ namespace fastllm {
 
     namespace {
         static constexpr int DEEPSEEK_V4_DSPARK_LOG_INTERVAL = 64;
+        static constexpr int DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS = 7;
 
         // A DSpark target verification writes a speculative multi-token suffix
         // into the ordinary decode cache.  Keep the compressor raw rows alive
@@ -119,6 +121,32 @@ namespace fastllm {
                 return (char)std::tolower(c);
             });
             return !(s.empty() || s == "0" || s == "false" || s == "off" || s == "no");
+        }
+
+        static bool DeepSeekV4SparseMlaSm120Enabled() {
+            const char *v = std::getenv(
+                "FASTLLM_CUDA_DSV4_SPARSE_MLA_SM120");
+            return v == nullptr || EnvFlagEnabled(
+                "FASTLLM_CUDA_DSV4_SPARSE_MLA_SM120");
+        }
+
+        static bool DeepSeekV4PairedAllReduceEnabled() {
+#ifdef USE_CUDA
+            return FastllmCudaCustomAllReduceEnabled() &&
+                   !EnvFlagEnabled(
+                       "FASTLLM_DSV4_DISABLE_PAIRED_ALLREDUCE");
+#else
+            return false;
+#endif
+        }
+
+        static bool DeepSeekV4LinearColumnLocal(
+                Data &input, Data &weight, Data &bias, Data &output) {
+#ifdef USE_CUDA
+            return MultiCudaLinearColumnLocal(input, weight, bias, output);
+#else
+            return false;
+#endif
         }
 
         static void PrepareDeepSeekV4SamplingConfig(GenerationConfig &config) {
@@ -270,7 +298,55 @@ namespace fastllm {
             FastllmCudaCopyFromDeviceToHost(
                 destination.cpuData, replica->cudaData,
                 destination.GetBytes());
+            // Keep the source allocation as a non-owning mirror.  NUMA MoE
+            // uses the CPU copy for its local experts, while mixed inference
+            // can still recognize that this tensor genuinely came from CUDA
+            // and reuse the existing replica instead of staging it again.
+            destination.cudaData = replica->cudaData;
+            destination.cudaDataBorrowed = true;
+            destination.dataDeviceIds = {device};
             return true;
+        }
+
+        static bool DeepSeekV4NumasGpuPrefillEnabled() {
+            const char *value = std::getenv("FT_GPU_PREFILL");
+            if (value == nullptr) {
+                return true;
+            }
+            std::string normalized(value);
+            std::transform(
+                normalized.begin(), normalized.end(), normalized.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            return normalized != "0" && normalized != "false" &&
+                   normalized != "off";
+        }
+
+        // NUMA evaluates the official FP8 activation boundary on CPU, while
+        // its large-prefill path may stream selected experts to CUDA.  Publish
+        // the already quantized/dequantized BF16 bytes on that CUDA device;
+        // borrowing the original pre-quantization activation would make the
+        // CPU and GPU expert subsets observe different model inputs.
+        static bool AddDeepSeekV4QuantizedCudaReplica(
+            Data &activation, int device
+        ) {
+            if (device < 0 || activation.dataDevice != DataDevice::CPU ||
+                activation.cpuData == nullptr || activation.cudaData != nullptr) {
+                return false;
+            }
+            activation.ToDevice(
+                DataDevice::CUDA, std::vector<int>{device}, true);
+            if (activation.cudaData == nullptr ||
+                GetPointerDeviceId(activation.cudaData) != device) {
+                return false;
+            }
+            // Activation storage is not a model weight or KV cache, so the
+            // CPU allocation remains valid.  Switching the authoritative view
+            // back does not copy data and retains the owned CUDA allocation.
+            activation.ToDevice(
+                DataDevice::CPU, std::vector<int>{device}, false);
+            return activation.cpuData != nullptr &&
+                   activation.cudaData != nullptr &&
+                   !activation.cudaDataBorrowed;
         }
 
         static std::vector<int> GetReplicatedCudaDevices(const Data &data) {
@@ -604,7 +680,8 @@ namespace fastllm {
                    weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
                    weight.dataType == DataType::NVFP4 ||
                    weight.dataType == DataType::NVFP4_BLOCK_16 ||
-                   weight.dataType == DataType::NVFP4_BLOCK_16_E8M0;
+                   weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
         }
 
         static void ResetData(Data &data);
@@ -620,45 +697,12 @@ namespace fastllm {
                             "DeepSeek-V4 FP8 activation quantization expects BF16 rows divisible by 128.\n");
             if (input.dataDevice == DataDevice::CPU && input.cpuData != nullptr &&
                 std::getenv("FASTLLM_DSV4_DISABLE_CPU_ACT_QUANT_FAST") == nullptr) {
-                static const FP8E4M3ToFP32Manager fp8;
                 ResetData(output);
                 output = Data(DataType::BFLOAT16, input.dims);
                 output.Allocate(false);
-                const uint16_t *src = (const uint16_t*)input.cpuData;
-                uint16_t *dst = (uint16_t*)output.cpuData;
-                int dim = input.dims.back();
-                uint64_t count = input.Count(0);
-                for (uint64_t rowStart = 0; rowStart < count; rowStart += dim) {
-                    for (int blockStart = 0; blockStart < dim; blockStart += 128) {
-                        uint64_t start = rowStart + blockStart;
-                        uint64_t end = std::min<uint64_t>(start + 128, rowStart + dim);
-                        float amax = 1e-4f;
-                        for (uint64_t i = start; i < end; i++) {
-                            amax = std::max(amax, std::fabs(BFloat16ToFloat(src[i])));
-                        }
-                        float normalized = amax / 448.0f;
-                        uint32_t bits;
-                        memcpy(&bits, &normalized, sizeof(bits));
-                        int exponent = (int)((bits >> 23) & 0xFF) - 127 +
-                                       ((bits & ((1u << 23) - 1)) != 0);
-                        float scale = std::ldexp(1.0f, exponent);
-                        const uint16_t *lookupRow =
-                            GetFP8E4M3BFloat16QuantizeLookupRow(exponent);
-                        if (lookupRow != nullptr) {
-                            for (uint64_t i = start; i < end; i++) {
-                                dst[i] = lookupRow[src[i]];
-                            }
-                        } else {
-                            for (uint64_t i = start; i < end; i++) {
-                                float value = BFloat16ToFloat(src[i]);
-                                float q = std::max(
-                                    -448.0f, std::min(448.0f, value / scale));
-                                dst[i] = FloatToBFloat16(
-                                    fp8.quantizeDequantize(q) * scale);
-                            }
-                        }
-                    }
-                }
+                RunCpuDeepSeekV4ActivationQuantization(
+                    (const uint16_t*)input.cpuData,
+                    (uint16_t*)output.cpuData, input.Count(0));
                 return;
             }
             std::vector<float> values = ReadFloatData(input);
@@ -1349,27 +1393,20 @@ namespace fastllm {
 
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
             if (!DeepSeekV4PreferCuda() && input.dataDevice == DataDevice::CPU &&
+                input.cpuData != nullptr && input.dataType == DataType::BFLOAT16 &&
                 dtype == DataType::BFLOAT16 && !input.dims.empty()) {
                 const int channels = input.dims.back();
                 const int rows = (int)(input.Count(0) / channels);
-                std::vector<float> values = ReadFloatData(input);
                 auto weightValues = ReadWeightFloatDataCached(weight);
-                std::vector<float> normalized(values.size());
-                for (int row = 0; row < rows; row++) {
-                    const float *src = values.data() + (uint64_t)row * channels;
-                    float *dst = normalized.data() + (uint64_t)row * channels;
-                    double sumSquares = 0.0;
-                    for (int channel = 0; channel < channels; channel++) {
-                        sumSquares += (double)src[channel] * src[channel];
-                    }
-                    float scale = 1.0f / std::sqrt((float)(sumSquares / channels) + eps);
-                    for (int channel = 0; channel < channels; channel++) {
-                        dst[channel] = src[channel] * scale * (*weightValues)[channel];
-                    }
+                const uint16_t *source = (const uint16_t*)input.cpuData;
+                if (&input != &output) {
+                    ResetData(output);
+                    output = Data(DataType::BFLOAT16, input.dims);
+                    output.Allocate(false);
                 }
-                // torch.Tensor.to(torch.bfloat16) uses round-to-nearest-even;
-                // the generic CPU RMSNorm BF16 path truncates instead.
-                WriteFloatData(normalized, input.dims, output, DataType::BFLOAT16);
+                RunCpuDeepSeekV4RMSNormBFloat16(
+                    source, weightValues->data(),
+                    (uint16_t*)output.cpuData, rows, channels, eps);
                 return;
             }
             RMSNorm(input, weight, eps, output);
@@ -1810,6 +1847,32 @@ namespace fastllm {
             return GetDataSeqLen(raw, bsz, wideDim);
         }
 
+#ifdef USE_CUDA
+        static bool CompactCompressorRawInPlaceCuda(Data &kv, Data &score,
+                                                     int dropLen) {
+            if (kv.multiDeviceData || score.multiDeviceData) {
+                // Keep replicated caches on the established Split path until
+                // this optimization has a multi-device atomic-commit path.
+                return false;
+            }
+            if (kv.dataDevice != DataDevice::CUDA ||
+                score.dataDevice != DataDevice::CUDA ||
+                kv.cudaData == nullptr || score.cudaData == nullptr) {
+                return false;
+            }
+            int device = GetPointerDeviceId(kv.cudaData);
+            if (device < 0 || GetPointerDeviceId(score.cudaData) != device) {
+                return false;
+            }
+            int originalDevice = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            bool ok = FastllmCudaDeepSeekV4CompactCompressorRaw(
+                kv, score, dropLen);
+            FastllmCudaSetDevice(originalDevice);
+            return ok;
+        }
+#endif
+
         static void TrimCompressorRawCache(int bsz, int totalLen, int compressRatio, int wideDim,
                                            int compressedBlocks, Data &allKV,
                                            Data &allScore, int &rawTokenBase) {
@@ -1841,6 +1904,17 @@ namespace fastllm {
             }
 
             int dropLen = retainStart - rawTokenBase;
+#ifdef USE_CUDA
+            // The ratio-4 overlap tail is disjoint from the dropped prefix
+            // (normally rows [4, 8) -> [0, 4)).  Keep the 128-row reserve and
+            // copy both FP32 projections in one launch instead of allocating,
+            // splitting and replacing two tensors every fourth token.
+            if (dropLen >= newLen &&
+                CompactCompressorRawInPlaceCuda(allKV, allScore, dropLen)) {
+                rawTokenBase = retainStart;
+                return;
+            }
+#endif
             Data nextKV, nextScore;
             Split(allKV, 1, dropLen, oldLen, nextKV);
             Split(allScore, 1, dropLen, oldLen, nextScore);
@@ -2196,7 +2270,8 @@ namespace fastllm {
                                              int headDim, int ropeDim, float ropeBase,
                                              float ropeFactor, int betaFast, int betaSlow,
                                              int originalSeqLen, Data &output,
-                                             bool preferCudaOutput = false) {
+                                             bool preferCudaOutput = false,
+                                             bool indexer = false) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4BuildCompressedKV");
             if (compressRatio <= 0 || totalLen < compressRatio) {
                 return false;
@@ -2243,7 +2318,7 @@ namespace fastllm {
                                                rawTokenBase, rawLen, reusableBlocks, addBlocks,
                                                compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
                                                betaFast, betaSlow, originalSeqLen, overlap,
-                                               preferCudaOutput, output);
+                                               preferCudaOutput, output, indexer);
             return true;
         }
 
@@ -2563,11 +2638,13 @@ namespace fastllm {
                                              float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1,
                                              int prefixLen = 0,
                                              bool nonCausalBlock = false,
-                                             const Data *decodeMeta = nullptr) {
+                                             const Data *decodeMeta = nullptr,
+                                             const Data *compressedTopK = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseAttention");
 #ifdef USE_CUDA
             std::vector<int> tpDevices;
-            if (PrepareDeepSeekV4AttentionTp(q, kv, attnSink, output, tpDevices)) {
+            if (compressedTopK == nullptr &&
+                PrepareDeepSeekV4AttentionTp(q, kv, attnSink, output, tpDevices)) {
                 std::vector<char> ok(tpDevices.size(), 0);
                 RunDeepSeekV4MultiCuda(tpDevices, [&](int rank, int device) {
                     const Data *localMeta = decodeMeta == nullptr ? nullptr :
@@ -2587,7 +2664,8 @@ namespace fastllm {
                 }
                 return;
             }
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
+            if (compressedTopK == nullptr &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
                 DeepSeekV4PreferCuda() && q.dims.size() == 4 && kv.dims.size() == 3) {
                 Data qCuda, kvCuda;
                 const Data *qForCuda = &q;
@@ -2613,6 +2691,14 @@ namespace fastllm {
                 }
             }
 #endif
+            if (compressedTopK != nullptr) {
+                DeepSeekV4SparseAttention(
+                    q, kv, attnSink, windowSize, ropeDim, ropeBase,
+                    startPos, softmaxScale, output, compressRatio,
+                    originalSeqLen, ropeFactor, betaFast, betaSlow,
+                    prefixLen, compressedTopK);
+                return;
+            }
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(kv);
             auto sinkPtr = ReadWeightFloatDataCached(attnSink);
@@ -2775,14 +2861,17 @@ namespace fastllm {
                                                          int compressRatio = 0,
                                                          Data *packedWindowKV = nullptr,
                                                          Data *packedCompressedKV = nullptr,
+                                                         Data *sm120Scratch = nullptr,
                                                          const Data *compressedIndices = nullptr,
-                                                         const Data *compressedLengths = nullptr) {
+                                                         const Data *compressedLengths = nullptr,
+                                                         const Data *compressedTopK = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
             Data &windowMutable = (Data&)windowKV;
             Data &compressedMutable = (Data&)compressedKV;
             std::vector<int> tpDevices;
-            if (PrepareDeepSeekV4AttentionTp(q, windowMutable, attnSink, output, tpDevices)) {
+            if (compressedTopK == nullptr &&
+                PrepareDeepSeekV4AttentionTp(q, windowMutable, attnSink, output, tpDevices)) {
                 PrepareMultiCudaReplicatedData(compressedMutable, tpDevices, true);
                 if (compressedIndices != nullptr) {
                     PrepareMultiCudaReplicatedData(
@@ -2811,14 +2900,21 @@ namespace fastllm {
                         Data *localPackedCompressed =
                             packedCompressedKV == nullptr ? nullptr :
                             GetTensorCudaReplica(*packedCompressedKV, device);
-                        if (localPackedWindow != nullptr &&
-                            localPackedCompressed != nullptr) {
+                        Data *localScratch = sm120Scratch == nullptr ?
+                            nullptr : GetTensorCudaReplica(
+                                *sm120Scratch, device);
+                        if (DeepSeekV4SparseMlaSm120Enabled() &&
+                            localPackedWindow != nullptr &&
+                            localPackedCompressed != nullptr &&
+                            (sm120Scratch == nullptr ||
+                             localScratch != nullptr)) {
                             ok[rank] =
                                 FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                     *localQ, *localWindow, *localCompressed,
                                     localIndices, localLengths,
                                     *localPackedWindow, *localPackedCompressed,
-                                    *localSink, windowSize, compressRatio,
+                                    localScratch, *localSink, windowSize,
+                                    compressRatio,
                                     (const int32_t*)localMeta->cudaData, ropeDim,
                                     ropeBase, originalSeqLen, ropeFactor,
                                     betaFast, betaSlow, softmaxScale,
@@ -2849,7 +2945,7 @@ namespace fastllm {
                 }
                 return;
             }
-            if (q.dims[1] == 1) {
+            if (compressedTopK == nullptr && q.dims[1] == 1) {
                 Data qCuda, windowCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -2890,13 +2986,14 @@ namespace fastllm {
                 attnSink.ToDevice(DataDevice::CUDA, targetDeviceIds);
                 if (decodeMeta != nullptr && decodeMeta->dataDevice == DataDevice::CUDA &&
                     decodeMeta->cudaData != nullptr) {
-                    if (packedWindowKV != nullptr &&
+                    if (DeepSeekV4SparseMlaSm120Enabled() &&
+                        packedWindowKV != nullptr &&
                         packedCompressedKV != nullptr &&
                         FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                             *qForCuda, *windowForCuda, *compressedForCuda,
                             compressedIndices, compressedLengths,
-                            *packedWindowKV, *packedCompressedKV, attnSink,
-                            windowSize, compressRatio,
+                            *packedWindowKV, *packedCompressedKV,
+                            sm120Scratch, attnSink, windowSize, compressRatio,
                             (const int32_t*)decodeMeta->cudaData, ropeDim,
                             ropeBase, originalSeqLen, ropeFactor, betaFast,
                             betaSlow, softmaxScale, output)) {
@@ -2922,6 +3019,20 @@ namespace fastllm {
                 }
             }
 #endif
+            if (q.dataDevice == DataDevice::CPU &&
+                windowKV.dataDevice == DataDevice::CPU &&
+                attnSink.dataDevice == DataDevice::CPU &&
+                (compressedCount <= 0 ||
+                 compressedKV.dataDevice == DataDevice::CPU) &&
+                (compressedTopK == nullptr ||
+                 compressedTopK->dataDevice == DataDevice::CPU)) {
+                DeepSeekV4SparseAttentionDecodeCached(
+                    q, windowKV, compressedKV, attnSink, windowSize,
+                    startPos, compressedCount, ropeDim, ropeBase,
+                    softmaxScale, output, originalSeqLen, ropeFactor,
+                    betaFast, betaSlow, compressedTopK);
+                return;
+            }
             auto qv = ReadFloatData(q);
             auto windowValues = ReadFloatData(windowKV);
             std::vector<float> compressed;
@@ -2946,8 +3057,25 @@ namespace fastllm {
                     idxs.push_back(i);
                 }
             }
-            for (int i = 0; i < compressedCount; i++) {
-                idxs.push_back(windowSize + i);
+            if (compressedTopK != nullptr && compressedTopK->Count(0) > 0) {
+                AssertInFastLLM(
+                    compressedTopK->dataDevice == DataDevice::CPU &&
+                        compressedTopK->dataType == DataType::INT32 &&
+                        compressedTopK->cpuData != nullptr,
+                    "DeepSeekV4 sparse decode received invalid top-k indices.\n");
+                const int32_t *topKData =
+                    (const int32_t*)compressedTopK->cpuData;
+                int topKCount = (int)compressedTopK->Count(0);
+                for (int i = 0; i < topKCount; i++) {
+                    int idx = topKData[i];
+                    if (idx >= 0 && idx < compressedCount) {
+                        idxs.push_back(windowSize + idx);
+                    }
+                }
+            } else {
+                for (int i = 0; i < compressedCount; i++) {
+                    idxs.push_back(windowSize + i);
+                }
             }
 
             auto getKVRow = [&](int b, int idx) -> const float* {
@@ -3113,6 +3241,143 @@ namespace fastllm {
                                      compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
                                      betaFast, betaSlow, originalSeqLen, output);
             return true;
+        }
+
+        static bool HasCpuIndexerWeights(WeightMap &weight,
+                                         const std::string &attentionPrefix) {
+            static const char *suffixes[] = {
+                ".indexer.wq_b.weight",
+                ".indexer.weights_proj.weight",
+                ".indexer.compressor.wkv.weight",
+                ".indexer.compressor.wgate.weight",
+                ".indexer.compressor.ape",
+                ".indexer.compressor.norm.weight"
+            };
+            for (const char *suffix : suffixes) {
+                if (weight.weight.find(attentionPrefix + suffix) ==
+                    weight.weight.end()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static bool PrepareCpuIndexerTopK(
+                WeightMap &weight, const std::string &attentionPrefix,
+                Data &attnInput, Data &qNorm, int bsz, int seqlen,
+                int startPos, int compressRatio, int indexHeads,
+                int indexHeadDim, int indexTopK, int ropeDim,
+                float ropeBase, int originalSeqLen, float ropeFactor,
+                int betaFast, int betaSlow,
+                DeepSeekV4DecodeLayerCache *decodeCache,
+                Data &topKIndices) {
+            if (compressRatio != 4 || DeepSeekV4PreferCuda() ||
+                EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_INDEXER") ||
+                !HasCpuIndexerWeights(weight, attentionPrefix)) {
+                return false;
+            }
+            ScopedExecutorProfiler executorProfile("DeepSeekV4Indexer");
+            const std::string indexerPrefix = attentionPrefix + ".indexer";
+            const std::string compressorPrefix = indexerPrefix + ".compressor";
+
+            Data indexQ, indexWeights;
+            weight[indexerPrefix + ".wq_b.weight"].tpLinearType =
+                TP_LINEAR_ROW;
+            DeepSeekV4Linear(
+                qNorm, weight[indexerPrefix + ".wq_b.weight"], Data(),
+                indexQ);
+            indexQ.Reshape({bsz, seqlen, indexHeads, indexHeadDim});
+            weight[indexerPrefix + ".weights_proj.weight"].tpLinearType =
+                TP_LINEAR_ROW;
+            DeepSeekV4Linear(
+                attnInput, weight[indexerPrefix + ".weights_proj.weight"],
+                Data(), indexWeights);
+            indexWeights.Reshape({bsz, seqlen, indexHeads});
+            if (indexWeights.dataType != DataType::BFLOAT16) {
+                ToDataType(indexWeights, DataType::BFLOAT16);
+            }
+
+            Data rawKV, rawScore;
+            ComputeCompressorRaw(
+                weight, compressorPrefix, attnInput, rawKV, rawScore);
+            const int wideDim = 2 * indexHeadDim;
+            const int totalLen = startPos + seqlen;
+            const int targetBlocks = totalLen / compressRatio;
+            if (targetBlocks <= 0) {
+                return false;
+            }
+
+            Data transientCompressed;
+            Data *compressed = &transientCompressed;
+            if (decodeCache == nullptr) {
+                if (startPos != 0 || !BuildCompressedKVFromRaw(
+                        weight, compressorPrefix, rawKV, rawScore, bsz, 0,
+                        totalLen, compressRatio, indexHeadDim, ropeDim,
+                        ropeBase, ropeFactor, betaFast, betaSlow,
+                        originalSeqLen, transientCompressed, false, true)) {
+                    return false;
+                }
+            } else {
+                if (startPos == 0) {
+                    decodeCache->indexerCompressorWideDim = wideDim;
+                    decodeCache->indexerCompressorRawTokenBase = 0;
+                    decodeCache->indexerCompressedBlocks = 0;
+                    ResetData(decodeCache->indexerCompressedKV);
+                    CopyTensorData(decodeCache->indexerCompressorKVRaw, rawKV);
+                    CopyTensorData(decodeCache->indexerCompressorScoreRaw,
+                                   rawScore);
+                    EnsureCompressorRawCapacity(
+                        decodeCache->indexerCompressorKVRaw, seqlen);
+                    EnsureCompressorRawCapacity(
+                        decodeCache->indexerCompressorScoreRaw, seqlen);
+                } else {
+                    AppendCompressorRaw(
+                        rawKV, rawScore, bsz, seqlen, wideDim,
+                        decodeCache->indexerCompressorKVRaw,
+                        decodeCache->indexerCompressorScoreRaw);
+                }
+
+                bool targetReady =
+                    decodeCache->indexerCompressedBlocks == targetBlocks &&
+                    HasCompressedKVData(decodeCache->indexerCompressedKV);
+                if (!targetReady) {
+                    bool built = BuildCompressedKVFromRaw(
+                        weight, compressorPrefix,
+                        decodeCache->indexerCompressorKVRaw,
+                        decodeCache->indexerCompressorScoreRaw, bsz,
+                        decodeCache->indexerCompressorRawTokenBase, totalLen,
+                        compressRatio, indexHeadDim, ropeDim, ropeBase,
+                        ropeFactor, betaFast, betaSlow, originalSeqLen,
+                        decodeCache->indexerCompressedKV, false, true);
+                    if (!built) {
+                        return false;
+                    }
+                    decodeCache->indexerCompressedBlocks =
+                        GetReusableCompressedBlocks(
+                            decodeCache->indexerCompressedKV, bsz,
+                            targetBlocks, indexHeadDim);
+                }
+                TrimCompressorRawCache(
+                    bsz, totalLen, compressRatio, wideDim,
+                    decodeCache->indexerCompressedBlocks,
+                    decodeCache->indexerCompressorKVRaw,
+                    decodeCache->indexerCompressorScoreRaw,
+                    decodeCache->indexerCompressorRawTokenBase);
+                compressed = &decodeCache->indexerCompressedKV;
+            }
+
+            if (!HasCompressedKVData(*compressed) ||
+                compressed->dataDevice != DataDevice::CPU) {
+                return false;
+            }
+            DeepSeekV4IndexerTopK(
+                indexQ, indexWeights, *compressed, indexTopK,
+                compressRatio, ropeDim, ropeBase, startPos,
+                originalSeqLen, ropeFactor, betaFast, betaSlow,
+                topKIndices);
+            return topKIndices.dataType == DataType::INT32 &&
+                topKIndices.dims.size() == 3 &&
+                topKIndices.Count(0) > 0;
         }
 
         static void ConcatSeqReference(const Data &a, const Data &b, Data &output) {
@@ -3522,6 +3787,16 @@ namespace fastllm {
     }
 
 #ifdef USE_CUDA
+    bool DeepSeekV4CopyCudaTensorToCpuForTest(
+            const Data &source, Data &destination) {
+        return CopyDeepSeekV4CudaTensorToCpu(source, destination);
+    }
+
+    bool DeepSeekV4AddQuantizedCudaReplicaForTest(
+            Data &activation, int device) {
+        return AddDeepSeekV4QuantizedCudaReplica(activation, device);
+    }
+
     int DeepSeekV4BuildWindowKVPrefixForTest(
             const Data &windowKV, int bsz, int headDim, int startPos,
             int windowSize, Data &output) {
@@ -3541,6 +3816,15 @@ namespace fastllm {
             int wideDim, Data &allKV, Data &allScore) {
         AppendCompressorRaw(
             kv, score, bsz, seqlen, wideDim, allKV, allScore);
+    }
+
+    void DeepSeekV4TrimCompressorRawForTest(
+            int bsz, int totalLen, int compressRatio, int wideDim,
+            int compressedBlocks, Data &allKV, Data &allScore,
+            int &rawTokenBase) {
+        TrimCompressorRawCache(
+            bsz, totalLen, compressRatio, wideDim, compressedBlocks,
+            allKV, allScore, rawTokenBase);
     }
 #endif
 
@@ -3572,6 +3856,10 @@ namespace fastllm {
         Data indexerCompressorScore;
         Data indexerQ;
         Data indexerWeights;
+        // SM120 sparse-MLA decode uses one temporary buffer per TP rank. Keep
+        // it request-owned so CUDA Graph capture never depends on incidental
+        // allocator-pool sizes left behind by prefill or KV-cache dtype.
+        Data sparseMlaScratch;
         Data attnOut4;
         Data woAOut;
         Data attnOut;
@@ -4533,6 +4821,9 @@ namespace fastllm {
             return false;
         }
         auto preparePackedSm120Caches = [&](int compressedCapacity) {
+            if (!DeepSeekV4SparseMlaSm120Enabled()) {
+                return true;
+            }
             bool useSm120 = true;
             int originalDevice = FastllmCudaGetDevice();
             for (int device : devices) {
@@ -5261,12 +5552,12 @@ namespace fastllm {
             dst.compressedTokenBase = src.compressedTokenBase;
             dst.rawTailStartPos = src.rawTailStartPos;
             dst.compressorRawTokenBase = src.compressorRawTokenBase;
-            CopyTensorData(dst.compressorTailKV, src.compressorTailKV);
-            CopyTensorData(dst.compressorTailScore, src.compressorTailScore);
             dst.indexerCompressorWideDim = src.indexerCompressorWideDim;
             dst.indexerCompressorRawTokenBase =
                 src.indexerCompressorRawTokenBase;
             dst.indexerCompressedBlocks = src.indexerCompressedBlocks;
+            CopyTensorData(dst.compressorTailKV, src.compressorTailKV);
+            CopyTensorData(dst.compressorTailScore, src.compressorTailScore);
 
             ResetData(dst.compressedKV);
             if (src.compressedBlocks > 0 && src.compressedKV.dims.size() >= 2) {
@@ -5446,7 +5737,7 @@ namespace fastllm {
                 dst.indexerCompressedKV.ToDevice(DataDevice::CPU);
                 dst.indexerCompressedKV.lockInCPU = true;
             }
-            if (storeFullRaw) {
+            if (storeFullRaw || src.compressRatio == 4) {
                 CopyHistoryTensorData(dst.indexerCompressorKVRaw,
                                       src.indexerCompressorKVRaw);
                 CopyHistoryTensorData(dst.indexerCompressorScoreRaw,
@@ -6299,6 +6590,10 @@ namespace fastllm {
         };
     }
 
+    DeepSeekV4Model::~DeepSeekV4Model() {
+        ShutdownRuntime();
+    }
+
     std::map<std::string,
              std::vector<std::pair<std::string, DataType> > >
     DeepSeekV4Model::GetTensorMap(
@@ -6334,7 +6629,14 @@ namespace fastllm {
             };
             for (auto &source : mapped) {
                 for (auto &destination : source.second) {
-                    if (isDsparkAux(destination.first)) {
+                    if (destination.first ==
+                        "mtp.2.confidence_head.proj.weight") {
+                        // The reference implementation promotes this tiny
+                        // BF16 checkpoint tensor to FP32 because its sigmoid
+                        // output is a scheduling probability, not an
+                        // activation passed into the next model layer.
+                        destination.second = DataType::FLOAT32;
+                    } else if (isDsparkAux(destination.first)) {
                         destination.second = DataType::BFLOAT16;
                     }
                 }
@@ -6594,6 +6896,20 @@ namespace fastllm {
                 dsparkMarkovRank > 0 &&
                 dsparkTargetLayerIds == std::vector<int>({40, 41, 42}),
                 "The embedded DeepSeek-V4 DSpark configuration is unsupported.");
+            const char *confidenceThresholdEnv = std::getenv(
+                "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD");
+            if (confidenceThresholdEnv != nullptr &&
+                confidenceThresholdEnv[0] != '\0') {
+                char *end = nullptr;
+                dsparkConfidenceThreshold = std::strtof(
+                    confidenceThresholdEnv, &end);
+                AssertInFastLLM(
+                    end != confidenceThresholdEnv && *end == '\0' &&
+                    std::isfinite(dsparkConfidenceThreshold) &&
+                    dsparkConfidenceThreshold >= 0.0f &&
+                    dsparkConfidenceThreshold <= 1.0f,
+                    "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1].");
+            }
         }
 
         // -------- Hyper-Connections --------
@@ -7196,7 +7512,8 @@ namespace fastllm {
                                     const std::vector<Data> &activeMainWindowKV,
                                     const Data *decodeMeta,
                                     Data &baseLogits,
-                                    DeepSeekV4DecodeWorkspace *persistentWorkspace)
+                                    DeepSeekV4DecodeWorkspace *persistentWorkspace,
+                                    Data *confidenceHidden)
                                     -> bool {
             draftBackboneFailure.clear();
 #ifdef USE_CUDA
@@ -7411,6 +7728,8 @@ namespace fastllm {
 
             std::vector<Data*> moeWeights = dsparkWeights[stage];
             bool hasSharedExpertOut = false;
+            const bool routedTensorParallel =
+                this->UseTensorParallelRoutedExperts();
             auto sharedGateupIt = weight.weight.find(
                 pre + ".ffn.shared_experts.gateup.weight");
             auto sharedDownIt = weight.weight.find(
@@ -7426,16 +7745,19 @@ namespace fastllm {
                 LinearSwigluBlock(
                     &ffnInput, &sharedGateupIt->second, GetEmptyData(),
                     &sharedW3, &sharedW1);
+                // Draft stages stay byte-for-byte on the established two
+                // collectives.  The paired reduction targets M=8 validation,
+                // where the saved collective is material; changing draft
+                // launch timing can otherwise perturb proposal acceptance even
+                // when the arithmetic itself is identical.
                 DeepSeekV4Linear(
                     sharedW1, sharedDownIt->second, *GetEmptyData(),
                     sharedExpertOut);
-                moeWeights[0] = moeWeights[1] = nullptr;
                 hasSharedExpertOut = true;
+                moeWeights[0] = moeWeights[1] = nullptr;
             }
 
             this->ApplyMoeDeviceMapForLayer(layerId);
-            const bool routedTensorParallel =
-                this->UseTensorParallelRoutedExperts();
             const bool routedExpertParallel =
                 !routedTensorParallel && DeepSeekV4DeviceSpecUsesType(
                     this->SelectMoeDeviceForLayer(layerId), "multicuda");
@@ -7480,6 +7802,12 @@ namespace fastllm {
                 weight["mtp.2.hc_head_scale"],
                 weight["mtp.2.hc_head_base"], hc_mult, hc_eps,
                 rms_norm_eps, headInput);
+            if (confidenceHidden != nullptr) {
+                // Confidence is trained on the unnormalized HcHead output.
+                // The eager LM-head path normalizes headInput in place, so
+                // preserve this small [1, block, hidden] tensor first.
+                Copy(headInput, *confidenceHidden);
+            }
             Data *normalizedHead = &headInput;
 #ifdef USE_CUDA
             if (decodeMeta != nullptr &&
@@ -7788,7 +8116,14 @@ namespace fastllm {
                 !baseLogits.tpGlobalDims.empty() &&
                 markovW2.dims[0] == baseLogits.tpGlobalDims.back() &&
                 markovRanges == baseLogits.tpRanges &&
-                FastllmCudaCustomAllReduceInit(markovDevices);
+                FastllmCudaPeerAccessInit(markovDevices);
+            if (graphState.capturing && !peerLinearReady) {
+                // The eager fallback records one event per GPU and makes the
+                // root wait for all of them.  Those waits are valid outside a
+                // graph, but would merge independently captured GPU streams.
+                draftBackboneFailure = "markov-peer-access";
+                return nullptr;
+            }
             draftWorkspace.dsparkMarkovProposalPeerReady = false;
             for (int device : markovDevices) {
                 auto weightIt = markovW2.multiDeviceDatas.find(device);
@@ -8091,6 +8426,8 @@ namespace fastllm {
 #endif
 
         Data eagerBaseLogits;
+        Data eagerConfidenceHidden;
+        Data *confidenceHiddenPtr = nullptr;
         Data *baseLogitsPtr = &eagerBaseLogits;
         Data *gpuProposalIdsPtr = nullptr;
 #ifdef USE_CUDA
@@ -8128,6 +8465,28 @@ namespace fastllm {
                 // stream capture; lazy communicator creation invalidates every
                 // participating CUDA graph stream.
                 prepared = FastllmInitNccl(draftGraphDevices);
+            }
+            bool graphSafePeerReady = true;
+            if (prepared) {
+                // DSpark's Markov proposal uses GPU-side peer signals to keep
+                // each device in its own capture sequence.  This only needs
+                // CUDA P2P; it must not depend on custom all-reduce being
+                // enabled because NCCL remains a valid reduction backend.
+                graphSafePeerReady =
+                    FastllmCudaDeepSeekV4DsparkMarkovPeerAvailable() &&
+                    FastllmCudaPeerAccessInit(draftGraphDevices);
+                prepared = graphSafePeerReady;
+            }
+            if (!graphSafePeerReady) {
+                static std::once_flag peerFallbackLog;
+                std::call_once(peerFallbackLog, []() {
+                    std::fprintf(
+                        stderr,
+                        "[Fastllm] DeepSeek-V4 DSpark draft CUDA graph "
+                        "disabled: graph-safe full-mesh CUDA peer access is "
+                        "unavailable; using eager NCCL fallback.\n");
+                    std::fflush(stderr);
+                });
             }
             if (prepared && draftGraphState->devices.empty()) {
                 draftGraphState->PrepareDevices(
@@ -8401,7 +8760,7 @@ namespace fastllm {
                         context.mainWindowKV,
                         &draftGraphState->decodeMeta,
                         draftGraphState->baseLogits,
-                        draftGraphState->workspace.get());
+                        draftGraphState->workspace.get(), nullptr);
                     if (ready && draftGraphState->workspace) {
                         gpuProposalIdsPtr = runGpuMarkovProposal(
                             draftGraphState->inputIds,
@@ -8648,10 +9007,20 @@ namespace fastllm {
             AssertInFastLLM(
                 runDraftBackbone(
                     inputIds, context.mainWindowKV, nullptr,
-                    eagerBaseLogits, nullptr),
+                    eagerBaseLogits, nullptr, &eagerConfidenceHidden),
                 "DSpark draft backbone failed.");
             baseLogitsPtr = &eagerBaseLogits;
+            confidenceHiddenPtr = &eagerConfidenceHidden;
         }
+#ifdef USE_CUDA
+        if (draftBackboneReady && draftGraphState != nullptr &&
+            draftGraphState->workspace != nullptr) {
+            // The persistent path keeps HcHead output separate from its
+            // normalized LM-head workspace, so no additional graph node or
+            // copy is needed.
+            confidenceHiddenPtr = &draftGraphState->workspace->headInput;
+        }
+#endif
         Data &baseLogits = *baseLogitsPtr;
 
         DeepSeekV4DsparkProposal proposal;
@@ -8700,6 +9069,69 @@ namespace fastllm {
             }
             return tokens;
         };
+        auto populateProposalConfidence = [&] (
+                DeepSeekV4DsparkProposal &activeProposal) {
+            if (dsparkConfidenceThreshold <= 0.0f ||
+                confidenceHiddenPtr == nullptr) {
+                activeProposal.confidence.assign(dsparkTokens, 1.0f);
+                return;
+            }
+            AssertInFastLLM(
+                (int)activeProposal.tokens.size() == dsparkTokens &&
+                confidenceHiddenPtr->dims ==
+                    std::vector<int>({1, dsparkTokens, embed_dim}),
+                "DSpark confidence input has an invalid shape.");
+
+            // The confidence head consumes the unnormalized draft backbone
+            // state and the Markov embedding of [anchor, draft[:-1]].  Batch
+            // all positions into one tiny projection so scheduling adds a
+            // single device-to-host synchronization per proposal.
+            std::vector<float> previousTokens(dsparkTokens);
+            previousTokens[0] = (float)anchorToken;
+            for (int step = 1; step < dsparkTokens; ++step) {
+                previousTokens[step] =
+                    (float)activeProposal.tokens[step - 1];
+            }
+            Data previousIds(
+                DataType::FLOAT32, {1, dsparkTokens}, previousTokens);
+            Data markovEmbeddings;
+            EmbeddingDirect(
+                previousIds,
+                weight["mtp.2.markov_head.markov_w1.weight"],
+                markovEmbeddings);
+            Data confidenceHidden, confidenceMarkov;
+            Copy(*confidenceHiddenPtr, confidenceHidden);
+            Copy(markovEmbeddings, confidenceMarkov);
+            ToDataType(confidenceHidden, DataType::FLOAT32);
+            ToDataType(confidenceMarkov, DataType::FLOAT32);
+            Data confidenceFeatures;
+            Cat(confidenceHidden, confidenceMarkov, -1,
+                confidenceFeatures);
+            Data confidenceLogits;
+            Linear(
+                confidenceFeatures,
+                weight["mtp.2.confidence_head.proj.weight"],
+                Data(), confidenceLogits);
+            ToDataType(confidenceLogits, DataType::FLOAT32);
+            confidenceLogits.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(
+                confidenceLogits.dims ==
+                    std::vector<int>({1, dsparkTokens, 1}),
+                "DSpark confidence head output has an invalid shape.");
+            activeProposal.confidence.resize(dsparkTokens);
+            const float *confidenceData =
+                (const float*)confidenceLogits.cpuData;
+            for (int step = 0; step < dsparkTokens; ++step) {
+                const float value = confidenceData[step];
+                const float probability = value >= 0.0f ?
+                    1.0f / (1.0f + std::exp(-value)) :
+                    std::exp(value) / (1.0f + std::exp(value));
+                AssertInFastLLM(
+                    std::isfinite(probability),
+                    "DSpark confidence head produced NaN or Inf.");
+                activeProposal.confidence[step] = probability;
+            }
+        };
 #ifdef USE_CUDA
         if (gpuProposalIdsPtr != nullptr &&
             gpuProposalIdsPtr->dataDevice == DataDevice::CUDA &&
@@ -8724,6 +9156,10 @@ namespace fastllm {
                     proposal.gpuReadySignal = &readySignal;
                     proposal.gpuReadySeen = &readySeen;
                     proposal.gpuDeferred = true;
+                    // Deferred graph proposals remain fixed-shape.  Their
+                    // confidence tensor is intentionally not synchronized to
+                    // the host, preserving the existing overlapped pipeline.
+                    proposal.confidence.assign(dsparkTokens, 1.0f);
                     return proposal;
                 }
             }
@@ -8749,11 +9185,177 @@ namespace fastllm {
                     proposal.tokens.data(), gpuProposalIdsPtr->cudaData,
                     proposal.tokens.size() * sizeof(int));
             }
+            populateProposalConfidence(proposal);
             return proposal;
         }
 #endif
         proposal.tokens = runHostMarkov(baseLogits);
+        populateProposalConfidence(proposal);
         return proposal;
+    }
+
+    int DeepSeekV4Model::SelectDsparkVerifyDrafts(
+            const DeepSeekV4DsparkProposal &proposal,
+            const DeepSeekV4DsparkContext &context,
+            bool *preferTargetOnly) const {
+        (void)context;
+        if (preferTargetOnly != nullptr) {
+            *preferTargetOnly = false;
+        }
+        if (proposal.gpuDeferred) {
+            return dsparkTokens;
+        }
+        AssertInFastLLM(
+            (int)proposal.tokens.size() == dsparkTokens &&
+            (int)proposal.confidence.size() == dsparkTokens,
+            "DSpark proposal has an invalid confidence length.");
+        // Threshold zero is the exact fixed-block compatibility mode used by
+        // acceptance and performance regressions.
+        if (dsparkConfidenceThreshold <= 0.0f) {
+            return dsparkTokens;
+        }
+
+        // Start with a few complete blocks.  Besides warming the verifier,
+        // these rounds provide an unbiased prefix-survival sample for online
+        // confidence calibration.  A 32-token application warmup normally
+        // covers these five full-block probes plus two target-only probes.
+        if (dsparkValidationCount.load(std::memory_order_relaxed) <
+                DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS - 2) {
+            return dsparkTokens;
+        }
+
+        std::vector<double> calibratedSurvival(dsparkTokens, 0.0);
+        double rawSurvival = 1.0;
+        double previousSurvival = 1.0;
+        int confidenceLimit = dsparkTokens;
+        auto clampProbability = [](double value) {
+            return std::max(1.0e-4, std::min(1.0 - 1.0e-4, value));
+        };
+        for (int position = 0; position < dsparkTokens; ++position) {
+            rawSurvival *= clampProbability(
+                proposal.confidence[position]);
+            double survival = rawSurvival;
+            const long long attempts =
+                dsparkDraftPositionAttempts[position].load(
+                    std::memory_order_relaxed);
+            const long long accepted =
+                dsparkDraftPositionAccepts[position].load(
+                    std::memory_order_relaxed);
+            const long long predictedScaled =
+                dsparkDraftPositionPredictedSurvival[position].load(
+                    std::memory_order_relaxed);
+            if (attempts > 0 && predictedScaled > 0) {
+                const double observed = clampProbability(
+                    (double)accepted / (double)attempts);
+                const double averagePrediction = clampProbability(
+                    (double)predictedScaled /
+                    (1000000.0 * (double)attempts));
+                const double ratioCalibrated = clampProbability(
+                    rawSurvival * observed / averagePrediction);
+                // Retain proposal-specific confidence while smoothly moving
+                // toward the observed curve.  Four virtual raw samples keep
+                // the short warmup from overreacting.
+                const double weight = (double)attempts /
+                    ((double)attempts + 4.0);
+                survival = rawSurvival +
+                    weight * (ratioCalibrated - rawSurvival);
+            }
+            survival = std::min(previousSurvival,
+                                clampProbability(survival));
+            calibratedSurvival[position] = survival;
+            const double conditional = survival / previousSurvival;
+            if (conditional < dsparkConfidenceThreshold &&
+                confidenceLimit == dsparkTokens) {
+                confidenceLimit = position;
+            }
+            previousSurvival = survival;
+        }
+
+        const long long draftUs = dsparkDraftBestUs.load(
+            std::memory_order_relaxed);
+        struct VerifyPoint {
+            int drafts;
+            double milliseconds;
+        };
+        std::vector<VerifyPoint> observed;
+        observed.reserve(2);
+        for (int drafts = dsparkTokens;
+             drafts >= 0 && observed.size() < 2; --drafts) {
+            const long long verifyUs = dsparkVerifyBestUs[drafts].load(
+                std::memory_order_relaxed);
+            // Kernel compilation and graph preparation can make the first
+            // encounter tens of seconds long.  Such startup work is not the
+            // steady SPS curve the scheduler is meant to optimize.
+            if (verifyUs > 0 && verifyUs < 5000000) {
+                observed.push_back(
+                    {drafts, (double)verifyUs / 1000.0});
+            }
+        }
+        // Before the warmup request has populated a throughput curve, use the
+        // calibrated confidence limit.  Once prefix timing is available, fit
+        // the NUMA verifier's marginal token cost without cold compilation.
+        if (draftUs <= 0 || observed.empty()) {
+            return confidenceLimit;
+        }
+
+        const double draftMs = (double)draftUs / 1000.0;
+        double slopeMs = 0.0;
+        double interceptMs = 0.0;
+        bool linearCurve = observed.size() >= 2 &&
+            observed[0].drafts != observed[1].drafts;
+        if (linearCurve) {
+            slopeMs =
+                (observed[0].milliseconds - observed[1].milliseconds) /
+                (double)(observed[0].drafts - observed[1].drafts);
+            interceptMs = observed[0].milliseconds -
+                slopeMs * observed[0].drafts;
+            linearCurve = slopeMs > 0.0 && interceptMs > 0.0 &&
+                std::isfinite(slopeMs) && std::isfinite(interceptMs);
+        }
+        auto estimateTargetMs = [&](int drafts) {
+            if (linearCurve) {
+                return interceptMs + slopeMs * drafts;
+            }
+            // One observed point is enough for a conservative bootstrap.  A
+            // NUMA MoE verifier is dominated by expert-weight traffic and is
+            // close to linear; 0.7 is the measured marginal/full-decode ratio
+            // and is refined as soon as the second point arrives.
+            const VerifyPoint &reference = observed[0];
+            return reference.milliseconds *
+                (1.0 + 0.7 * drafts) /
+                (1.0 + 0.7 * reference.drafts);
+        };
+
+        double expectedCommit = 1.0;
+        double bestThroughput = 0.0;
+        int bestDrafts = 0;
+        for (int drafts = 1; drafts <= confidenceLimit; ++drafts) {
+            expectedCommit += calibratedSurvival[drafts - 1];
+            const double throughput = expectedCommit /
+                (draftMs + estimateTargetMs(drafts));
+            if (throughput > bestThroughput) {
+                bestThroughput = throughput;
+                bestDrafts = drafts;
+            }
+        }
+
+        // Compare speculation with an actual one-row verifier observation
+        // when available.  Otherwise the fitted curve's intercept is the best
+        // target-only estimate.  The recommendation is returned separately
+        // because the current round has already paid its draft cost.
+        const long long targetOnlyUs = dsparkVerifyBestUs[0].load(
+            std::memory_order_relaxed);
+        const double targetOnlyMs = targetOnlyUs > 0 ?
+            (double)targetOnlyUs / 1000.0 : estimateTargetMs(0);
+        const double targetOnlyThroughput = 1.0 / targetOnlyMs;
+        if (preferTargetOnly != nullptr) {
+            *preferTargetOnly = bestDrafts == 0 ||
+                bestThroughput <= targetOnlyThroughput;
+        }
+        // The draft cost is already sunk in the current probe, so verify the
+        // best immediate prefix even when future rounds should run target
+        // only.  This avoids turning a probe into draft + one-token decode.
+        return bestDrafts;
     }
 
     int DeepSeekV4Model::ForwardDspark(
@@ -8881,6 +9483,21 @@ namespace fastllm {
 
         const int anchorToken = tokenIds[0];
         const int oldTokens = context.committedTokens;
+        using DsparkProfileClock = std::chrono::steady_clock;
+        const int dsparkTargetOnlyCooldownRounds = std::max(
+            0, std::min(
+                1024,
+                EnvInt(
+                    "FASTLLM_DSV4_DSPARK_TARGET_ONLY_COOLDOWN_ROUNDS",
+                    0)));
+        const auto dsparkRoundBegin = DsparkProfileClock::now();
+        double dsparkDraftSubmitMs = 0.0;
+        double dsparkTargetSubmitMs = 0.0;
+        double dsparkTargetFinishMs = 0.0;
+        auto dsparkElapsedMs = [](const auto &begin, const auto &end) {
+            return std::chrono::duration<double, std::milli>(
+                end - begin).count();
+        };
         if (!dsparkLogPrinted.exchange(true)) {
             std::printf(
                 "[DeepSeek-V4 DSpark] enabled: layers=%d, "
@@ -8926,7 +9543,23 @@ namespace fastllm {
         }
 #endif
         DeepSeekV4DsparkProposal proposal;
-        bool usedPrefetchedProposal =
+        // Reserve the last two calibration rounds for genuine no-draft target
+        // decode.  The first compiles the one-row verifier shape; the second
+        // supplies its steady baseline for the throughput comparison.
+        const long long completedCalibrations =
+            dsparkValidationCount.load(std::memory_order_relaxed);
+        const bool calibrationTargetOnlyRound =
+            dsparkConfidenceThreshold > 0.0f &&
+            completedCalibrations >=
+                DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS - 2 &&
+            completedCalibrations <
+                DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS;
+        const bool targetOnlyRound = calibrationTargetOnlyRound ||
+            context.targetOnlyRoundsRemaining > 0;
+        if (targetOnlyRound && !calibrationTargetOnlyRound) {
+            context.targetOnlyRoundsRemaining--;
+        }
+        bool usedPrefetchedProposal = !targetOnlyRound &&
             context.prefetchedProposalReady &&
             context.prefetchedAnchorToken == anchorToken &&
             context.prefetchedCommittedTokens == oldTokens;
@@ -8937,7 +9570,11 @@ namespace fastllm {
         context.prefetchedAnchorToken = -1;
         context.prefetchedCommittedTokens = -1;
         context.prefetchedProposalReady = false;
-        if (!usedPrefetchedProposal) {
+        if (targetOnlyRound) {
+            proposal.tokens.assign(dsparkTokens, dsparkNoiseTokenId);
+            proposal.confidence.assign(dsparkTokens, 0.0f);
+        } else if (!usedPrefetchedProposal) {
+            const auto draftBegin = DsparkProfileClock::now();
             proposal = RunDsparkDraft(
                 anchorToken, context, false,
 #ifdef USE_CUDA
@@ -8946,21 +9583,42 @@ namespace fastllm {
                 false
 #endif
             );
+            dsparkDraftSubmitMs = dsparkElapsedMs(
+                draftBegin, DsparkProfileClock::now());
         }
         AssertInFastLLM(
             proposal.gpuDeferred ||
-                (int)proposal.tokens.size() == dsparkTokens,
+                ((int)proposal.tokens.size() == dsparkTokens &&
+                 (int)proposal.confidence.size() == dsparkTokens),
             "DSpark proposal has an invalid length.");
+        bool preferTargetOnly = false;
+        const int verifyDrafts = targetOnlyRound ? 0 :
+            SelectDsparkVerifyDrafts(
+                proposal, context, &preferTargetOnly);
+        // Confidence and acceptance can change at every token as a response
+        // moves between prose and code, so retry on the next token by default.
+        // An explicitly configured cooldown performs target-only rounds
+        // without paying for draft construction.
+        if (!targetOnlyRound && preferTargetOnly) {
+            context.targetOnlyRoundsRemaining =
+                dsparkTargetOnlyCooldownRounds;
+        } else if (!targetOnlyRound && verifyDrafts > 0) {
+            context.targetOnlyRoundsRemaining = 0;
+        }
+        const int verifyTokens = verifyDrafts + 1;
+        AssertInFastLLM(
+            verifyDrafts >= 0 && verifyDrafts <= dsparkTokens,
+            "DSpark confidence scheduler returned an invalid prefix.");
 
         std::vector<int> verifyIds;
-        verifyIds.reserve(dsparkTokens + 1);
+        verifyIds.reserve(verifyTokens);
         verifyIds.push_back(anchorToken);
         if (proposal.gpuDeferred) {
             verifyIds.insert(
-                verifyIds.end(), dsparkTokens, dsparkNoiseTokenId);
+                verifyIds.end(), verifyDrafts, dsparkNoiseTokenId);
         } else {
             verifyIds.insert(verifyIds.end(), proposal.tokens.begin(),
-                             proposal.tokens.end());
+                             proposal.tokens.begin() + verifyDrafts);
         }
         DeepSeekV4DsparkTargetCapture &capture = context.targetCapture;
         ScopedDeepSeekV4DsparkVerification verificationScope;
@@ -8972,13 +9630,17 @@ namespace fastllm {
         targetGpuInput.readySeen = proposal.gpuReadySeen;
         targetGpuInput.anchorToken = anchorToken;
         targetGpuInput.startPos = oldTokens;
-        targetGpuInput.proposalCount = dsparkTokens;
+        targetGpuInput.proposalCount = verifyDrafts;
         DeepSeekV4DsparkTargetGpuInputScope gpuInputScope(
             proposal.gpuDeferred ? &targetGpuInput : nullptr);
 #endif
+        const auto targetSubmitBegin = DsparkProfileClock::now();
         RunDsparkTarget(
             verifyIds, oldTokens, pastKeyValues, generationConfig,
             lastTokens, nullptr, &capture);
+        dsparkTargetSubmitMs = dsparkElapsedMs(
+            targetSubmitBegin, DsparkProfileClock::now());
+        const auto targetFinishBegin = DsparkProfileClock::now();
         std::vector<int> targetRows;
         DeepSeekV4DsparkProposal pipelinedProposal;
         bool gpuPostprocess = false;
@@ -8986,9 +9648,10 @@ namespace fastllm {
         int gpuCommitTokens = -1;
         int gpuNextToken = -1;
 #ifdef USE_CUDA
-        const int verifyRows = dsparkTokens + 1;
+        const int verifyRows = verifyTokens;
         bool gpuPostprocessEligible =
-            proposal.gpuDeferred && capture.samplingReady &&
+            verifyDrafts == dsparkTokens && proposal.gpuDeferred &&
+            capture.samplingReady &&
             capture.contextReady && capture.contextRows == verifyRows &&
             FastllmCudaDeepSeekV4DsparkMarkovPeerAvailable() &&
             proposal.gpuTokens != nullptr &&
@@ -9278,21 +9941,43 @@ namespace fastllm {
 #else
         targetRows = SampleDsparkTargetRows(capture.headInput, &context);
 #endif
+        dsparkTargetFinishMs = dsparkElapsedMs(
+            targetFinishBegin, DsparkProfileClock::now());
+        auto updateBestLatency = [](
+                std::atomic<long long> &slot, double milliseconds) {
+            const long long candidate = (long long)std::llround(
+                milliseconds * 1000.0);
+            if (candidate <= 0) {
+                return;
+            }
+            long long current = slot.load(std::memory_order_relaxed);
+            while ((current == 0 || candidate < current) &&
+                   !slot.compare_exchange_weak(
+                       current, candidate,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
+            }
+        };
+        if (!usedPrefetchedProposal && dsparkDraftSubmitMs > 0.0) {
+            updateBestLatency(dsparkDraftBestUs, dsparkDraftSubmitMs);
+        }
+        updateBestLatency(
+            dsparkVerifyBestUs[verifyDrafts],
+            dsparkTargetSubmitMs + dsparkTargetFinishMs);
         AssertInFastLLM(
             (int)proposal.tokens.size() == dsparkTokens,
             "DSpark proposal materialization returned an invalid length.");
         AssertInFastLLM(
-            (int)targetRows.size() == dsparkTokens + 1,
+            (int)targetRows.size() == verifyTokens,
             "DSpark target verification returned an invalid row count.");
 
         int accepted = 0;
-        while (accepted < dsparkTokens &&
+        while (accepted < verifyDrafts &&
                proposal.tokens[accepted] == targetRows[accepted]) {
             accepted++;
         }
         const int nextToken = targetRows[accepted];
         const int commitTokens = accepted + 1;
-        const int verifyTokens = dsparkTokens + 1;
         if (gpuPostprocess) {
             AssertInFastLLM(
                 accepted == gpuAccepted &&
@@ -9344,27 +10029,71 @@ namespace fastllm {
         context.historyTokens.insert(
             context.historyTokens.end(), verifyIds.begin(),
             verifyIds.begin() + commitTokens);
-        context.proposedTokens += dsparkTokens;
+        context.proposedTokens += verifyDrafts;
         context.acceptedTokens += accepted;
         context.verifyRounds++;
         const int trackedDrafts = std::min(
-            dsparkTokens,
+            verifyDrafts,
             (int)dsparkDraftPositionAttempts.size());
+        double predictedSurvival = 1.0;
         for (int position = 0; position < trackedDrafts; ++position) {
+            predictedSurvival *= std::max(
+                1.0e-4, std::min(
+                    1.0 - 1.0e-4,
+                    (double)proposal.confidence[position]));
             dsparkDraftPositionAttempts[position].fetch_add(
                 1, std::memory_order_relaxed);
+            dsparkDraftPositionPredictedSurvival[position].fetch_add(
+                (long long)std::llround(predictedSurvival * 1000000.0),
+                std::memory_order_relaxed);
             if (accepted > position) {
                 dsparkDraftPositionAccepts[position].fetch_add(
                     1, std::memory_order_relaxed);
             }
         }
         dsparkProposedTokenCount.fetch_add(
-            dsparkTokens, std::memory_order_relaxed);
+            verifyDrafts, std::memory_order_relaxed);
         dsparkAcceptedTokenCount.fetch_add(
             accepted, std::memory_order_relaxed);
         const long long validations =
             dsparkValidationCount.fetch_add(
                 1, std::memory_order_relaxed) + 1;
+        if (!targetOnlyRound && verifyDrafts > 0 &&
+            !preferTargetOnly &&
+            validations > DEEPSEEK_V4_DSPARK_CALIBRATION_ROUNDS) {
+            context.speculativeWindowMs += dsparkElapsedMs(
+                dsparkRoundBegin, DsparkProfileClock::now());
+            context.speculativeWindowCommitted += commitTokens;
+            context.speculativeWindowRounds++;
+            if (context.speculativeWindowRounds >= 2) {
+                const long long targetOnlyUs =
+                    dsparkVerifyBestUs[0].load(
+                        std::memory_order_relaxed);
+                if (targetOnlyUs > 0 &&
+                    context.speculativeWindowMs > 0.0) {
+                    const double speculativeTokensPerSecond =
+                        (double)context.speculativeWindowCommitted * 1000.0 /
+                        context.speculativeWindowMs;
+                    const double targetOnlyTokensPerSecond =
+                        1000000.0 / (double)targetOnlyUs;
+                    // Require a small positive margin so measurement noise
+                    // cannot keep a non-improving speculative path enabled.
+                    if (speculativeTokensPerSecond <=
+                            targetOnlyTokensPerSecond * 1.01) {
+                        context.targetOnlyRoundsRemaining =
+                            dsparkTargetOnlyCooldownRounds;
+                    }
+                }
+                context.speculativeWindowMs = 0.0;
+                context.speculativeWindowCommitted = 0;
+                context.speculativeWindowRounds = 0;
+            }
+        } else if (targetOnlyRound || preferTargetOnly ||
+                   verifyDrafts == 0) {
+            context.speculativeWindowMs = 0.0;
+            context.speculativeWindowCommitted = 0;
+            context.speculativeWindowRounds = 0;
+        }
         if (validations % DEEPSEEK_V4_DSPARK_LOG_INTERVAL == 0) {
             const long long proposed = dsparkProposedTokenCount.load(
                 std::memory_order_relaxed);
@@ -9379,7 +10108,10 @@ namespace fastllm {
                 "accept_rate=%.2f%%, avg_accepted=%.2f/%d, "
                 "pos_accept_rate=[",
                 validations, acceptRate, averageAccepted, dsparkTokens);
-            for (int position = 0; position < trackedDrafts; ++position) {
+            const int loggedDrafts = std::min(
+                dsparkTokens,
+                (int)dsparkDraftPositionAttempts.size());
+            for (int position = 0; position < loggedDrafts; ++position) {
                 const long long attempts =
                     dsparkDraftPositionAttempts[position].load(
                         std::memory_order_relaxed);
@@ -9618,15 +10350,16 @@ namespace fastllm {
         DeepSeekV4DecodeWorkspace localDecodeWorkspace;
         DeepSeekV4DecodeWorkspace *decodeWorkspace = &localDecodeWorkspace;
         const Data *modelInputIds = &inputIds;
+        bool graphSafeDecode = false;
+        bool dsparkGraphVerification = false;
 #ifdef USE_CUDA
         std::shared_ptr<DeepSeekV4CudaGraphState> graphState;
         std::unique_lock<std::mutex> graphLock;
-        bool graphSafeDecode = false;
         bool graphGpuReplayInputs = false;
         const DeepSeekV4DsparkTargetGpuInput *targetGpuInput =
             deepSeekV4DsparkTargetGpuInput;
         std::vector<int> graphDevices;
-        const bool dsparkGraphVerification =
+        dsparkGraphVerification =
             DeepSeekV4DsparkVerificationActive() && dsparkEnabled &&
             dsparkTokens > 0 && seqlen == dsparkTokens + 1;
         // Size and specialize a request-local decode graph for the complete
@@ -9902,6 +10635,31 @@ namespace fastllm {
                         pipelineDevices.push_back(layerDevice);
                     }
                     previousLayerDevice = layerDevice;
+                }
+                if (graphPrepared) {
+                    const size_t sparseMlaScratchBytes =
+                        DeepSeekV4SparseMlaSm120Enabled() ?
+                        FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
+                            seqlen, num_attention_heads, 4) : 0;
+                    if (sparseMlaScratchBytes >
+                            (size_t)std::numeric_limits<int>::max()) {
+                        graphPrepared = false;
+                    } else if (sparseMlaScratchBytes > 0) {
+                        const std::vector<int> scratchDims = {
+                            (int)sparseMlaScratchBytes};
+                        const bool scratchStale =
+                            !DeepSeekV4GraphTensorMatches(
+                                graphState->workspace->sparseMlaScratch,
+                                DataType::INT8, scratchDims, graphDevices);
+                        if (scratchStale &&
+                            !DeepSeekV4AllocateGraphTensor(
+                                graphState->workspace->sparseMlaScratch,
+                                DataType::INT8, scratchDims, graphDevices,
+                                false)) {
+                            graphPrepared = false;
+                        }
+                        addressChanged |= scratchStale;
+                    }
                 }
                 if (graphPrepared) {
                     // A full-TP capture owns one graph per GPU.  Every graph
@@ -10716,6 +11474,23 @@ namespace fastllm {
                 }
                 sparsePrefillKVPtr = &sparsePrefillKV;
             }
+            Data compressedTopK;
+            const Data *compressedTopKPtr = nullptr;
+            if (compressRatio == 4 && !DeepSeekV4PreferCuda() &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_INDEXER") &&
+                startPos + seqlen >= compressRatio) {
+                bool indexerReady = PrepareCpuIndexerTopK(
+                    weight, pre + ".attn", attnInput, qNorm, bsz, seqlen,
+                    startPos, compressRatio, index_n_heads, index_head_dim,
+                    index_topk, qk_rope_head_dim, layerRopeBase,
+                    layerOriginalSeqLen, rope_factor,
+                    rope_scaling_beta_fast, rope_scaling_beta_slow,
+                    decodeCache, compressedTopK);
+                AssertInFastLLM(
+                    indexerReady,
+                    "DeepSeekV4Model: CPU CSA indexer failed to produce top-k indices.\n");
+                compressedTopKPtr = &compressedTopK;
+            }
             if (decodeCache != nullptr && startPos > 0 &&
                 (seqlen == 1 || graphSafeDecode)) {
                 SparseAttentionDecodeCachedReference(q, decodeCache->windowKV,
@@ -10732,8 +11507,16 @@ namespace fastllm {
                                                         &decodeCache->cudaGraphPackedWindowKV : nullptr,
                                                      graphSafeDecode ?
                                                         &decodeCache->cudaGraphPackedCompressedKV : nullptr,
+                                                     graphSafeDecode ?
+                                                        &decodeWorkspace->sparseMlaScratch : nullptr,
                                                      activeIndexerIndices,
-                                                     activeIndexerLengths
+                                                     activeIndexerLengths,
+                                                     compressedTopKPtr
+#else
+                                                     , nullptr, 0,
+                                                     nullptr, nullptr,
+                                                     nullptr, nullptr,
+                                                     compressedTopKPtr
 #endif
                                                      );
             } else {
@@ -10742,7 +11525,8 @@ namespace fastllm {
                                          1.0f / std::sqrt((float)head_dim_full), attnOut4,
                                          compressRatio, layerOriginalSeqLen, rope_factor,
                                          rope_scaling_beta_fast, rope_scaling_beta_slow,
-                                         sparsePrefillPrefixLen);
+                                         sparsePrefillPrefixLen,
+                                         false, nullptr, compressedTopKPtr);
             }
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             DeepSeekV4Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
@@ -10817,6 +11601,7 @@ namespace fastllm {
                 // MOE
                 bool hasSharedExpertOut = false;
                 bool fuseSharedExpert = false;
+                Data *pairedReduceInput = nullptr;
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
@@ -10889,12 +11674,11 @@ namespace fastllm {
                             (ffnInput.dims[0] == 1 ||
                              dsparkGraphVerification);
                         // The expert-parallel path owns a complete routed
-                        // expert partial per rank, so it can safely fold the
-                        // local shared-expert shard into the same reduction.
-                        // Tensor parallel reduces a different intermediate
-                        // partitioning contract; folding the shared partial
-                        // there changes target logits.  Keep TP on the
-                        // separately validated shared-expert reduction.
+                        // expert partial per rank, so it can safely pre-add the
+                        // local shared shard.  Tensor parallel must instead
+                        // preserve two independent rank-ordered FP32 sums and
+                        // their BF16 rounding boundaries; the M=8 verifier uses
+                        // the paired collective below for that exact contract.
                         fuseSharedExpert =
                             routedExpertParallel && fuseSharedExpertRows;
                         if (!fuseSharedExpert) {
@@ -10907,10 +11691,24 @@ namespace fastllm {
                             }
                             LinearSwigluBlock(sharedInputPtr, &sharedGateupIt->second, GetEmptyData(),
                                               &sharedW3, &sharedW1);
-                            DeepSeekV4Linear(sharedW1, sharedDownIt->second, *GetEmptyData(),
-                                             sharedExpertOut);
+                            const bool pairSharedReduction =
+                                routedTensorParallel &&
+                                dsparkGraphVerification &&
+                                DeepSeekV4PairedAllReduceEnabled();
+                            if (pairSharedReduction) {
+                                AssertInFastLLM(
+                                    DeepSeekV4LinearColumnLocal(
+                                        sharedW1, sharedDownIt->second,
+                                        *GetEmptyData(), sharedExpertOut),
+                                    "DeepSeek-V4 failed to defer the shared-expert TP reduction.\n");
+                                pairedReduceInput = &sharedExpertOut;
+                            } else {
+                                DeepSeekV4Linear(
+                                    sharedW1, sharedDownIt->second,
+                                    *GetEmptyData(), sharedExpertOut);
+                                hasSharedExpertOut = true;
+                            }
                             moeWeights[0] = moeWeights[1] = nullptr;
-                            hasSharedExpertOut = true;
                         }
                     }
                 }
@@ -10922,7 +11720,21 @@ namespace fastllm {
                     if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
                         moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                         IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+#ifdef USE_CUDA
+                        int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
+#endif
                         DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
+#ifdef USE_CUDA
+                        if (moeInputCudaDevice >= 0 &&
+                            moeQuantizedInput.dims.size() > 0 &&
+                            moeQuantizedInput.dims[0] >= 32 &&
+                            DeepSeekV4NumasGpuPrefillEnabled()) {
+                            AssertInFastLLM(
+                                AddDeepSeekV4QuantizedCudaReplica(
+                                    moeQuantizedInput, moeInputCudaDevice),
+                                "DeepSeek-V4 failed to stage its quantized NUMA MoE activation on CUDA.");
+                        }
+#endif
                         moeInput = &moeQuantizedInput;
                     }
                     MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
@@ -10932,7 +11744,8 @@ namespace fastllm {
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
                                   MoeGateSwiglu, routedExpertParallel,
-                                  swiglu_limit, true);
+                                  swiglu_limit, true,
+                                  pairedReduceInput);
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
 #ifdef USE_CUDA
@@ -12058,12 +12871,25 @@ namespace fastllm {
 
             std::vector<Data> qParts(batch);
             std::vector<Data*> qPartPtrs(batch);
+            bool cpuIndexerLayer =
+                compressRatio == 4 && !DeepSeekV4PreferCuda() &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_INDEXER");
+            std::vector<Data> indexerAttnInputParts(batch);
+            std::vector<Data> indexerQNormParts(batch);
+            std::vector<Data> compressedTopKParts(batch);
+            std::vector<Data*> compressedTopKPtrs(batch, nullptr);
             for (int b = 0; b < batch; b++) {
                 Split(q, 0, b, b + 1, qParts[b]);
                 ScaleQRatory(qParts[b], rms_norm_eps, qk_rope_head_dim, layerRopeBase,
                              startPositions[b], layerOriginalSeqLen, rope_factor,
                              rope_scaling_beta_fast, rope_scaling_beta_slow);
                 qPartPtrs[b] = &qParts[b];
+                if (cpuIndexerLayer) {
+                    Split(attnInput, 0, b, b + 1,
+                          indexerAttnInputParts[b]);
+                    Split(qNorm, 0, b, b + 1,
+                          indexerQNormParts[b]);
+                }
             }
 
             DeepSeekV4Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, true);
@@ -12174,12 +13000,28 @@ namespace fastllm {
                 compressedKVPtrs[b] = (Data*)decodeCompressedKVForAttention;
                 layerCompressedCounts[b] = decodeCompressedCount;
                 cachedDecode[b] = startPos > 0 ? 1 : 0;
+                if (cpuIndexerLayer &&
+                    startPos + seqlen >= compressRatio) {
+                    bool indexerReady = PrepareCpuIndexerTopK(
+                        weight, pre + ".attn", indexerAttnInputParts[b],
+                        indexerQNormParts[b], 1, seqlen, startPos,
+                        compressRatio, index_n_heads, index_head_dim,
+                        index_topk, qk_rope_head_dim, layerRopeBase,
+                        layerOriginalSeqLen, rope_factor,
+                        rope_scaling_beta_fast, rope_scaling_beta_slow,
+                        &decodeCache, compressedTopKParts[b]);
+                    AssertInFastLLM(
+                        indexerReady,
+                        "DeepSeekV4Model::ForwardBatch: CPU CSA indexer failed.\n");
+                    compressedTopKPtrs[b] = &compressedTopKParts[b];
+                }
             }
 
             Data attnOut4, woAOut, attnOut;
             bool allCachedDecode = batch > 1;
             for (int b = 0; b < batch; b++) {
-                allCachedDecode = allCachedDecode && cachedDecode[b] != 0;
+                allCachedDecode = allCachedDecode && cachedDecode[b] != 0 &&
+                    compressedTopKPtrs[b] == nullptr;
             }
             bool usedBatchSparseDecode = false;
             if (allCachedDecode) {
@@ -12205,13 +13047,19 @@ namespace fastllm {
                                                              1.0f / std::sqrt((float)head_dim_full),
                                                              attnOutParts[b], layerOriginalSeqLen,
                                                              rope_factor, rope_scaling_beta_fast,
-                                                             rope_scaling_beta_slow);
+                                                             rope_scaling_beta_slow,
+                                                             nullptr, 0,
+                                                             nullptr, nullptr,
+                                                             nullptr, nullptr,
+                                                             compressedTopKPtrs[b]);
                     } else {
                         SparseAttentionReference(qParts[b], kvParts[b], weight[pre + ".attn.attn_sink"], window_size,
                                                  qk_rope_head_dim, layerRopeBase, startPositions[b],
                                                  1.0f / std::sqrt((float)head_dim_full), attnOutParts[b],
                                                  compressRatio, layerOriginalSeqLen, rope_factor,
-                                                 rope_scaling_beta_fast, rope_scaling_beta_slow);
+                                                 rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                                 0, false, nullptr,
+                                                 compressedTopKPtrs[b]);
                     }
                     attnOutPtrs[b] = &attnOutParts[b];
                 }
@@ -12311,7 +13159,21 @@ namespace fastllm {
                     if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
                         moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                         IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
+#ifdef USE_CUDA
+                        int moeInputCudaDevice = GetTensorCudaDevice(*moeInput);
+#endif
                         DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
+#ifdef USE_CUDA
+                        if (moeInputCudaDevice >= 0 &&
+                            moeQuantizedInput.dims.size() > 0 &&
+                            moeQuantizedInput.dims[0] >= 32 &&
+                            DeepSeekV4NumasGpuPrefillEnabled()) {
+                            AssertInFastLLM(
+                                AddDeepSeekV4QuantizedCudaReplica(
+                                    moeQuantizedInput, moeInputCudaDevice),
+                                "DeepSeek-V4 failed to stage its quantized batched NUMA MoE activation on CUDA.");
+                        }
+#endif
                         moeInput = &moeQuantizedInput;
                     }
                     MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,

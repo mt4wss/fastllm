@@ -3,6 +3,22 @@
 
 #include "fastllm.h"
 
+// Device-resident request/chunk offsets shared by the ragged GDN frontend,
+// recurrent kernels, and output layout conversion.  The backing storage is
+// owned by a per-worker CUDA cache; callers must only retain this view until
+// the next call made by the same worker with different sequence lengths.
+struct FastllmCudaRaggedGdnMetadataView {
+    const int *tokenOffsets = nullptr;
+    const int *chunkOffsets = nullptr;
+    const int *chunkTokenBases = nullptr;
+    const int *chunkValidTokens = nullptr;
+    int batch = 0;
+    int totalTokens = 0;
+    int totalChunks = 0;
+    int maxChunks = 0;
+    int maxPaddedTokens = 0;
+};
+
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -176,6 +192,12 @@ bool FastllmCudaGetThreadError();
 void FastllmCudaClearGraphError();
 bool FastllmCudaGetGraphError();
 
+// Best-effort warmup reserve allocation.  Returns the number of blocks added
+// and preserves every existing pool entry when a later block cannot be
+// allocated.  Capacity failures are reported to the caller without poisoning
+// the CUDA thread/graph error flags, so the caller can restore its state and
+// fail startup cleanly.
+int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
 #ifdef __CUDACC__
@@ -183,6 +205,12 @@ cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, 
 #endif
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaForceFree(void *ret);
+// Return a pooled allocation after all work already submitted to this host
+// thread's per-thread stream has completed. The allocation is detached from
+// its Data owner immediately but is not eligible for pool reuse until the
+// recorded stream event is ready. Returns false for non-pooled allocations or
+// while CUDA Graph capture owns the ordinary free path.
+bool FastllmCudaFreeAfterCurrentThreadStream(void *ret);
 void FastllmCudaFree(void *ret);
 void DisableCudaMalloc();
 // 由 multicuda 在 NCCL 初始化成功后置位；置位后真实 cudaMalloc 前会先排空在途 NCCL 集合通信，
@@ -250,12 +278,26 @@ bool FastllmCudaMarlinHalfFP8Gemm(const void *a, const uint32_t *b_q_weight,
                                   const void *b_scales, void *c,
                                   int size_m, int size_n, int size_k,
                                   int group_size, int *workspace);
+// SM75+ weight-only NVFP4 Marlin (W4A16, group size 16).  SM75 selects the
+// two-stage Turing specialization; SM80+ selects the four-stage kernel.
+bool FastllmCudaMarlinHalfNVFP4Gemm(const void *a,
+                                    const uint32_t *b_q_weight,
+                                    const void *b_scales,
+                                    const float *global_scale, void *c,
+                                    int size_m, int size_n, int size_k,
+                                    int *workspace, void *c_tmp);
+bool FastllmCudaMarlinNVFP4Supported(int size_n, int size_k);
 bool FastllmCudaHasFp8MarlinLayout(const fastllm::Data &weight);
 bool FastllmCudaTryMarlinHalfMatMulFloatFP8E4M3(const fastllm::Data &input,
                                                 fastllm::Data &weight,
                                                 const fastllm::Data &bias,
-                                                fastllm::Data &output,
-                                                int n, int m, int k);
+                                                 fastllm::Data &output,
+                                                 int n, int m, int k);
+bool FastllmCudaHasNVFP4MarlinLayout(const fastllm::Data &weight);
+bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
@@ -403,6 +445,18 @@ bool FastllmCudaQwen35GdnPostConvExactFloat16(
         fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
         fastllm::Data &g, fastllm::Data &beta,
         fastllm::Data &kBeta, fastllm::Data &vBeta);
+bool FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+        const fastllm::Data &qkvInput,
+        const fastllm::Data &normWeight,
+        const fastllm::Data &combinedBaInput,
+        const fastllm::Data &aLog,
+        const fastllm::Data &dtBias,
+        int baOffset, const std::vector<int> &seqLens,
+        int chunkSize, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        fastllm::Data &q, fastllm::Data &k,
+        fastllm::Data &g, fastllm::Data &kBeta,
+        fastllm::Data &vBeta);
 bool FastllmCudaKimiK3RMSNorm(const fastllm::Data &input,
                               const fastllm::Data &weight,
                               fastllm::Data &output, float eps);
@@ -604,6 +658,23 @@ bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv, const fastl
                                             int blockStart, int blockCount, int compressRatio,
                                             int headDim, int wideDim, bool overlap,
                                             fastllm::Data &output);
+// Preserve the eager pipeline's FP32 -> BF16 -> RMSNorm -> BF16 -> RoPE /
+// quantization boundaries, but finish each compressed row in one launch and
+// write it directly into an already-reserved cache.
+bool FastllmCudaDeepSeekV4FinalizeCompressedKV(
+                                            const fastllm::Data &compressed,
+                                            const fastllm::Data &normWeight,
+                                            int blockStart, int compressRatio,
+                                            int ropeDim, float ropeBase,
+                                            int originalSeqLen, float ropeFactor,
+                                            int betaFast, int betaSlow,
+                                            fastllm::Data &cache);
+// Drop a disjoint prefix from the two raw compressor caches in place.  The
+// allocation and its reserve stride remain stable; only logical dimensions
+// are shortened after the byte-identical device copy is enqueued.
+bool FastllmCudaDeepSeekV4CompactCompressorRaw(fastllm::Data &kv,
+                                               fastllm::Data &score,
+                                               int dropLen);
 bool FastllmCudaDeepSeekV4InitGraphRawRing(const fastllm::Data &raw, int rawTokenBase,
                                            fastllm::Data &ring);
 bool FastllmCudaDeepSeekV4UpdateCompressedKVGraph(
@@ -660,6 +731,9 @@ bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
                                                       int betaSlow,
                                                       fastllm::Data &indices,
                                                       fastllm::Data &lengths);
+size_t FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
+                                                      int seqlen, int heads,
+                                                      int compressRatio);
 bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                       const fastllm::Data &q,
                                                       const fastllm::Data &windowKV,
@@ -668,6 +742,7 @@ bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120(
                                                       const fastllm::Data *compressedLengths,
                                                       fastllm::Data &packedWindowKV,
                                                       fastllm::Data &packedCompressedKV,
+                                                      fastllm::Data *scratch,
                                                       fastllm::Data &attnSink,
                                                       int windowSize, int compressRatio,
                                                       const int32_t *decodeMeta,
@@ -698,6 +773,12 @@ bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const f
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA,
                               int groups, int oRank, fastllm::Data &output,
                               bool allowTriton = true);
+bool FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                              const fastllm::Data &gateUp,
+                              fastllm::Data &downInput,
+                              const float *routeScales,
+                              float swigluLimit,
+                              bool quantize);
 #ifdef FASTLLM_ENABLE_DSV4_WOA_DEEPGEMM_SM120
 extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               const fastllm::Data &o,
@@ -736,10 +817,34 @@ bool FastllmCudaTryTritonChunkGdnPostConv(
         Data &normalizedQ, Data &normalizedK,
         Data &q, Data &k, Data &v, Data &g, Data &beta,
         Data &kBeta, Data &vBeta);
+bool FastllmCudaTryChunkGdnRaggedPostConv(
+        const Data &qkvInput, const Data &normWeight,
+        const Data &combinedBaInput, const Data &aLog,
+        const Data &dtBias, int baOffset,
+        const std::vector<int> &seqLens, int chunkSize,
+        int keyHeads, int valueHeads, int kDim, int vDim,
+        float normEps, float qScale,
+        Data &q, Data &k, Data &g,
+        Data &kBeta, Data &vBeta);
+bool FastllmCudaMappedGdnKkt(
+        const Data &kBeta, const Data &k,
+        int headGroup, Data &output);
 bool FastllmCudaTryTritonChunkGdnRecompute(
         const Data &attn, const Data &vBeta,
         const Data &kBeta, const Data &gExp, const Data &g,
         Data &vOutput, Data &kOutput);
+bool FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut);
+// Runs only the optional Triton implementation. Unlike the availability-first
+// wrapper above, this returns false without entering the native CUDA fallback.
+bool FastllmCudaTryTritonChunkGdnVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut);
 bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
         const Data &q, const Data &windowKV, const Data &compressedKV,
         const Data &attnSink, int windowSize, int compressRatio,
@@ -844,6 +949,20 @@ bool FastllmCudaPackRaggedGdnPrefillFloat16(
 bool FastllmCudaUnpackRaggedGdnPrefillFloat16(
     const fastllm::Data &padded, const std::vector<int> &seqLens,
     fastllm::Data &ragged);
+bool FastllmCudaPackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &q, const fastllm::Data &k,
+    const fastllm::Data &v, const fastllm::Data &b,
+    const fastllm::Data &g, const std::vector<int> &seqLens,
+    int chunkSize, float qScale,
+    fastllm::Data &qPacked, fastllm::Data &kPacked,
+    fastllm::Data &vPacked, fastllm::Data &bPacked,
+    fastllm::Data &gPacked);
+bool FastllmCudaUnpackRaggedGdnPrefillChunksFloat16(
+    const fastllm::Data &packed, const std::vector<int> &seqLens,
+    int chunkSize, fastllm::Data &ragged);
+bool FastllmCudaGetRaggedGdnMetadata(
+    const std::vector<int> &seqLens, int chunkSize,
+    FastllmCudaRaggedGdnMetadataView &view);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 
@@ -855,6 +974,9 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                               int input0Spatial, int input1Spatial, int outputSpatial,
                               int input0Stride, int input1Stride,
                               int batch, int n, int m, int k, float alpha);
+bool FastllmCudaBatchMatMulTransBHeadMapped(
+    const fastllm::Data &input0, const fastllm::Data &input1,
+    fastllm::Data &output, int headGroup, float alpha = 1.0f);
 bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim);
 bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
@@ -940,6 +1062,14 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
                                   float typicalPosteriorAlpha);
+bool FastllmCudaTopKTopPSamplingToDevice(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
@@ -948,6 +1078,15 @@ bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
 bool FastllmCudaGreedySamplingWithScores(float *logits, int *output,
                                          float *scores, int batch,
                                          int vocabSize);
+bool FastllmCudaGreedySamplingPackedCandidateWithIdOffset(
+                                         float *logits,
+                                         void *packedCandidates,
+                                         int batch, int vocabSize,
+                                         int idOffset);
+bool FastllmCudaMergeShardedGreedyCandidates(
+                                         const void *packedCandidates,
+                                         int *output, float *floatOutput,
+                                         int ranks, int batch);
 bool FastllmCudaSampleTopK(float *topk, float *temperatures,
                            int *topKArr, float *topPArr, float *randoms,
                            int *output,
@@ -972,6 +1111,19 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
+enum FastllmCudaLinearFp16Path {
+    FASTLLM_CUDA_LINEAR_FP16_PATH_AUTO = 0,
+    FASTLLM_CUDA_LINEAR_FP16_PATH_NATIVE = 1,
+    FASTLLM_CUDA_LINEAR_FP16_PATH_CUBLAS = 2,
+};
+// AUTO keeps B1-B7 on the native kernels, uses the verified Qwen3.6 B8 GDN
+// specialization for 5120x48 without bias, and retains cuBLAS otherwise.
+// Exposed so correctness tests can verify the production dispatch policy.
+FastllmCudaLinearFp16Path FastllmCudaResolveLinearFp16AutoPath(int n, int m, int k, bool addTo, bool hasBias);
+// Explicit path selection is intended for correctness tests and benchmarks.
+// Production callers should use AUTO through FastllmCudaHalfMatMulFloat16.
+// NATIVE supports one to eight rows; CUBLAS bypasses AUTO dispatch.
+bool FastllmCudaHalfMatMulFloat16WithPath(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization, FastllmCudaLinearFp16Path path);
 bool FastllmCudaHalfMatMulFloat16WithRouterSpecialization(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo, bool allowRouterSpecialization);
 // Fuses the Qwen3.5 FP16 router and shared-gate projections for one to seven
 // flattened decode rows. Larger batches keep the cuBLAS GEMM path.
@@ -1169,6 +1321,7 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastll
 bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);
+bool FastllmCudaCutlassLinearFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128Add(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaCutlassLinearFP8E4M3Block128FromRMSNorm(const fastllm::Data &input, fastllm::Data &normWeight, float eps, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -1245,6 +1398,35 @@ bool FastllmCudaTritonChunkGatedDeltaRulePrefill(
     fastllm::Data &g, fastllm::Data &attn,
     fastllm::Data &decayMask, fastllm::Data &kCumdecay,
     fastllm::Data &lastRecurrentState, fastllm::Data &coreAttnOut);
+
+bool FastllmCudaTritonChunkGatedDeltaRuleVarlenPrefill(
+    const char *hCubinPath, const char *hKernelName,
+    int hNumWarps, int hShared,
+    const char *oCubinPath, const char *oKernelName,
+    int oNumWarps, int oShared,
+    const char *oFusedDecayCubinPath,
+    const char *oFusedDecayKernelName,
+    int oFusedDecayNumWarps, int oFusedDecayShared,
+    const char *hPrecomputedScaleCubinPath,
+    const char *hPrecomputedScaleKernelName,
+    int hPrecomputedScaleNumWarps, int hPrecomputedScaleShared,
+    const char *oDirectQkCubinPath,
+    const char *oDirectQkKernelName,
+    int oDirectQkNumWarps, int oDirectQkShared,
+    bool precomputeScale, bool fuseDecayMask, bool directOutputQk,
+    int maxChunks, int chunkSize, int kDim, int vDim,
+    int hBlockV, int oBlockV, const std::vector<int> &seqLens,
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &decayMask, fastllm::Data &kCumdecay,
+    fastllm::Data &lastRecurrentState,
+    fastllm::Data &coreAttnOut);
+
+bool FastllmCudaTritonChunkGdnKkt(
+    const char *cubinPath, const char *kernelName,
+    int numWarps, int shared,
+    const fastllm::Data &kBeta, const fastllm::Data &k,
+    int headGroup, fastllm::Data &output);
 
 bool FastllmCudaTritonChunkGdnPostConv(
     const char *cubinPath, const char *kernelName,
@@ -1372,6 +1554,13 @@ bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedSlots(
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);
+bool FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+    fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
+    fastllm::Data &g, fastllm::Data &attn,
+    fastllm::Data &k_cumdecay, fastllm::Data &last_recurrent_state,
+    const std::vector<int> &seqLens, fastllm::Data &core_attn_out,
+    const fastllm::Data *decay_mask = nullptr,
+    bool apply_decay_mask = false);
 
 void FastllmCudaSetDevice(int gpu_id);
 int FastllmCudaGetDevice();
