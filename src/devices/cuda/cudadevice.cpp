@@ -5903,10 +5903,12 @@ namespace fastllm {
     }
 
     void DoCudaCatDirect(Data &input0, Data &input1, int axis) {
-        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                                (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
-                                (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16),
-                        "Cat's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input0.dataType == input1.dataType &&
+                        (input0.dataType == DataType::FLOAT32 ||
+                         input0.dataType == DataType::FLOAT16 ||
+                         input0.dataType == DataType::BFLOAT16 ||
+                         input0.dataType == DataType::INT8),
+                        "CatDirect's inputs should have the same float or int8 type.\n");
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
 
         if (input0.dims.size() == 0) {
@@ -6221,8 +6223,9 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Silu error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Silu error: Data's type should be float32, float16 or bfloat16.\n");
         FastllmCudaSilu(input, output);
     }
 
@@ -6296,8 +6299,9 @@ namespace fastllm {
 
         float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, 
-                        "Mul error: Data's type should be float32 or float16.\n");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Mul error: Data's type should be float32, float16 or bfloat16.\n");
         FastllmCudaMul(input, v, output);
     }
 
@@ -7123,6 +7127,10 @@ namespace fastllm {
         Data tempMiddle;
         Data tempSwiglu;
         Data tempOutput;
+        Data tempFloatMiddle;
+        Data tempFloatSwiglu;
+        Data tempFloatOutput;
+        Data floatOutput;
     };
 
     static CudaMergeMoeFromCpuWorkspace &GetCudaMergeMoeFromCpuWorkspace(
@@ -7151,15 +7159,6 @@ namespace fastllm {
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
         MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit) {
-// static std::map <std::string, float> timeCnt;
-// static std::chrono::steady_clock::time_point lastMergeMoeCallTime;
-// auto now = std::chrono::steady_clock::now();
-// if (!timeCnt.empty() && std::chrono::duration_cast<std::chrono::seconds>(now - lastMergeMoeCallTime).count() >= 2) {
-   // timeCnt.clear();
-// }
-// lastMergeMoeCallTime = now;
-// auto st = std::chrono::system_clock::now();
-// auto xxx = std::chrono::system_clock::now();
         int curDeviceId = FastllmCudaGetDevice();
         CudaMergeMoeFromCpuWorkspace &workspace =
             GetCudaMergeMoeFromCpuWorkspace(curDeviceId);
@@ -7168,6 +7167,10 @@ namespace fastllm {
         Data &tempMiddle = workspace.tempMiddle;
         Data &tempSwiglu = workspace.tempSwiglu;
         Data &tempOutput = workspace.tempOutput;
+        Data &tempFloatMiddle = workspace.tempFloatMiddle;
+        Data &tempFloatSwiglu = workspace.tempFloatSwiglu;
+        Data &tempFloatOutput = workspace.tempFloatOutput;
+        Data &floatOutput = workspace.floatOutput;
         if (output.cudaData != nullptr) {
             int outputPtrDevice = GetPointerDeviceId(output.cudaData);
             if (outputPtrDevice >= 0 && outputPtrDevice != curDeviceId) {
@@ -7185,7 +7188,6 @@ namespace fastllm {
             output.ToCudaTemporary({}, true);
         }
         input.ToCudaTemporary({}, false);
-// ForceDeviceSync(); timeCnt["io"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         int batch = input.dims[0];
         
         int32_t *indexData = (int32_t*)index.cpuData;
@@ -7216,70 +7218,48 @@ namespace fastllm {
             }
         }
 
-        std::vector <int> indexVec;
-        std::vector <float> scales;
-        std::vector <int> startIdx;                
-        for (int i = 0; i < expertTasks.size(); i++) {
-            startIdx.push_back(indexVec.size());
-            for (int j = 0; j < expertTasks[i].size(); j++) {
-                indexVec.push_back(expertTasks[i][j].first);
-                scales.push_back(expertTasks[i][j].second);
+        // Match the NUMA CPU path's FP32 projection outputs and expert
+        // reduction only for the ordinary packed-FP8 BF16 MoE path.
+        const bool accurateFp8Moe = [&]() {
+            if (!setZero || deepSeekV4Mode ||
+                input.dataType != DataType::BFLOAT16 ||
+                output.dataType != DataType::BFLOAT16 ||
+                gateType != MoeGateSwiglu || !isCrossSwiglu) {
+                return false;
             }
-        }
+            bool hasGpuExpert = false;
+            int gateUpDim = -1;
+            int outputDim = -1;
+            for (int i = 0; i < (int)expertTasks.size(); i++) {
+                if (expertTasks[i].empty() ||
+                    experts.find(i) == experts.end() ||
+                    weights[i * 2] == nullptr) {
+                    continue;
+                }
+                hasGpuExpert = true;
+                if (weights[i * 2 + 1] == nullptr ||
+                    weights[i * 2]->dims.size() != 2 ||
+                    weights[i * 2 + 1]->dims.size() != 2 ||
+                    weights[i * 2]->dims[1] % 128 != 0 ||
+                    weights[i * 2 + 1]->dims[1] % 128 != 0 ||
+                    weights[i * 2]->dims[0] % 2 != 0 ||
+                    weights[i * 2]->dataType !=
+                        DataType::FP8_E4M3_BLOCK_128 ||
+                    weights[i * 2 + 1]->dataType !=
+                        DataType::FP8_E4M3_BLOCK_128) {
+                    return false;
+                }
+                if (gateUpDim < 0) {
+                    gateUpDim = weights[i * 2]->dims[0];
+                    outputDim = weights[i * 2 + 1]->dims[0];
+                } else if (weights[i * 2]->dims[0] != gateUpDim ||
+                           weights[i * 2 + 1]->dims[0] != outputDim) {
+                    return false;
+                }
+            }
+            return hasGpuExpert;
+        }();
 
-// ForceDeviceSync(); timeCnt["get experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
-        float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
-        float *cudaUnitScales = nullptr;
-// ForceDeviceSync(); timeCnt["malloc index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
-        FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
-        if (deepSeekV4Mode) {
-            AssertInFastLLM(
-                isCrossSwiglu && gateType == MoeGateSwiglu,
-                "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
-            std::vector<float> unitScales(scales.size(), 1.0f);
-            cudaUnitScales = (float*)FastllmCudaMalloc(
-                unitScales.size() * sizeof(float));
-            FastllmCudaCopyFromHostToDevice(
-                cudaUnitScales, unitScales.data(),
-                unitScales.size() * sizeof(float));
-        }
-// ForceDeviceSync(); timeCnt["copy index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-        tempInput.Resize(input.dims);
-        tempInput.dataType = input.dataType;
-        tempInput.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempInput.Allocate();
-
-        tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
-        tempMiddle.dataType = input.dataType;
-        tempMiddle.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempMiddle.Allocate();
-
-        tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
-        tempSwiglu.dataType = input.dataType;
-        tempSwiglu.ToDevice(
-            input.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempSwiglu.Allocate();
-
-        tempOutput.Resize(output.dims);
-        tempOutput.dataType = input.dataType;
-        tempOutput.ToDevice(
-            output.dataDevice, std::vector<int>{curDeviceId}, false);
-        tempOutput.Allocate();
-// ForceDeviceSync(); timeCnt["alloc data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-float total = 0.0f;
-std::map <int, int> eeCnt;
-for (int e = 0; e < expertTasks.size(); e++) {
-    if (weights[e * 2] != nullptr) {
-        eeCnt[expertTasks[e].size()]++;
-    }
-}
-for (auto &it : eeCnt) {
-    // printf("%d: %d\n", it.first, it.second);
-}
         auto isValidExpert = [&](int idx) {
             return idx >= 0 && idx < (int)expertTasks.size() &&
                    expertTasks[idx].size() > 0 &&
@@ -7293,6 +7273,115 @@ for (auto &it : eeCnt) {
             return -1;
         };
 
+        int accurateWorkspaceBatch = 0;
+        int accurateWorkspaceExpert = -1;
+        if (accurateFp8Moe) {
+            accurateWorkspaceExpert = findNextValidExpert(-1);
+            for (int i = accurateWorkspaceExpert; i >= 0;
+                 i = findNextValidExpert(i)) {
+                accurateWorkspaceBatch = std::max(
+                    accurateWorkspaceBatch, (int)expertTasks[i].size());
+            }
+            AssertInFastLLM(
+                accurateWorkspaceExpert >= 0 && accurateWorkspaceBatch > 0,
+                "CUDA NUMA MoE has no valid FP8 expert workspace.");
+        }
+
+        std::vector <int> indexVec;
+        std::vector <float> scales;
+        std::vector <int> startIdx;                
+        for (int i = 0; i < expertTasks.size(); i++) {
+            startIdx.push_back(indexVec.size());
+            for (int j = 0; j < expertTasks[i].size(); j++) {
+                indexVec.push_back(expertTasks[i][j].first);
+                scales.push_back(expertTasks[i][j].second);
+            }
+        }
+
+        int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
+        float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+        float *cudaUnitScales = nullptr;
+        FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+        if (deepSeekV4Mode) {
+            AssertInFastLLM(
+                isCrossSwiglu && gateType == MoeGateSwiglu,
+                "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
+            std::vector<float> unitScales(scales.size(), 1.0f);
+            cudaUnitScales = (float*)FastllmCudaMalloc(
+                unitScales.size() * sizeof(float));
+            FastllmCudaCopyFromHostToDevice(
+                cudaUnitScales, unitScales.data(),
+                unitScales.size() * sizeof(float));
+        }
+        tempInput.Resize(
+            accurateFp8Moe
+                ? std::vector<int>{accurateWorkspaceBatch, input.dims[1]}
+                : input.dims);
+        tempInput.dataType = input.dataType;
+        tempInput.ToDevice(
+            input.dataDevice, std::vector<int>{curDeviceId}, false);
+        tempInput.Allocate();
+
+        if (accurateFp8Moe) {
+            int gateUpDim = weights[accurateWorkspaceExpert * 2]->dims[0];
+
+            tempSwiglu.Resize(
+                {accurateWorkspaceBatch, gateUpDim / 2});
+            tempSwiglu.dataType = input.dataType;
+            tempSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempSwiglu.Allocate();
+
+            tempFloatMiddle.dataType = DataType::FLOAT32;
+            tempFloatMiddle.Resize(
+                {accurateWorkspaceBatch, gateUpDim});
+            tempFloatMiddle.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempFloatMiddle.Allocate();
+
+            tempFloatSwiglu.dataType = DataType::FLOAT32;
+            tempFloatSwiglu.Resize(
+                {accurateWorkspaceBatch, gateUpDim / 2});
+            tempFloatSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempFloatSwiglu.Allocate();
+
+            tempFloatOutput.dataType = DataType::FLOAT32;
+            tempFloatOutput.Resize(
+                {accurateWorkspaceBatch, output.dims[1]});
+            tempFloatOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempFloatOutput.Allocate();
+
+            floatOutput.dataType = DataType::FLOAT32;
+            floatOutput.Resize(output.dims);
+            floatOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            floatOutput.Allocate();
+            FastllmCudaMemset0(
+                floatOutput.cudaData, floatOutput.GetBytes());
+        } else {
+            tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+            tempMiddle.dataType = input.dataType;
+            tempMiddle.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempMiddle.Allocate();
+
+            tempSwiglu.Resize(
+                {input.dims[0], weights[2]->dims[0] / 2});
+            tempSwiglu.dataType = input.dataType;
+            tempSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempSwiglu.Allocate();
+
+            tempOutput.Resize(output.dims);
+            tempOutput.dataType = input.dataType;
+            tempOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempOutput.Allocate();
+        }
+
         void *copyStream = FastllmCudaStreamCreate(true);
         void *computeDoneEvent = FastllmCudaEventCreate();
         int curExpert = findNextValidExpert(-1);
@@ -7300,8 +7389,6 @@ for (auto &it : eeCnt) {
         if (curExpert >= 0) {
             weights[curExpert * 2]->ToCudaTemporary({}, true);
             weights[curExpert * 2 + 1]->ToCudaTemporary({}, true);
-total += weights[curExpert * 2]->GetBytes();
-total += weights[curExpert * 2 + 1]->GetBytes();
         }
 
         int prevExpert = -1;
@@ -7311,8 +7398,6 @@ total += weights[curExpert * 2 + 1]->GetBytes();
             if (nextExpert >= 0) {
                 weights[nextExpert * 2]->ToCudaTemporary({}, true, copyStream);
                 weights[nextExpert * 2 + 1]->ToCudaTemporary({}, true, copyStream);
-total += weights[nextExpert * 2]->GetBytes();
-total += weights[nextExpert * 2 + 1]->GetBytes();
             }
 
             int i = curExpert;
@@ -7324,106 +7409,83 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 GetDataBytes(input.dataType, 1, input.dims[1]), 
                 cudaIndex + startIdx[i]
             );
-            DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
-            DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
-            if (deepSeekV4Mode) {
+            if (accurateFp8Moe) {
+                int expertBatch = (int)expertTasks[i].size();
+                int hidden = tempInput.dims[1];
+                int gateUp = weights[i * 2]->dims[0];
+                int inter = gateUp / 2;
+                int outputDim = weights[i * 2 + 1]->dims[0];
+
+                tempFloatMiddle.Resize({expertBatch, gateUp});
                 AssertInFastLLM(
-                    FastllmCudaDeepSeekV4PrepareMoeDownInput(
-                        tempMiddle, tempSwiglu,
-                        cudaScales + startIdx[i], swigluLimit,
-                        IsDeepSeekV4CudaQuantizedWeight(
-                            *weights[i * 2 + 1])),
-                    "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
-            } else {
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
+                        tempInput, *weights[i * 2], *GetEmptyData(),
+                        tempFloatMiddle, expertBatch, hidden, gateUp),
+                    "CUDA NUMA MoE failed its FP32 gate/up projection.");
                 ApplyCudaMoeGate(
-                    tempMiddle, tempSwiglu, gateType, isCrossSwiglu);
+                    tempFloatMiddle, tempFloatSwiglu,
+                    gateType, isCrossSwiglu);
+
+                // The down projection consumes BF16 activations on the CPU
+                // reference path, so keep this single precision boundary.
+                tempSwiglu.Resize({expertBatch, inter});
+                FastllmFloatToBF16(
+                    tempFloatSwiglu.cudaData, tempSwiglu.cudaData,
+                    tempFloatSwiglu.Count(0));
+
+                tempFloatOutput.Resize({expertBatch, outputDim});
+                AssertInFastLLM(
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
+                        tempSwiglu, *weights[i * 2 + 1],
+                        *GetEmptyData(), tempFloatOutput,
+                        expertBatch, inter, outputDim),
+                    "CUDA NUMA MoE failed its FP32 down projection.");
+            } else {
+                DoCudaLinearReshape(
+                    tempInput, *weights[i * 2], tempMiddle);
+                DoCudaLinear(
+                    tempInput, *weights[i * 2],
+                    *GetEmptyData(), tempMiddle);
+
+                if (deepSeekV4Mode) {
+                    AssertInFastLLM(
+                        FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                            tempMiddle, tempSwiglu,
+                            cudaScales + startIdx[i], swigluLimit,
+                            IsDeepSeekV4CudaQuantizedWeight(
+                                *weights[i * 2 + 1])),
+                        "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
+                } else {
+                    ApplyCudaMoeGate(
+                        tempMiddle, tempSwiglu,
+                        gateType, isCrossSwiglu);
+                }
+                DoCudaLinearReshape(
+                    tempSwiglu, *weights[i * 2 + 1], tempOutput);
+                DoCudaLinear(
+                    tempSwiglu, *weights[i * 2 + 1],
+                    *GetEmptyData(), tempOutput);
             }
-            DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
-            DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
 
-            // debug: 输出指定token关联的所有专家计算结果（通过环境变量 FASTLLM_DEBUG_TOKEN_ID 指定token id，逗号分隔）
-            /* {
-                static std::set<int> debugTokenIds;
-                static bool debugTokenIdInited = false;
-                if (!debugTokenIdInited) {
-                    const char *env = getenv("FASTLLM_DEBUG_TOKEN_ID");
-                    if (env) {
-                        std::string s(env);
-                        size_t pos = 0;
-                        while (pos < s.size()) {
-                            size_t next = s.find(',', pos);
-                            if (next == std::string::npos) next = s.size();
-                            debugTokenIds.insert(atoi(s.substr(pos, next - pos).c_str()));
-                            pos = next + 1;
-                        }
-                    }
-                    debugTokenIdInited = true;
-                }
-                if (!debugTokenIds.empty()) {
-                    bool needCopy = false;
-                    for (int t = 0; t < (int)expertTasks[i].size(); t++) {
-                        if (debugTokenIds.count(expertTasks[i][t].first)) { needCopy = true; break; }
-                    }
-                    if (needCopy) {
-                        int lines = expertTasks[i].size();
-                        int dim = output.dims[1];
-                        size_t rawBytes = GetDataBytes(tempOutput.dataType, lines, dim);
-                        std::vector<uint8_t> rawBuf(rawBytes);
-                        FastllmCudaCopyFromDeviceToHost(rawBuf.data(), tempOutput.cudaData, rawBytes);
-                        std::vector<float> f32Buf(lines * dim);
-                        if (tempOutput.dataType == DataType::FLOAT32) {
-                            memcpy(f32Buf.data(), rawBuf.data(), lines * dim * sizeof(float));
-                        } else if (tempOutput.dataType == DataType::FLOAT16) {
-                            for (int idx = 0; idx < lines * dim; idx++) {
-                                uint16_t h = ((uint16_t*)rawBuf.data())[idx];
-                                uint32_t sign = (h >> 15) & 0x1;
-                                uint32_t exp = (h >> 10) & 0x1F;
-                                uint32_t mant = h & 0x3FF;
-                                uint32_t f;
-                                if (exp == 0) f = (sign << 31);
-                                else if (exp == 0x1F) f = (sign << 31) | 0x7F800000 | (mant << 13);
-                                else f = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
-                                memcpy(&f32Buf[idx], &f, 4);
-                            }
-                        } else if (tempOutput.dataType == DataType::BFLOAT16) {
-                            for (int idx = 0; idx < lines * dim; idx++) {
-                                uint16_t bf = ((uint16_t*)rawBuf.data())[idx];
-                                uint32_t f = (uint32_t)bf << 16;
-                                memcpy(&f32Buf[idx], &f, 4);
-                            }
-                        }
-                        for (int t = 0; t < lines; t++) {
-                            int rowIdx = expertTasks[i][t].first;
-                            if (debugTokenIds.count(rowIdx)) {
-                                float score = expertTasks[i][t].second;
-                                float sumAbs = 0.0f;
-                                for (int d = 0; d < dim; d++) {
-                                    sumAbs += std::abs(f32Buf[t * dim + d]);
-                                }
-                                printf("[DEBUG CUDA origToken=%d] expert=%d, score=%.6f, output_l1norm=%.6f, first5=[%.6f, %.6f, %.6f, %.6f, %.6f]\n",
-                                       rowIdx, i, score, sumAbs,
-                                       f32Buf[t * dim + 0],
-                                       f32Buf[t * dim + 1],
-                                       f32Buf[t * dim + 2],
-                                       f32Buf[t * dim + 3],
-                                       f32Buf[t * dim + 4]);
-                            }
-                        }
-                        fflush(stdout);
-                    }
-                }
-            } */
-
-            FastllmCudaPickOutput (
-                (uint8_t*)tempOutput.cudaData,
-                (uint8_t*)output.cudaData,
-                expertTasks[i].size(),
-                output.dims[1],
-                cudaIndex + startIdx[i],
-                (deepSeekV4Mode ? cudaUnitScales : cudaScales) +
-                    startIdx[i],
-                tempOutput.dataType
-            );
+            if (accurateFp8Moe) {
+                FastllmCudaPickOutputFloat(
+                    (float*)tempFloatOutput.cudaData,
+                    (float*)floatOutput.cudaData,
+                    expertTasks[i].size(), output.dims[1],
+                    cudaIndex + startIdx[i],
+                    cudaScales + startIdx[i]);
+            } else {
+                FastllmCudaPickOutput (
+                    (uint8_t*)tempOutput.cudaData,
+                    (uint8_t*)output.cudaData,
+                    expertTasks[i].size(),
+                    output.dims[1],
+                    cudaIndex + startIdx[i],
+                    (deepSeekV4Mode ? cudaUnitScales : cudaScales) +
+                        startIdx[i],
+                    tempOutput.dataType
+                );
+            }
 
             FastllmCudaEventRecord(computeDoneEvent);
             FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
@@ -7446,6 +7508,11 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             weights[prevExpert * 2]->FreeCudaTemporary({}, false);
             weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
         }
+        if (accurateFp8Moe) {
+            FastllmFloatToBF16(
+                floatOutput.cudaData, output.cudaData,
+                output.Count(0));
+        }
         FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
 
@@ -7454,17 +7521,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         if (cudaUnitScales != nullptr) {
             FastllmCudaFree(cudaUnitScales);
         }
-// printf("copy weight %f G.\n", total / 1e9);
 
         input.FreeCudaTemporary({}, false);
-// ForceDeviceSync(); timeCnt["last free"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-// float totalTime = 0.0f;
-// for (auto &it : timeCnt) {
-//     // printf("%s: %f s.\n", it.first.c_str(), it.second);
-//     totalTime += it.second;
-// }
-// // printf("total time = %f\n", totalTime);
-//printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(xxx, std::chrono::system_clock::now()));
     }
 
     void DoCudaKimiK3RoutedExpertsFromCPU(

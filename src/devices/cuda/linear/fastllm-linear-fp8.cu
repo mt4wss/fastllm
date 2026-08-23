@@ -576,6 +576,22 @@ void LaunchFastllmGemmFp16FP8E4M3(half *input, uint8_t *weight, half *output, ha
     const int grid = (k + W * ROWS - 1) / (W * ROWS);
     const bool useBlock128 = (blockM == 128 && blockK == 128 && (m & 127) == 0);
 
+    // Six-token speculative verification is the dominant FP8 shape on the
+    // target model.  Two output rows per warp expose twice as many blocks and
+    // hide weight-load latency better than the generic four-row launch.
+    const char *n6Rows2Env = std::getenv("FASTLLM_CUDA_FP8_N6_ROWS2");
+    const bool n6Rows2 = n6Rows2Env == nullptr || std::atoi(n6Rows2Env) != 0;
+    if (n == 6 && useBlock128 && n6Rows2) {
+        constexpr int N6_W = 2;
+        constexpr int N6_ROWS = 2;
+        const int n6Grid =
+            (k + N6_W * N6_ROWS - 1) / (N6_W * N6_ROWS);
+        FastllmGemvHalfFP8E4M3KernelWarpMultiRowBlock128
+            <N6_W, 6, N6_ROWS><<<n6Grid, N6_W * 32>>>(
+                input, weight, output, bias, scales, m, k);
+        return;
+    }
+
     // Small batch-one projections do not expose enough warps when each warp
     // owns four rows (2048 outputs only launch four warps/SM on AD102).  The
     // activation is cache-resident, so using two rows per warp improves DRAM
@@ -1697,9 +1713,19 @@ __global__ void FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow(__nv_bfloat16 *A, 
 // 优化版本: 每个 warp 负责一行输出。一个 128 大小的量化 block 恰好由 32 个 lane 各处理 4 个
 // FP8 权重 (uint32), 完全利用整个 warp。使用 warp shuffle 归约, 去除 shared memory 与
 // __syncthreads。V100(sm_70) 无原生 bf16 运算, 解码后转 float 累加。
-template <int WARPS_PER_BLOCK, int PART>
+__device__ __forceinline__ void FastllmStoreBF16FP8Block128Result(
+        __nv_bfloat16 *output, size_t index, float value) {
+    output[index] = __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ void FastllmStoreBF16FP8Block128Result(
+        float *output, size_t index, float value) {
+    output[index] = value;
+}
+
+template <int WARPS_PER_BLOCK, int PART, typename OutputType>
 __global__ void FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow(
-        const __nv_bfloat16 * __restrict__ A, const uint8_t * __restrict__ B, __nv_bfloat16 * __restrict__ C,
+        const __nv_bfloat16 * __restrict__ A, const uint8_t * __restrict__ B, OutputType * __restrict__ C,
         const __nv_bfloat16 * __restrict__ bias, int m, int k, int perRow) {
     const int warpId = threadIdx.x >> 5;
     const int laneId = threadIdx.x & 31;
@@ -1770,12 +1796,16 @@ __global__ void FastllmGemvBF16FP8E4M3Block128KernelWarpMultiRow(
         for (int x = 0; x < PART; x++) {
             float r = acc[x] * magicScaleConstant;
             if (bias != nullptr) r += __bfloat162float(bias[st]);
-            C[st + (size_t)k * x] = __float2bfloat16_rn(r);
+            FastllmStoreBF16FP8Block128Result(
+                C, st + (size_t)k * x, r);
         }
     }
 }
 
-void LaunchFastllmGemmBF16FP8E4M3Block128(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
+template <typename OutputType>
+void LaunchFastllmGemmBF16FP8E4M3Block128(
+        __nv_bfloat16 *input, uint8_t *weight, OutputType *output,
+        __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
     constexpr int W = 8; // 每个 block 8 个 warp (256 线程)
     const int grid = (k + W - 1) / W;
 #define FASTLLM_BF16_FP8_B128_WARP_LAUNCH(PARTVAL, AOFF, COFF) \
@@ -1867,6 +1897,82 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastll
         LaunchFastllmGemmBF16FP8E4M3Block128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBF16Bias, n, m, k, perRow);
     }
 
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
+        const fastllm::Data &input, fastllm::Data &weight,
+        const fastllm::Data &bias, fastllm::Data &output,
+        int n, int m, int k) {
+    if (input.dataType != fastllm::DataType::BFLOAT16 ||
+        weight.dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        !bias.dims.empty() || m % 128 != 0) {
+        return false;
+    }
+
+    __nv_bfloat16 *cudaInput =
+        (__nv_bfloat16*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+    const size_t perRow =
+        m + ((m - 1) / 128 + 1) * sizeof(float);
+    if (n >= 32) {
+        // The warp kernel below is tuned for GEMV-sized batches.  NUMA hybrid
+        // prefill deliberately keeps FP32 projection outputs for accuracy, so
+        // use the same dequantize-plus-GEMM strategy as the BF16-output path
+        // once enough rows are available to saturate cuBLAS.
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+
+        size_t workspaceBytes = 0;
+        bool ownScratch = false;
+        __nv_bfloat16 *cudaBF16Weight =
+            (__nv_bfloat16*)FastllmBorrowDequantScratch(
+                (size_t)k * m * sizeof(__nv_bfloat16),
+                &workspaceBytes, &ownScratch);
+        const size_t bytesPerRow =
+            (size_t)m * sizeof(__nv_bfloat16);
+        const int maxRowsPerChunk = (int)std::min<size_t>(
+            (size_t)k,
+            std::max<size_t>(1, workspaceBytes / bytesPerRow));
+        const size_t fp8BlockBytes = 128 + sizeof(float);
+        const int blocksPerRow = m / 128;
+
+        float alpha = exp2f(120.0f);
+        float beta = 0.0f;
+        for (int rowOffset = 0; rowOffset < k;
+             rowOffset += maxRowsPerChunk) {
+            int rows = std::min(maxRowsPerChunk, k - rowOffset);
+            FastllmCudaFP8E4M3BLOCK1282BF16Kernel
+                <<<rows * blocksPerRow, 128>>>(
+                    (uint8_t*)weight.cudaData +
+                        (size_t)rowOffset * blocksPerRow * fp8BlockBytes,
+                    cudaBF16Weight);
+            cublasStatus_t status = cublasGemmEx(
+                fastllmCublasHandle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                rows, n, m,
+                &alpha,
+                cudaBF16Weight, CUDA_R_16BF, m,
+                cudaInput, CUDA_R_16BF, m,
+                &beta,
+                cudaOutput + rowOffset, CUDA_R_32F, k,
+                CUBLAS_COMPUTE_32F,
+                static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                FastllmReleaseDequantScratch(
+                    cudaBF16Weight, ownScratch);
+                printf("Error: CUDA BF16 x packed FP8 FP32-output GEMM failed.\n");
+                throw("cublas error");
+            }
+        }
+        FastllmReleaseDequantScratch(cudaBF16Weight, ownScratch);
+    } else {
+        LaunchFastllmGemmBF16FP8E4M3Block128(
+            cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+            nullptr, n, m, k, perRow);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;

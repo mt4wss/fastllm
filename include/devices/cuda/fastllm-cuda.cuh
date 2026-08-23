@@ -115,6 +115,7 @@ void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 cublasHandle_t getFastllmCublasHandle();
 
 void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex);
+void FastllmCudaPickOutputFloat(float *partOutput, float *output, int rows, int cols, int *index, float *scales);
 void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int cols, int *index, float *scales, fastllm::DataType dataType);
 
 void DeviceSync();
@@ -733,6 +734,46 @@ bool FastllmCudaDeepSeekV4BuildIndexerTopKGraph(
                                                       int betaSlow,
                                                       fastllm::Data &indices,
                                                       fastllm::Data &lengths);
+// Dots3-Note DSA indexer. Q RoPE/NoPE halves are FP32 after leading-RoPE,
+// K is BF16 after LayerNorm + leading-RoPE, and weights are the 64 projected
+// coefficients. Quantized Q/K tensors use INT8 storage for raw E4M3 bytes;
+// K scales are carried separately as FP32.
+bool FastllmCudaDots3NotePackIndexerKey(
+        const fastllm::Data &rope, const fastllm::Data &nope,
+        fastllm::Data &output);
+
+// Pack the main-attention key directly from the per-head NoPE portion of the
+// combined KV projection and the shared RoPE key. The output is
+// [heads, tokens, nopeDim + ropeDim].
+bool FastllmCudaDots3NotePackAttentionKey(
+        const fastllm::Data &kv, const fastllm::Data &rope,
+        int nopeDim, fastllm::Data &output);
+
+bool FastllmCudaDots3NoteQuantizeIndexer(
+        const fastllm::Data &qRope, const fastllm::Data &qNope,
+        const fastllm::Data &k,
+        const fastllm::Data &weights, fastllm::Data &qFp8,
+        fastllm::Data &foldedWeights, fastllm::Data &kFp8,
+        fastllm::Data &kScales);
+bool FastllmCudaDots3NoteIndexerTopK(
+        const fastllm::Data &qFp8,
+        const fastllm::Data &foldedWeights,
+        const fastllm::Data &kFp8, const fastllm::Data &kScales,
+        int startPos, int topK, fastllm::Data &indices);
+bool FastllmCudaDots3NoteSparseAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indices,
+        int startPos, float scale, fastllm::Data &output);
+bool FastllmCudaDots3NoteSparseAttentionPrefill(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &indices,
+        int startPos, float scale, fastllm::Data &output,
+        void *borrowedScratch = nullptr,
+        size_t borrowedScratchBytes = 0);
+bool FastllmCudaDots3NoteSlidingAttentionPrefill(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, int startPos, int windowSize,
+        float scale, fastllm::Data &output);
 size_t FastllmCudaDeepSeekV4SparseAttentionDecodeCachedGraphSm120ScratchBytes(
                                                       int seqlen, int heads,
                                                       int compressRatio);
@@ -1064,6 +1105,75 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
                                   float typicalPosteriorAlpha);
+bool FastllmCudaDFlashRejectionSampling(
+                                  float *logits,
+                                  const float *temperatures,
+                                  const int *topKArr,
+                                  const float *topPArr,
+                                  const int *draftTokenIds,
+                                  const int *draftCandidateIds,
+                                  const float *draftCandidateProbs,
+                                  int *outputTokenIds,
+                                  int *acceptedDraftTokens,
+                                  int batch, int draftTokens,
+                                  int selectorTopK, int vocabSize);
+bool FastllmCudaDFlashDynamicConv(
+                                  const fastllm::Data &source,
+                                  const fastllm::Data &dynamicProjection,
+                                  const fastllm::Data &baseKernel,
+                                  fastllm::Data &output,
+                                  int side, int blockSize,
+                                  int hiddenSize, int groupSize,
+                                  int kernelSize);
+bool FastllmCudaDFlashPrepareQKV(
+                                  const fastllm::Data &qkv,
+                                  const fastllm::Data &qNormWeight,
+                                  const fastllm::Data &kNormWeight,
+                                  const fastllm::Data &positionIds,
+                                  const fastllm::Data &sinData,
+                                  const fastllm::Data &cosData,
+                                  fastllm::Data &query,
+                                  fastllm::Data &key,
+                                  fastllm::Data &value,
+                                  int tokens, int queryHeads,
+                                  int kvHeads, int headDim, float eps);
+bool FastllmCudaDFlashPrepareGateup(
+                                  const fastllm::Data &gateup,
+                                  fastllm::Data &output,
+                                  int tokens, int intermediateSize);
+bool FastllmCudaDFlashMaterializeKV(
+                                  const fastllm::Data &projectedKv,
+                                  const fastllm::Data &kNormWeights,
+                                  const fastllm::Data &positionIds,
+                                  const fastllm::Data &sinData,
+                                  const fastllm::Data &cosData,
+                                  fastllm::Data &output,
+                                  int layers, int tokens,
+                                  int kvHeads, int headDim, float eps);
+bool FastllmCudaDFlashMaterializeKVToCache(
+                                  const fastllm::Data &projectedKv,
+                                  const fastllm::Data &kNormWeights,
+                                  const fastllm::Data &positionIds,
+                                  const fastllm::Data &sinData,
+                                  const fastllm::Data &cosData,
+                                  const std::vector<fastllm::Data*> &caches,
+                                  int layers, int tokens,
+                                  int kvHeads, int headDim, float eps);
+bool FastllmCudaDFlashCompactKVCache(
+                                  const std::vector<fastllm::Data*> &caches,
+                                  int keepTokens);
+size_t FastllmCudaDFlashTopKScratchBytes(int rows);
+bool FastllmCudaDFlashTopK(
+                                  const fastllm::Data &logits,
+                                  fastllm::Data &packedCandidates,
+                                  fastllm::Data &scratch,
+                                  int topk, int globalIdOffset);
+bool FastllmCudaDFlashMergeTopK(
+                                  const fastllm::Data &packedCandidates,
+                                  fastllm::Data &output,
+                                  int ranks, int localRows,
+                                  int firstRow, int outputRows,
+                                  int topk);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,
@@ -1110,6 +1220,13 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
 
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
+bool FastllmCudaDFlashAttention(
+                          const fastllm::Data &q,
+                          const fastllm::Data &k,
+                          const fastllm::Data &v,
+                          fastllm::Data &output,
+                          int group, float scale,
+                          int runtimeBlockSize, int slidingWindow);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
@@ -1320,6 +1437,7 @@ bool FastllmCudaBFloat16MergeMOENVFP4GroupedIndexed(const fastllm::Data &input, 
                                                     const int *routePositions, const int *expertStarts, const int *expertCounts,
                                                     int batch, int topk, int totalTasks, int maxExpertTasks, int hidden, int inter);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3PerChannel(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k);

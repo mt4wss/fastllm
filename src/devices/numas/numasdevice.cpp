@@ -102,6 +102,83 @@ namespace fastllm {
         void *cudaData = nullptr;
     };
 
+    static int GetNumasMoePreferredCudaDevice(const Data &input) {
+        if (input.cudaData != nullptr) {
+            int deviceId = GetPointerDeviceId(input.cudaData);
+            if (deviceId >= 0) {
+                return deviceId;
+            }
+        }
+        if (!input.dataDeviceIds.empty() && input.dataDeviceIds[0] >= 0) {
+            return input.dataDeviceIds[0];
+        }
+        return -1;
+    }
+
+    static void SortNumasMoeCudaInputReplicas(
+            std::vector<NumasMoeCudaInputReplica> &replicas,
+            int preferredDevice) {
+        std::sort(
+            replicas.begin(), replicas.end(),
+            [preferredDevice](const NumasMoeCudaInputReplica &a,
+                              const NumasMoeCudaInputReplica &b) {
+                const bool aPreferred = a.deviceId == preferredDevice;
+                const bool bPreferred = b.deviceId == preferredDevice;
+                if (aPreferred != bPreferred) {
+                    return aPreferred;
+                }
+                return a.deviceId < b.deviceId;
+            });
+    }
+
+    static std::vector<int> GetNumasMoeCudaAssistDevices() {
+        std::vector<int> devices;
+        std::set<int> seen;
+        auto appendDevice = [&](int device) {
+            // ParseDeviceIds uses 99999 as the CPU sentinel in mixed specs.
+            if (device >= 0 && device != 99999 && seen.insert(device).second) {
+                devices.push_back(device);
+            }
+        };
+
+        // Preserve the established tensor-parallel path.
+        std::vector<int> tpDevices;
+        std::map<int, int> tpRatios;
+        FastllmGetMulticudaDeviceAndRatio(tpDevices, tpRatios, true);
+        for (int device : tpDevices) {
+            appendDevice(device);
+        }
+
+        // A serial CUDA device map (for example cudapp=2, expanded to
+        // {'cuda:0': 1, 'cuda:1': 1}) does not populate MultiCUDA's rank set.
+        // NUMA GPU-prefill can nevertheless use every CUDA device as an
+        // independent expert worker because expert weights are streamed from
+        // host memory rather than tensor-parallel shards.
+        for (const auto &entry : GetDeviceMap()) {
+            if (entry.second <= 0) {
+                continue;
+            }
+            std::string deviceSpec = entry.first;
+            std::transform(
+                deviceSpec.begin(), deviceSpec.end(), deviceSpec.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            if (deviceSpec == "cuda") {
+                appendDevice(0);
+                continue;
+            }
+            if (deviceSpec.rfind("cuda:", 0) != 0) {
+                continue;
+            }
+            std::map<int, int> ratios;
+            for (int device : ParseDeviceIds(entry.first, "cuda", ratios)) {
+                appendDevice(device);
+            }
+        }
+
+        std::sort(devices.begin(), devices.end());
+        return devices;
+    }
+
     static std::vector<NumasMoeCudaInputReplica>
     GetNumasMoeCudaInputReplicas(const Data &input) {
         std::vector<NumasMoeCudaInputReplica> replicas;
@@ -126,12 +203,8 @@ namespace fastllm {
                 replicas.push_back({deviceId, input.cudaData});
             }
         }
-        std::sort(
-            replicas.begin(), replicas.end(),
-            [](const NumasMoeCudaInputReplica &a,
-               const NumasMoeCudaInputReplica &b) {
-                return a.deviceId < b.deviceId;
-            });
+        SortNumasMoeCudaInputReplicas(
+            replicas, GetNumasMoePreferredCudaDevice(input));
         return replicas;
     }
 #endif
@@ -638,6 +711,8 @@ namespace fastllm {
         int m, k, kPer;
         int rowsPerTask;
         int chunksPerExpert;
+        bool useNvfp4FullBlocks;
+        bool useNvfp4ScaleLookup;
 
         DeepSeekV4NumasGemmQueueContext(
             const std::vector<std::pair<int, float>> *experts,
@@ -654,7 +729,15 @@ namespace fastllm {
             weightOffset(weightOffset), nid(nid),
             m(m), k(k), kPer(kPer), rowsPerTask(rowsPerTask),
             chunksPerExpert(
-                (kPer + rowsPerTask - 1) / rowsPerTask) {}
+                (kPer + rowsPerTask - 1) / rowsPerTask),
+            useNvfp4FullBlocks(
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_FULL_BLOCKS") ==
+                nullptr),
+            useNvfp4ScaleLookup(
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_SCALE_LUT") ==
+                nullptr) {}
 
         int TaskCount() const {
             return (int)experts->size() * chunksPerExpert;
@@ -691,19 +774,35 @@ namespace fastllm {
                 context->outputData +
                 (size_t)expertIdx * context->k +
                 (size_t)context->nid * context->kPer);
-            FastllmGemm(
-                1, context->m, context->k,
-                input,
-                GetDataBytes(
-                    context->inputDataType, 1, context->m),
-                weight->numasData[context->nid],
-                GetDataBytes(
-                    weight->GetDataType(), 1, context->m),
-                output,
-                GetDataBytes(DataType::FLOAT32, 1, context->k),
-                st, end,
-                context->inputDataType, weight->GetDataType(),
-                DataType::FLOAT32);
+            const long inputStride = GetDataBytes(
+                context->inputDataType, 1, context->m);
+            const long weightStride = GetDataBytes(
+                weight->GetDataType(), 1, context->m);
+            const long outputStride = GetDataBytes(
+                DataType::FLOAT32, 1, context->k);
+            bool fullBlocks = false;
+            if (context->useNvfp4FullBlocks &&
+                context->inputDataType == DataType::BFLOAT16 &&
+                weight->GetDataType() ==
+                    DataType::NVFP4_BLOCK_32_E8M0 &&
+                (context->m & 31) == 0) {
+                fullBlocks =
+                    FastllmGemmBFloat16NVFP4Block32E8M0FullBlocks_AVX512BF16(
+                        input, inputStride,
+                        weight->numasData[context->nid], weightStride,
+                        output, outputStride,
+                        1, context->m, context->k, st, end,
+                        context->useNvfp4ScaleLookup);
+            }
+            if (!fullBlocks) {
+                FastllmGemm(
+                    1, context->m, context->k,
+                    input, inputStride,
+                    weight->numasData[context->nid], weightStride,
+                    output, outputStride, st, end,
+                    context->inputDataType, weight->GetDataType(),
+                    DataType::FLOAT32);
+            }
         }
 
         void Run() override {
@@ -1161,6 +1260,8 @@ namespace fastllm {
             std::vector<MultiThreadDeepSeekV4NumasStoreOutputOp> storeOps;
             std::vector<MultiThreadDeepSeekV4NumasReduceOp> reduceOps;
     #ifdef USE_CUDA
+            std::unique_ptr<void, FastllmCudaHostFreeDeleter> pinnedInput {nullptr};
+            size_t pinnedInputBytes = 0;
             std::unique_ptr<void, FastllmCudaHostFreeDeleter> pinnedOutput {nullptr};
             size_t pinnedOutputBytes = 0;
             std::unique_ptr<void, FastllmCudaFreeDeleter> gpuOutputStaging {nullptr};
@@ -1170,6 +1271,20 @@ namespace fastllm {
             std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> gpuOutputCopyStream {
                 nullptr, FastllmCudaStreamDestroyDeleter {}
             };
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> inputCopyStream {
+                nullptr, FastllmCudaStreamDestroyDeleter {}
+            };
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> routeCopyStream {
+                nullptr, FastllmCudaStreamDestroyDeleter {}
+            };
+
+            uint8_t *EnsurePinnedInput(size_t bytes) {
+                if (pinnedInputBytes < bytes || pinnedInput.get() == nullptr) {
+                    pinnedInput.reset(FastllmCudaHostMalloc(bytes));
+                    pinnedInputBytes = bytes;
+                }
+                return (uint8_t*)pinnedInput.get();
+            }
 
             uint8_t *EnsurePinnedOutput(size_t bytes) {
                 if (pinnedOutputBytes < bytes || pinnedOutput.get() == nullptr) {
@@ -1250,6 +1365,44 @@ namespace fastllm {
                     }
                 }
                 return gpuOutputCopyStream.get();
+            }
+
+            void *EnsureInputCopyStream(int gpuId) {
+                if (inputCopyStream.get() == nullptr ||
+                    inputCopyStream.get_deleter().device != gpuId) {
+                    inputCopyStream.reset(nullptr);
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    inputCopyStream = std::unique_ptr<
+                        void, FastllmCudaStreamDestroyDeleter>(
+                            FastllmCudaStreamCreate(true),
+                            FastllmCudaStreamDestroyDeleter {gpuId});
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                }
+                return inputCopyStream.get();
+            }
+
+            void *EnsureRouteCopyStream(int gpuId) {
+                if (routeCopyStream.get() == nullptr ||
+                    routeCopyStream.get_deleter().device != gpuId) {
+                    routeCopyStream.reset(nullptr);
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    routeCopyStream = std::unique_ptr<
+                        void, FastllmCudaStreamDestroyDeleter>(
+                            FastllmCudaStreamCreate(true),
+                            FastllmCudaStreamDestroyDeleter {gpuId});
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                }
+                return routeCopyStream.get();
             }
     #endif
     };
@@ -5537,14 +5690,134 @@ namespace fastllm {
  // std::vector <std::pair <std::string, float> > record;
   auto st = std::chrono::system_clock::now();
         Data &rawInput = *(datas.find("input")->second);
-        Data cpuInput;
-        Data &input = *GetCpuTensor(rawInput, cpuInput, "input");
         Data &output = *(datas.find("output")->second);
         Data &rawIndex = *(datas.find("index")->second);
         Data &rawScore = *(datas.find("score")->second);
+        int layer = intParams.find("layer") != intParams.end() ?
+            intParams.find("layer")->second : 0;
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas =
+            GetNumasMoeRuntimeCache()[layer % 2];
+
         Data cpuIndex, cpuScore;
-        Data &index = *GetCpuTensor(rawIndex, cpuIndex, "index");
-        Data &score = *GetCpuTensor(rawScore, cpuScore, "score");
+        Data cpuInput;
+        Data *inputPtr = nullptr;
+        Data *indexPtr = nullptr;
+        Data *scorePtr = nullptr;
+#ifdef USE_CUDA
+        std::unique_ptr<Data> pinnedInputAlias;
+        std::unique_ptr<Data> pinnedIndexAlias;
+        std::unique_ptr<Data> pinnedScoreAlias;
+        void *inputCopyStream = nullptr;
+        bool inputCopyPending = false;
+        const bool inputOnCuda = rawInput.dataDevice == DataDevice::CUDA &&
+            rawInput.cudaData != nullptr && !rawInput.multiDeviceData;
+        const bool indexOnCuda = rawIndex.dataDevice == DataDevice::CUDA &&
+            rawIndex.cudaData != nullptr && !rawIndex.multiDeviceData;
+        const bool scoreOnCuda = rawScore.dataDevice == DataDevice::CUDA &&
+            rawScore.cudaData != nullptr && !rawScore.multiDeviceData;
+        if (inputOnCuda || indexOnCuda || scoreOnCuda) {
+            auto cudaId = [](const Data &data) {
+                int pointerDevice = GetPointerDeviceId(data.cudaData);
+                return pointerDevice >= 0 ? pointerDevice :
+                    (data.dataDeviceIds.empty() ? FastllmCudaGetDevice() :
+                     data.dataDeviceIds[0]);
+            };
+            int cudaDeviceId = inputOnCuda ? cudaId(rawInput) :
+                (indexOnCuda ? cudaId(rawIndex) : cudaId(rawScore));
+            AssertInFastLLM(
+                (!inputOnCuda || cudaId(rawInput) == cudaDeviceId) &&
+                (!indexOnCuda || cudaId(rawIndex) == cudaDeviceId) &&
+                (!scoreOnCuda || cudaId(rawScore) == cudaDeviceId),
+                "NUMA MergeMOE CUDA staging requires inputs on one device.");
+            FastllmCudaSetDevice(cudaDeviceId);
+
+            const size_t inputBytes = rawInput.GetBytes();
+            const size_t indexBytes = rawIndex.GetBytes();
+            const size_t scoreBytes = rawScore.GetBytes();
+            uint8_t *staging = fastllmMoeDataManagerNumas.
+                EnsurePinnedInput(inputBytes + indexBytes + scoreBytes);
+            uint8_t *inputHost = staging;
+            uint8_t *indexHost = inputHost + inputBytes;
+            uint8_t *scoreHost = indexHost + indexBytes;
+            inputCopyStream = fastllmMoeDataManagerNumas.
+                EnsureInputCopyStream(cudaDeviceId);
+            void *routeCopyStream = fastllmMoeDataManagerNumas.
+                EnsureRouteCopyStream(cudaDeviceId);
+            void *sourceReadyEvent = FastllmCudaEventCreate();
+            FastllmCudaEventRecordCurrentThread(sourceReadyEvent);
+            FastllmCudaStreamWaitEvent(inputCopyStream, sourceReadyEvent);
+            FastllmCudaStreamWaitEvent(routeCopyStream, sourceReadyEvent);
+            if (inputOnCuda) {
+                AssertInFastLLM(
+                    FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                        inputHost, rawInput.cudaData, inputBytes,
+                        inputCopyStream),
+                    "NUMA MergeMOE failed to enqueue the input D2H copy.");
+                pinnedInputAlias.reset(new Data(
+                    rawInput.dataType, rawInput.dims,
+                    DataDevice::CPU, inputHost));
+                pinnedInputAlias->strides = rawInput.strides;
+                inputPtr = pinnedInputAlias.get();
+                inputCopyPending = true;
+            }
+            if (indexOnCuda) {
+                AssertInFastLLM(
+                    FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                        indexHost, rawIndex.cudaData, indexBytes,
+                        routeCopyStream),
+                    "NUMA MergeMOE failed to enqueue the index D2H copy.");
+                pinnedIndexAlias.reset(new Data(
+                    rawIndex.dataType, rawIndex.dims,
+                    DataDevice::CPU, indexHost));
+                pinnedIndexAlias->strides = rawIndex.strides;
+                indexPtr = pinnedIndexAlias.get();
+            }
+            if (scoreOnCuda) {
+                AssertInFastLLM(
+                    FastllmCudaCopyFromDeviceToPinnedHostAsync(
+                        scoreHost, rawScore.cudaData, scoreBytes,
+                        routeCopyStream),
+                    "NUMA MergeMOE failed to enqueue the score D2H copy.");
+                pinnedScoreAlias.reset(new Data(
+                    rawScore.dataType, rawScore.dims,
+                    DataDevice::CPU, scoreHost));
+                pinnedScoreAlias->strides = rawScore.strides;
+                scorePtr = pinnedScoreAlias.get();
+            }
+            FastllmCudaEventDestroy(sourceReadyEvent);
+            // Routing is needed to partition experts.  Waiting on its small
+            // transfer also establishes producer completion before GPU expert
+            // workers consume the source activation on their own streams.
+            FastllmCudaStreamSynchronize(routeCopyStream);
+        }
+#endif
+        if (inputPtr == nullptr) {
+            inputPtr = GetCpuTensor(rawInput, cpuInput, "input");
+        }
+        if (indexPtr == nullptr) {
+            indexPtr = GetCpuTensor(rawIndex, cpuIndex, "index");
+        }
+        Data &index = *indexPtr;
+        if (scorePtr == nullptr) {
+            scorePtr = GetCpuTensor(rawScore, cpuScore, "score");
+        }
+        Data &score = *scorePtr;
+        Data &input = *inputPtr;
+        auto waitForCpuInput = [&]() {
+#ifdef USE_CUDA
+            if (inputCopyPending) {
+                FastllmCudaStreamSynchronize(inputCopyStream);
+                inputCopyPending = false;
+            }
+#endif
+        };
+        auto ensureCpuOutput = [&]() {
+            if (output.dataDevice != DataDevice::CPU ||
+                output.cpuData == nullptr) {
+                output.ToDevice(DataDevice::CPU, false);
+            }
+            output.Allocate(false);
+        };
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
@@ -5561,16 +5834,12 @@ namespace fastllm {
         int n = index.dims[0];
         int topk = index.dims[1];
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
-        int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas =
-            GetNumasMoeRuntimeCache()[layer % 2];
         // `moeFinal` is reused across layers and may have been reshaped back to
         // `[batch, seq, hidden]` by the caller. Reset it to the flattened MoE
         // input shape here before the NUMA path reads `output.dims[1]`.
         output.dataType = input.dataType;
         output.expansionDims.clear();
         output.Resize(input.dims);
-        output.Allocate();
 // printf("allocate spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         int32_t *indexData = (int32_t*)index.cpuData;
         float *scoreData = (float*)score.cpuData;
@@ -5637,15 +5906,15 @@ namespace fastllm {
 #ifdef USE_CUDA
         if (std::getenv("FASTLLM_NUMAS_MOE_GPU_TRACE") != nullptr) {
             std::vector<NumasMoeCudaInputReplica> traceReplicas =
-                GetNumasMoeCudaInputReplicas(input);
+                GetNumasMoeCudaInputReplicas(rawInput);
             printf(
                 "[Fastllm] NUMA MoE input layer=%d tokens=%d type=%s "
                 "cpu=%d cuda=%d multi=%d replicated=%d replicas=%zu "
                 "mixed_types=%d\n",
                 layer, n, GetDataTypeName(input.dataType).c_str(),
-                input.cpuData != nullptr, input.cudaData != nullptr,
-                input.multiDeviceData,
-                input.IsTensorParallelReplicated(),
+                rawInput.cpuData != nullptr, rawInput.cudaData != nullptr,
+                rawInput.multiDeviceData,
+                rawInput.IsTensorParallelReplicated(),
                 traceReplicas.size(), mixedActiveTypes);
             fflush(stdout);
         }
@@ -5653,6 +5922,8 @@ namespace fastllm {
         if (mixedActiveTypes) {
             std::unordered_set<int> activeExperts(
                 activeExpertList.begin(), activeExpertList.end());
+            waitForCpuInput();
+            ensureCpuOutput();
             DoNumasMergeMOEOnCPU(
                 input, output, index, score, weights, biass,
                 sharedScale, weightsBatch, topk, activeExperts,
@@ -5675,6 +5946,8 @@ namespace fastllm {
         if (useGroupedDecode) {
             std::unordered_set<int> activeExperts(
                 activeExpertList.begin(), activeExpertList.end());
+            waitForCpuInput();
+            ensureCpuOutput();
             DoNumasMergeMOEOnCPU(
                 input, output, index, score, weights, biass,
                 sharedScale, weightsBatch, topk, activeExperts,
@@ -5685,6 +5958,8 @@ namespace fastllm {
         }
 
         if (input.dims[0] < 32) {
+            waitForCpuInput();
+            ensureCpuOutput();
 // auto st = std::chrono::system_clock::now();
             int32_t *indexData = (int32_t*)index.cpuData;
             float *scoreData = (float*)score.cpuData;
@@ -6587,38 +6862,39 @@ namespace fastllm {
             bool gpuPrefill = moeConfig.GetGpuPrefill();
 #ifdef USE_CUDA
             std::vector<NumasMoeCudaInputReplica> cudaInputReplicas =
-                GetNumasMoeCudaInputReplicas(input);
-            // Supplement missing TP replicas only when the input already owns
-            // at least one valid CUDA mirror.  A CPU-only tensor must not be
-            // promoted to GPU merely because process-global MultiCUDA state
-            // still contains device ids from an earlier op.
+                GetNumasMoeCudaInputReplicas(rawInput);
+            // Supplement missing TP or serial-device-map replicas only when
+            // the input already owns at least one valid CUDA mirror.  A
+            // CPU-only tensor must not be promoted to GPU merely because
+            // process-global CUDA device state still contains ids from an
+            // earlier op.
             if (gpuPrefill && input.cpuData != nullptr &&
                 !cudaInputReplicas.empty()) {
-                std::vector<int> tpDevices;
-                std::map<int, int> tpRatios;
-                FastllmGetMulticudaDeviceAndRatio(
-                    tpDevices, tpRatios, true);
+                const int preferredDevice =
+                    GetNumasMoePreferredCudaDevice(rawInput);
+                std::vector<int> assistDevices =
+                    GetNumasMoeCudaAssistDevices();
                 std::unordered_set<int> presentDevices;
                 for (const auto &replica : cudaInputReplicas) {
                     presentDevices.insert(replica.deviceId);
                 }
-                for (int device : tpDevices) {
+                for (int device : assistDevices) {
                     if (presentDevices.count(device) != 0) {
                         continue;
                     }
+                    waitForCpuInput();
                     Data *staged = fastllmMoeDataManagerNumas.
                         StageGpuInputReplica(input, device);
                     cudaInputReplicas.push_back(
                         {device, staged->cudaData});
                     presentDevices.insert(device);
                 }
-                std::sort(
-                    cudaInputReplicas.begin(),
-                    cudaInputReplicas.end(),
-                    [](const NumasMoeCudaInputReplica &a,
-                       const NumasMoeCudaInputReplica &b) {
-                        return a.deviceId < b.deviceId;
-                    });
+                // The first replica owns the final partial output.  Keep it on
+                // the CUDA device that produced this layer's activation so a
+                // serial layer on cuda:1 does not reduce to cuda:0 and then
+                // immediately copy the result back.
+                SortNumasMoeCudaInputReplicas(
+                    cudaInputReplicas, preferredDevice);
             }
             if (cudaInputReplicas.empty()) {
                 gpuPrefill = false;
@@ -6738,8 +7014,7 @@ namespace fastllm {
                 FastllmCudaSetDevice(gpuId);
                 output.ToDevice(
                     DataDevice::CUDA, std::vector<int>{gpuId}, false);
-                output.ToDevice(
-                    DataDevice::CPU, std::vector<int>{gpuId}, false);
+                output.Allocate(false);
                 AssertInFastLLM(
                     output.cudaData != nullptr &&
                     GetPointerDeviceId(output.cudaData) == gpuId,
@@ -6804,6 +7079,33 @@ namespace fastllm {
                     int workerDevice = cudaInputReplicas[i].deviceId;
                     gpuThreads.emplace_back([&, i, workerDevice]() {
                         FastllmCudaSetDevice(workerDevice);
+                        // RegisterNumas converts source FP8 weights in place
+                        // to their packed representation.  Normalize CUDA
+                        // experts before their first hybrid-prefill use, so a
+                        // later one-token CPU decode cannot change the kernel
+                        // (and output) of an identical prefill.  Do this in
+                        // the existing GPU worker so its one-time packing is
+                        // overlapped with the disjoint CPU expert work.
+                        for (int e : gpuExpertSets[i]) {
+                            Data *gateUpWeight = weights[e * 2];
+                            Data *downWeight = weights[e * 2 + 1];
+                            if (gateUpWeight != nullptr &&
+                                gateUpWeight->dataType ==
+                                    DataType::FP8_E4M3 &&
+                                gateUpWeight->numasData.empty() &&
+                                gateUpWeight->cpuData != nullptr) {
+                                RegisterNumas(
+                                    gateUpWeight, "linearSwiglu");
+                            }
+                            if (downWeight != nullptr &&
+                                downWeight->dataType ==
+                                    DataType::FP8_E4M3 &&
+                                downWeight->numasData.empty() &&
+                                downWeight->cpuData != nullptr) {
+                                RegisterNumas(
+                                    downWeight, "linearColumn");
+                            }
+                        }
                         DoCudaMergeMOEFromCPU(
                             *gpuInputAliases[i], *gpuOutputPartials[i],
                             index, score, w1, w2, w3, weights, biass,
@@ -6814,6 +7116,10 @@ namespace fastllm {
             }
 // printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #endif
+            waitForCpuInput();
+            if (!gpuPrefill || gpuExperts.empty()) {
+                ensureCpuOutput();
+            }
             if (!cpuExperts.empty()) {
 #ifdef USE_CUDA
                 if (gpuPrefill && !gpuExperts.empty()) {

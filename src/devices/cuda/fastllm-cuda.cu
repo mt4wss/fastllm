@@ -1561,6 +1561,15 @@ __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     }
 }
 
+__global__ void FastllmSiluKernel(__nv_bfloat16 *a, __nv_bfloat16 *b,
+                                  int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __bfloat162float(a[idx]);
+        b[idx] = __float2bfloat16_rn(x / (1.0f + expf(-x)));
+    }
+}
+
 __global__ void FastllmSigmoidKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1839,6 +1848,15 @@ __global__ void FastllmMulKernel(half* a, half *b, half v, int len) {
 #else
         b[idx] = __hmul(a[idx], v);
 #endif
+    }
+}
+
+__global__ void FastllmMulKernel(__nv_bfloat16 *a, __nv_bfloat16 *b,
+                                 __nv_bfloat16 v, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __float2bfloat16_rn(
+            __bfloat162float(a[idx]) * __bfloat162float(v));
     }
 }
 
@@ -2709,6 +2727,28 @@ __global__ void FastllmNearlyRotatePosition2DKernel(half *data, float *positionI
     float va = __half2float(d[i * m]), vb = __half2float(d[i * m + 1]);
     d[i * m] = __float2half(va * curCos - vb * curSin);
     d[i * m + 1] = __float2half(va * curSin + vb * curCos);
+}
+
+__global__ void FastllmNearlyRotatePosition2DKernel(__nv_bfloat16 *data, float *positionIds, float *sin, float *cos,
+                                                    int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+    int o = (blockIdx.x / n);
+    int l = o / bs;
+    int b = o % bs;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    __nv_bfloat16 *d = data + o * spatial + j * 2;
+    int i = blockIdx.x % n;
+    float va = __bfloat162float(d[i * m]);
+    float vb = __bfloat162float(d[i * m + 1]);
+    float ac = __bfloat162float(__float2bfloat16_rn(va * curCos));
+    float pairSin = __bfloat162float(__float2bfloat16_rn(vb * curSin));
+    float as = __bfloat162float(__float2bfloat16_rn(va * curSin));
+    float pairCos = __bfloat162float(__float2bfloat16_rn(vb * curCos));
+    d[i * m] = __float2bfloat16_rn(ac - pairSin);
+    d[i * m + 1] = __float2bfloat16_rn(as + pairCos);
 }
 
 __global__ void FastllmRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
@@ -5835,6 +5875,9 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
         FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            (__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -6094,8 +6137,12 @@ bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) 
 
     if (input.dataType == fastllm::DataType::FLOAT32) {
         FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, v, len);
-    } else {
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, __float2half_rn(v), len);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(
+            (__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput,
+            __float2bfloat16_rn(v), len);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -11801,6 +11848,10 @@ bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data 
         FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                     len, bs, spatial, n, m,
                                                                                     positionStride, (int)sinData.dims[1], rotaryDim);
+    } else if (data.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((__nv_bfloat16*)cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                    len, bs, spatial, n, m,
+                                                                                    positionStride, (int)sinData.dims[1], rotaryDim);
     }
 
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
@@ -13541,6 +13592,1123 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     return true;
 }
 
+__global__ void FastllmDFlashScatterDraftProbsKernel(
+        float *draftProbs, const int *candidateIds,
+        const float *candidateProbs, int rows, int topK,
+        int vocabSize) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * topK;
+    if (index >= total) {
+        return;
+    }
+    int row = index / topK;
+    int token = candidateIds[index];
+    if (token >= 0 && token < vocabSize) {
+        draftProbs[(long long)row * vocabSize + token] =
+            candidateProbs[index];
+    }
+}
+
+__global__ void FastllmDFlashDynamicConvBf16Kernel(
+        const __nv_bfloat16 *__restrict__ source,
+        const __nv_bfloat16 *__restrict__ dynamicProjection,
+        const __nv_bfloat16 *__restrict__ baseKernel,
+        __nv_bfloat16 *__restrict__ output,
+        int side, int blockSize, int hiddenSize,
+        int groupSize, int kernelSize) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = blockSize * hiddenSize;
+    if (index >= total) {
+        return;
+    }
+
+    int token = index / hiddenSize;
+    int channel = index - token * hiddenSize;
+    int group = channel / groupSize;
+    int groups = hiddenSize / groupSize;
+    __nv_bfloat16 accumulated = __float2bfloat16_rn(0.0f);
+    for (int tap = 0; tap < kernelSize && tap <= token; tap++) {
+        size_t dynamicIndex =
+            (((size_t)token * 2 + side) * kernelSize + tap) * groups + group;
+        size_t baseIndex =
+            ((size_t)side * kernelSize + tap) * hiddenSize + channel;
+        __nv_bfloat16 coefficient = __float2bfloat16_rn(
+            __bfloat162float(dynamicProjection[dynamicIndex]) +
+            __bfloat162float(baseKernel[baseIndex]));
+        __nv_bfloat16 product = __float2bfloat16_rn(
+            __bfloat162float(source[(token - tap) * hiddenSize + channel]) *
+            __bfloat162float(coefficient));
+        if (tap == 0) {
+            accumulated = product;
+        } else {
+            accumulated = __float2bfloat16_rn(
+                __bfloat162float(accumulated) + __bfloat162float(product));
+        }
+    }
+    output[index] = accumulated;
+}
+
+bool FastllmCudaDFlashDynamicConv(
+        const fastllm::Data &source,
+        const fastllm::Data &dynamicProjection,
+        const fastllm::Data &baseKernel,
+        fastllm::Data &output,
+        int side, int blockSize, int hiddenSize,
+        int groupSize, int kernelSize) {
+    if (side < 0 || side >= 2 || blockSize <= 0 || hiddenSize <= 0 ||
+        groupSize <= 0 || kernelSize <= 0 ||
+        hiddenSize % groupSize != 0 ||
+        source.dataType != fastllm::DataType::BFLOAT16 ||
+        dynamicProjection.dataType != fastllm::DataType::BFLOAT16 ||
+        baseKernel.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        source.Count(0) != (uint64_t)blockSize * hiddenSize ||
+        dynamicProjection.Count(0) !=
+            (uint64_t)blockSize * 2 * kernelSize *
+                (hiddenSize / groupSize) ||
+        baseKernel.Count(0) !=
+            (uint64_t)2 * kernelSize * hiddenSize ||
+        output.Count(0) != (uint64_t)blockSize * hiddenSize ||
+        !FastllmCudaDataHasDenseStrides(source) ||
+        !FastllmCudaDataHasDenseStrides(dynamicProjection) ||
+        !FastllmCudaDataHasDenseStrides(baseKernel) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(source, dynamicProjection) ||
+        !FastllmCudaDataCanShareDevice(source, baseKernel) ||
+        !FastllmCudaDataCanShareDevice(source, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(source, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    const int total = blockSize * hiddenSize;
+    FastllmDFlashDynamicConvBf16Kernel<<<
+        (total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)source.cudaData,
+            (const __nv_bfloat16 *)dynamicProjection.cudaData,
+            (const __nv_bfloat16 *)baseKernel.cudaData,
+            (__nv_bfloat16 *)output.cudaData,
+            side, blockSize, hiddenSize, groupSize, kernelSize);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmDFlashPrepareQkvBf16Kernel(
+        const __nv_bfloat16 *__restrict__ qkv,
+        const float *__restrict__ qNormWeight,
+        const float *__restrict__ kNormWeight,
+        const float *__restrict__ positionIds,
+        const float *__restrict__ sinData,
+        const float *__restrict__ cosData,
+        half *__restrict__ query,
+        half *__restrict__ key,
+        half *__restrict__ value,
+        int tokens, int projectionStride, int queryHeads,
+        int kvHeads, int headDim, int sinCosStride, float eps) {
+    const int outputHead = blockIdx.x / tokens;
+    const int token = blockIdx.x % tokens;
+    int kind;
+    int head;
+    if (outputHead < queryHeads) {
+        kind = 0;
+        head = outputHead;
+    } else if (outputHead < queryHeads + kvHeads) {
+        kind = 1;
+        head = outputHead - queryHeads;
+    } else {
+        kind = 2;
+        head = outputHead - queryHeads - kvHeads;
+    }
+
+    const int sourceHead = kind == 0 ? head :
+        (kind == 1 ? queryHeads + head : queryHeads + kvHeads + head);
+    const __nv_bfloat16 *source = qkv +
+        (size_t)token * projectionStride + (size_t)sourceHead * headDim;
+    half *destination = (kind == 0 ? query : (kind == 1 ? key : value)) +
+        (size_t)(head * tokens + token) * headDim;
+    const int tid = threadIdx.x;
+
+    if (kind == 2) {
+        for (int channel = tid; channel < headDim; channel += blockDim.x) {
+            destination[channel] = __float2half_rz(
+                __bfloat162float(source[channel]));
+        }
+        return;
+    }
+
+    __shared__ float warpSums[2];
+    __shared__ float scale;
+    __shared__ __nv_bfloat16 normalized[128];
+    const __nv_bfloat162 *source2 =
+        reinterpret_cast<const __nv_bfloat162 *>(source);
+    float sum2 = 0.0f;
+    for (int channel = tid; channel < headDim / 2;
+         channel += blockDim.x) {
+        __nv_bfloat162 pair = source2[channel];
+        const float low = __bfloat162float(pair.x);
+        const float high = __bfloat162float(pair.y);
+        sum2 += low * low + high * high;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) {
+        warpSums[warp] = sum2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum = lane < 2 ? warpSums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(sum / headDim + eps);
+        }
+    }
+    __syncthreads();
+
+    const float *normWeight = kind == 0 ? qNormWeight : kNormWeight;
+    for (int channel = tid; channel < headDim / 2;
+         channel += blockDim.x) {
+        __nv_bfloat162 pair = source2[channel];
+        normalized[channel * 2] = __float2bfloat16_rn(
+            __bfloat162float(pair.x) * scale *
+                __ldg(normWeight + channel * 2));
+        normalized[channel * 2 + 1] = __float2bfloat16_rn(
+            __bfloat162float(pair.y) * scale *
+                __ldg(normWeight + channel * 2 + 1));
+    }
+    __syncthreads();
+
+    const int halfHeadDim = headDim / 2;
+    if (tid < halfHeadDim) {
+        const int position = (int)positionIds[token];
+        const float sine = sinData[(size_t)position * sinCosStride + tid];
+        const float cosine =
+            cosData[(size_t)position * sinCosStride + tid];
+        const float first = __bfloat162float(normalized[tid]);
+        const float second =
+            __bfloat162float(normalized[tid + halfHeadDim]);
+        const __nv_bfloat16 rotatedFirst = __float2bfloat16_rn(
+            first * cosine - second * sine);
+        const __nv_bfloat16 rotatedSecond = __float2bfloat16_rn(
+            first * sine + second * cosine);
+        destination[tid] = __float2half_rz(
+            __bfloat162float(rotatedFirst));
+        destination[tid + halfHeadDim] = __float2half_rz(
+            __bfloat162float(rotatedSecond));
+    }
+}
+
+bool FastllmCudaDFlashPrepareQKV(
+        const fastllm::Data &qkv,
+        const fastllm::Data &qNormWeight,
+        const fastllm::Data &kNormWeight,
+        const fastllm::Data &positionIds,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        fastllm::Data &query,
+        fastllm::Data &key,
+        fastllm::Data &value,
+        int tokens, int queryHeads, int kvHeads, int headDim, float eps) {
+    if (tokens <= 0 || queryHeads <= 0 || kvHeads <= 0 || headDim != 128 ||
+        qkv.dataType != fastllm::DataType::BFLOAT16 ||
+        qNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        kNormWeight.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        sinData.dataType != fastllm::DataType::FLOAT32 ||
+        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        query.dataType != fastllm::DataType::FLOAT16 ||
+        key.dataType != fastllm::DataType::FLOAT16 ||
+        value.dataType != fastllm::DataType::FLOAT16 ||
+        qkv.dims != std::vector<int>({1, tokens,
+            (queryHeads + 2 * kvHeads) * headDim}) ||
+        qNormWeight.dims != std::vector<int>({headDim}) ||
+        kNormWeight.dims != std::vector<int>({headDim}) ||
+        positionIds.dims != std::vector<int>({1, tokens}) ||
+        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
+        sinData.dims[1] < headDim ||
+        query.dims != std::vector<int>({queryHeads, tokens, headDim}) ||
+        key.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
+        value.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
+        !FastllmCudaDataHasDenseStrides(qkv) ||
+        !FastllmCudaDataHasDenseStrides(qNormWeight) ||
+        !FastllmCudaDataHasDenseStrides(kNormWeight) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(sinData) ||
+        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(query) ||
+        !FastllmCudaDataHasDenseStrides(key) ||
+        !FastllmCudaDataHasDenseStrides(value) ||
+        !FastllmCudaDataCanShareDevice(qkv, qNormWeight) ||
+        !FastllmCudaDataCanShareDevice(qkv, kNormWeight) ||
+        !FastllmCudaDataCanShareDevice(qkv, positionIds) ||
+        !FastllmCudaDataCanShareDevice(qkv, sinData) ||
+        !FastllmCudaDataCanShareDevice(qkv, cosData) ||
+        !FastllmCudaDataCanShareDevice(qkv, query) ||
+        !FastllmCudaDataCanShareDevice(qkv, key) ||
+        !FastllmCudaDataCanShareDevice(qkv, value)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(qkv, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    const int blocks = tokens * (queryHeads + 2 * kvHeads);
+    FastllmDFlashPrepareQkvBf16Kernel<<<
+        blocks, 64, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)qkv.cudaData,
+            (const float *)qNormWeight.cudaData,
+            (const float *)kNormWeight.cudaData,
+            (const float *)positionIds.cudaData,
+            (const float *)sinData.cudaData,
+            (const float *)cosData.cudaData,
+            (half *)query.cudaData, (half *)key.cudaData,
+            (half *)value.cudaData,
+            tokens, qkv.dims[2], queryHeads, kvHeads, headDim,
+            sinData.dims[1], eps);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmDFlashPrepareGateupBf16Kernel(
+        const __nv_bfloat16 *__restrict__ gateup,
+        __nv_bfloat16 *__restrict__ output,
+        int tokens, int intermediateSize) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = tokens * intermediateSize;
+    if (index >= total) {
+        return;
+    }
+
+    int token = index / intermediateSize;
+    int channel = index - token * intermediateSize;
+    const __nv_bfloat16 *row = gateup +
+        (size_t)token * 2 * intermediateSize;
+    half gate = __float2half_rz(__bfloat162float(row[channel]));
+    half up = __float2half_rz(
+        __bfloat162float(row[intermediateSize + channel]));
+#ifdef CUDA_NO_TENSOR_CORE
+    float gateFloat = __half2float(gate);
+    gate = __float2half(gateFloat / (1.0 + expf(-gateFloat)));
+    gate = __float2half(
+        __half2float(up) * 1.0f * __half2float(gate));
+#else
+    gate = __hdiv(gate, __hadd(__float2half(1.0), hexp(-gate)));
+    gate *= (half)((float)up * 1.0f);
+#endif
+    output[index] = __float2bfloat16_rn(__half2float(gate));
+}
+
+bool FastllmCudaDFlashPrepareGateup(
+        const fastllm::Data &gateup,
+        fastllm::Data &output,
+        int tokens, int intermediateSize) {
+    if (tokens <= 0 || intermediateSize <= 0 ||
+        gateup.dataType != fastllm::DataType::BFLOAT16 ||
+        output.dataType != fastllm::DataType::BFLOAT16 ||
+        gateup.dims !=
+            std::vector<int>({1, tokens, 2 * intermediateSize}) ||
+        output.dims !=
+            std::vector<int>({1, tokens, intermediateSize}) ||
+        !FastllmCudaDataHasDenseStrides(gateup) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(gateup, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(gateup, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    int total = tokens * intermediateSize;
+    FastllmDFlashPrepareGateupBf16Kernel<<<
+        (total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)gateup.cudaData,
+            (__nv_bfloat16 *)output.cudaData,
+            tokens, intermediateSize);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+struct FastllmDFlashKvCacheOutput {
+    half *pointers[10];
+    size_t headStride;
+    int tokenOffset;
+};
+
+__global__ void FastllmDFlashMaterializeKvBf16Kernel(
+        const __nv_bfloat16 *__restrict__ projectedKv,
+        const float *__restrict__ kNormWeights,
+        const float *__restrict__ positionIds,
+        const float *__restrict__ sinData,
+        const float *__restrict__ cosData,
+        half *__restrict__ output,
+        FastllmDFlashKvCacheOutput cacheOutput,
+        int tokens, int projectionStride, int kvHeads,
+        int headDim, int sinCosStride, float eps) {
+    int item = blockIdx.x;
+    int kind = item & 1;
+    item >>= 1;
+    int head = item % kvHeads;
+    item /= kvHeads;
+    int token = item % tokens;
+    int layer = item / tokens;
+
+    const int sourceChannel =
+        ((layer * 2 + kind) * kvHeads + head) * headDim;
+    const __nv_bfloat16 *source =
+        projectedKv + (size_t)token * projectionStride + sourceChannel;
+    half *destination;
+    if (output != nullptr) {
+        destination = output +
+            (size_t)(((layer * 2 + kind) * kvHeads + head) * tokens +
+                     token) * headDim;
+    } else {
+        destination = cacheOutput.pointers[layer * 2 + kind] +
+            (size_t)head * cacheOutput.headStride +
+            (size_t)(cacheOutput.tokenOffset + token) * headDim;
+    }
+    const int tid = threadIdx.x;
+
+    if (kind != 0) {
+        for (int channel = tid; channel < headDim; channel += blockDim.x) {
+            destination[channel] = __float2half_rz(
+                __bfloat162float(source[channel]));
+        }
+        return;
+    }
+
+    __shared__ float warpSums[2];
+    __shared__ float scale;
+    __shared__ __nv_bfloat16 normalized[128];
+    const __nv_bfloat162 *source2 =
+        reinterpret_cast<const __nv_bfloat162 *>(source);
+    float sum2 = 0.0f;
+    for (int channel = tid; channel < headDim / 2;
+         channel += blockDim.x) {
+        __nv_bfloat162 value = source2[channel];
+        float low = __bfloat162float(value.x);
+        float high = __bfloat162float(value.y);
+        sum2 += low * low + high * high;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) {
+        warpSums[warp] = sum2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < 2 ? warpSums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffff, value, offset);
+        }
+        if (lane == 0) {
+            scale = rsqrtf(value / headDim + eps);
+        }
+    }
+    __syncthreads();
+
+    const float *normWeight = kNormWeights + (size_t)layer * headDim;
+    for (int channel = tid; channel < headDim / 2;
+         channel += blockDim.x) {
+        __nv_bfloat162 value = source2[channel];
+        float low = __bfloat162float(value.x);
+        float high = __bfloat162float(value.y);
+        normalized[channel * 2] = __float2bfloat16_rn(
+            low * scale * __ldg(normWeight + channel * 2));
+        normalized[channel * 2 + 1] = __float2bfloat16_rn(
+            high * scale * __ldg(normWeight + channel * 2 + 1));
+    }
+    __syncthreads();
+
+    const int halfHeadDim = headDim / 2;
+    if (tid < halfHeadDim) {
+        const int position = (int)positionIds[token];
+        const float sine = sinData[(size_t)position * sinCosStride + tid];
+        const float cosine = cosData[(size_t)position * sinCosStride + tid];
+        const float first = __bfloat162float(normalized[tid]);
+        const float second =
+            __bfloat162float(normalized[tid + halfHeadDim]);
+        const __nv_bfloat16 rotatedFirst = __float2bfloat16_rn(
+            first * cosine - second * sine);
+        const __nv_bfloat16 rotatedSecond = __float2bfloat16_rn(
+            first * sine + second * cosine);
+        destination[tid] = __float2half_rz(
+            __bfloat162float(rotatedFirst));
+        destination[tid + halfHeadDim] = __float2half_rz(
+            __bfloat162float(rotatedSecond));
+    }
+}
+
+bool FastllmCudaDFlashMaterializeKV(
+        const fastllm::Data &projectedKv,
+        const fastllm::Data &kNormWeights,
+        const fastllm::Data &positionIds,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        fastllm::Data &output,
+        int layers, int tokens, int kvHeads, int headDim, float eps) {
+    if (layers <= 0 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
+        projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
+        kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        sinData.dataType != fastllm::DataType::FLOAT32 ||
+        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        output.dataType != fastllm::DataType::FLOAT16 ||
+        projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
+        projectedKv.dims[1] < tokens ||
+        projectedKv.dims[2] != layers * 2 * kvHeads * headDim ||
+        kNormWeights.dims != std::vector<int>({layers, headDim}) ||
+        positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
+        positionIds.dims[1] < tokens ||
+        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
+        sinData.dims[1] < headDim ||
+        output.dims !=
+            std::vector<int>({layers, 2, kvHeads, tokens, headDim}) ||
+        !FastllmCudaDataHasDenseStrides(projectedKv) ||
+        !FastllmCudaDataHasDenseStrides(kNormWeights) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(sinData) ||
+        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, cosData) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(projectedKv, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    const int blocks = layers * tokens * kvHeads * 2;
+    FastllmDFlashKvCacheOutput cacheOutput = {};
+    FastllmDFlashMaterializeKvBf16Kernel<<<
+        blocks, 64, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)projectedKv.cudaData,
+            (const float *)kNormWeights.cudaData,
+            (const float *)positionIds.cudaData,
+            (const float *)sinData.cudaData,
+            (const float *)cosData.cudaData,
+            (half *)output.cudaData, cacheOutput,
+            tokens, projectedKv.dims[2], kvHeads, headDim,
+            sinData.dims[1], eps);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaDFlashMaterializeKVToCache(
+        const fastllm::Data &projectedKv,
+        const fastllm::Data &kNormWeights,
+        const fastllm::Data &positionIds,
+        const fastllm::Data &sinData,
+        const fastllm::Data &cosData,
+        const std::vector<fastllm::Data*> &caches,
+        int layers, int tokens, int kvHeads, int headDim, float eps) {
+    if (layers != 5 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
+        caches.size() != (size_t)layers * 2 ||
+        projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
+        kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        sinData.dataType != fastllm::DataType::FLOAT32 ||
+        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
+        projectedKv.dims[1] < tokens ||
+        projectedKv.dims[2] != layers * 2 * kvHeads * headDim ||
+        kNormWeights.dims != std::vector<int>({layers, headDim}) ||
+        positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
+        positionIds.dims[1] < tokens ||
+        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
+        sinData.dims[1] < headDim ||
+        !FastllmCudaDataHasDenseStrides(projectedKv) ||
+        !FastllmCudaDataHasDenseStrides(kNormWeights) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(sinData) ||
+        !FastllmCudaDataHasDenseStrides(cosData)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(projectedKv, device) ||
+        FastllmCudaGetDevice() != device ||
+        !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, cosData)) {
+        return false;
+    }
+
+    FastllmDFlashKvCacheOutput cacheOutput = {};
+    int cacheTokens = -1;
+    for (size_t index = 0; index < caches.size(); index++) {
+        const fastllm::Data *cache = caches[index];
+        const int currentTokens =
+            cache != nullptr && cache->dims.size() == 3 ?
+                cache->dims[1] : 0;
+        if (cache == nullptr ||
+            cache->dataType != fastllm::DataType::FLOAT16 ||
+            cache->dataDevice != fastllm::DataDevice::CUDA ||
+            cache->cudaData == nullptr ||
+            (!cache->dims.empty() &&
+             (cache->dims.size() != 3 ||
+              cache->dims != std::vector<int>({kvHeads, currentTokens,
+                                                headDim}))) ||
+            cache->expansionDims.size() != 3 ||
+            cache->expansionDims[0] != kvHeads ||
+            cache->expansionDims[1] < currentTokens + tokens ||
+            cache->expansionDims[2] != headDim ||
+            cache->strides.size() != 3 || cache->strides[2] != 1 ||
+            cache->strides[1] != (uint64_t)headDim ||
+            cache->strides[0] !=
+                (uint64_t)cache->expansionDims[1] * headDim ||
+            !FastllmCudaDataCanShareDevice(projectedKv, *cache) ||
+            (cacheTokens >= 0 && currentTokens != cacheTokens) ||
+            (index > 0 && cache->strides[0] != cacheOutput.headStride)) {
+            return false;
+        }
+        cacheTokens = currentTokens;
+        cacheOutput.pointers[index] = (half *)cache->cudaData;
+        cacheOutput.headStride = cache->strides[0];
+    }
+    cacheOutput.tokenOffset = cacheTokens;
+
+    const int blocks = layers * tokens * kvHeads * 2;
+    FastllmDFlashMaterializeKvBf16Kernel<<<
+        blocks, 64, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)projectedKv.cudaData,
+            (const float *)kNormWeights.cudaData,
+            (const float *)positionIds.cudaData,
+            (const float *)sinData.cudaData,
+            (const float *)cosData.cudaData,
+            nullptr, cacheOutput,
+            tokens, projectedKv.dims[2], kvHeads, headDim,
+            sinData.dims[1], eps);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+struct FastllmDFlashKvCacheView {
+    half *pointers[10];
+    size_t headStrides[10];
+};
+
+__global__ void FastllmDFlashGatherKvCacheTailKernel(
+        FastllmDFlashKvCacheView caches, uint4 *__restrict__ scratch,
+        int heads, int oldTokens, int keepTokens) {
+    constexpr int vectorsPerToken = 16;
+    int item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= keepTokens * vectorsPerToken) {
+        return;
+    }
+    int vectorInToken = item & (vectorsPerToken - 1);
+    int token = item >> 4;
+    int head = blockIdx.y;
+    int cache = blockIdx.z;
+    size_t scratchIndex =
+        ((size_t)(cache * heads + head) * keepTokens + token) *
+            vectorsPerToken + vectorInToken;
+    const half *source = caches.pointers[cache] +
+        (size_t)head * caches.headStrides[cache] +
+        (size_t)(oldTokens - keepTokens + token) *
+            vectorsPerToken * 8;
+    scratch[scratchIndex] =
+        reinterpret_cast<const uint4 *>(source)[vectorInToken];
+}
+
+__global__ void FastllmDFlashScatterKvCacheTailKernel(
+        const uint4 *__restrict__ scratch, FastllmDFlashKvCacheView caches,
+        int heads, int keepTokens) {
+    constexpr int vectorsPerToken = 16;
+    int item = blockIdx.x * blockDim.x + threadIdx.x;
+    if (item >= keepTokens * vectorsPerToken) {
+        return;
+    }
+    int vectorInToken = item & (vectorsPerToken - 1);
+    int token = item >> 4;
+    int head = blockIdx.y;
+    int cache = blockIdx.z;
+    size_t scratchIndex =
+        ((size_t)(cache * heads + head) * keepTokens + token) *
+            vectorsPerToken + vectorInToken;
+    half *destination = caches.pointers[cache] +
+        (size_t)head * caches.headStrides[cache] +
+        (size_t)token * vectorsPerToken * 8;
+    reinterpret_cast<uint4 *>(destination)[vectorInToken] =
+        scratch[scratchIndex];
+}
+
+bool FastllmCudaDFlashCompactKVCache(
+        const std::vector<fastllm::Data*> &caches, int keepTokens) {
+    if (caches.empty() || caches.size() > 10 || keepTokens <= 0) {
+        return false;
+    }
+    const fastllm::Data *reference = caches[0];
+    int device = -1;
+    if (reference == nullptr ||
+        !FastllmCudaResolveDataDeviceId(*reference, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    FastllmDFlashKvCacheView cacheView = {};
+    int oldTokens = -1;
+    int heads = -1;
+    int headDim = -1;
+    for (size_t index = 0; index < caches.size(); index++) {
+        const fastllm::Data *cache = caches[index];
+        if (cache == nullptr || cache->dataType != fastllm::DataType::FLOAT16 ||
+            cache->dataDevice != fastllm::DataDevice::CUDA ||
+            cache->cudaData == nullptr || cache->dims.size() != 3 ||
+            cache->dims[1] <= keepTokens || cache->dims[2] != 128 ||
+            cache->expansionDims.size() != 3 ||
+            cache->expansionDims[0] != cache->dims[0] ||
+            cache->expansionDims[1] < cache->dims[1] ||
+            cache->expansionDims[2] != cache->dims[2] ||
+            cache->strides.size() != 3 || cache->strides[2] != 1 ||
+            cache->strides[1] != (uint64_t)cache->dims[2] ||
+            cache->strides[0] !=
+                (uint64_t)cache->expansionDims[1] * cache->dims[2] ||
+            !FastllmCudaDataCanShareDevice(*reference, *cache) ||
+            (oldTokens >= 0 && cache->dims[1] != oldTokens) ||
+            (heads >= 0 && cache->dims[0] != heads) ||
+            (headDim >= 0 && cache->dims[2] != headDim)) {
+            return false;
+        }
+        oldTokens = cache->dims[1];
+        heads = cache->dims[0];
+        headDim = cache->dims[2];
+        cacheView.pointers[index] = (half *)cache->cudaData;
+        cacheView.headStrides[index] = cache->strides[0];
+    }
+
+    constexpr int vectorsPerToken = 16;
+    const size_t vectors = caches.size() * (size_t)heads * keepTokens *
+        vectorsPerToken;
+    const size_t scratchBytes = vectors * sizeof(uint4);
+    size_t availableBytes = 0;
+    bool scratchOwn = false;
+    void *scratch = FastllmBorrowCudaTempBuffer(
+        scratchBytes, &availableBytes, &scratchOwn);
+    if (scratch == nullptr || availableBytes < scratchBytes) {
+        FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+        return false;
+    }
+
+    const int threads = 256;
+    dim3 blocks((keepTokens * vectorsPerToken + threads - 1) / threads,
+                heads, caches.size());
+    FastllmDFlashGatherKvCacheTailKernel<<<
+        blocks, threads, 0, cudaStreamPerThread>>>(
+            cacheView, (uint4 *)scratch, heads, oldTokens, keepTokens);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state == cudaSuccess) {
+        FastllmDFlashScatterKvCacheTailKernel<<<
+            blocks, threads, 0, cudaStreamPerThread>>>(
+                (const uint4 *)scratch, cacheView, heads, keepTokens);
+        state = cudaPeekAtLastError();
+    }
+    FastllmReleaseCudaTempBuffer(scratch, scratchOwn);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+size_t FastllmCudaDFlashTopKScratchBytes(int rows) {
+    if (rows <= 0) {
+        return 0;
+    }
+    return (size_t)rows *
+        (sizeof(flashinfer::sampling::RadixRowState) +
+         sizeof(flashinfer::sampling::RadixDeterministicCollectScratch));
+}
+
+__global__ void FastllmDFlashOffsetTopKIdsKernel(
+        int *ids, int count, int globalIdOffset) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        ids[index] += globalIdOffset;
+    }
+}
+
+bool FastllmCudaDFlashTopK(
+        const fastllm::Data &logits,
+        fastllm::Data &packedCandidates,
+        fastllm::Data &scratch,
+        int topk, int globalIdOffset) {
+    if (logits.dims.empty() || topk <= 0 || topk > 50 ||
+        globalIdOffset < 0 ||
+        logits.dataType != fastllm::DataType::FLOAT32 ||
+        packedCandidates.dataType != fastllm::DataType::INT32 ||
+        scratch.dataType != fastllm::DataType::INT8 ||
+        !FastllmCudaDataHasDenseStrides(logits) ||
+        !FastllmCudaDataHasDenseStrides(packedCandidates) ||
+        !FastllmCudaDataHasDenseStrides(scratch) ||
+        !FastllmCudaDataCanShareDevice(logits, packedCandidates) ||
+        !FastllmCudaDataCanShareDevice(logits, scratch)) {
+        return false;
+    }
+    const int channels = logits.dims.back();
+    const int rows = channels > 0 ?
+        (int)(logits.Count(0) / (uint64_t)channels) : 0;
+    const size_t scratchBytes = FastllmCudaDFlashTopKScratchBytes(rows);
+    if (rows <= 0 || topk > channels ||
+        packedCandidates.Count(0) != (uint64_t)rows * topk * 2 ||
+        scratch.Count(0) < scratchBytes) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(logits, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+
+    int *candidateIds = (int*)packedCandidates.cudaData;
+    float *candidateScores = (float*)(candidateIds + (size_t)rows * topk);
+    auto *rowStates =
+        (flashinfer::sampling::RadixRowState*)scratch.cudaData;
+    cudaError_t state = cudaMemsetAsync(
+        scratch.cudaData, 0, scratchBytes, cudaStreamPerThread);
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::TopKDispatch<float, int>(
+            (float*)logits.cudaData, candidateIds, candidateScores,
+            (uint32_t)rows, (uint32_t)topk, (uint32_t)channels,
+            rowStates, true, true,
+            flashinfer::sampling::TopKTieBreak::None,
+            cudaStreamPerThread);
+    }
+    if (state == cudaSuccess && globalIdOffset != 0) {
+        const int count = rows * topk;
+        FastllmDFlashOffsetTopKIdsKernel<<<
+            (count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                candidateIds, count, globalIdOffset);
+        state = cudaPeekAtLastError();
+    }
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmDFlashMergeTopKKernel(
+        const int *packedCandidates, float *output,
+        int ranks, int localRows, int firstRow,
+        int outputRows, int topk) {
+    int outputRow = blockIdx.x;
+    if (outputRow >= outputRows || threadIdx.x != 0) {
+        return;
+    }
+
+    constexpr int MAX_TOPK = 50;
+    float bestScores[MAX_TOPK];
+    int bestIds[MAX_TOPK];
+    for (int i = 0; i < topk; i++) {
+        bestScores[i] = -1.0e30f;
+        bestIds[i] = 0x7fffffff;
+    }
+    int sourceRow = firstRow + outputRow;
+    size_t rankStride = (size_t)localRows * topk * 2;
+    size_t planeSize = (size_t)localRows * topk;
+    for (int rank = 0; rank < ranks; rank++) {
+        const int *rankBase = packedCandidates + (size_t)rank * rankStride;
+        const int *rankIds = rankBase;
+        const float *rankScores = (const float*)(rankBase + planeSize);
+        for (int candidate = 0; candidate < topk; candidate++) {
+            size_t offset = (size_t)sourceRow * topk + candidate;
+            int id = rankIds[offset];
+            float score = rankScores[offset];
+            for (int position = 0; position < topk; position++) {
+                if (score > bestScores[position] ||
+                    (score == bestScores[position] &&
+                     id < bestIds[position])) {
+                    for (int move = topk - 1; move > position; move--) {
+                        bestScores[move] = bestScores[move - 1];
+                        bestIds[move] = bestIds[move - 1];
+                    }
+                    bestScores[position] = score;
+                    bestIds[position] = id;
+                    break;
+                }
+            }
+        }
+    }
+    float *rowOutput = output + (size_t)outputRow * topk * 2;
+    for (int candidate = 0; candidate < topk; candidate++) {
+        rowOutput[candidate * 2] = (float)bestIds[candidate];
+        rowOutput[candidate * 2 + 1] = bestScores[candidate];
+    }
+}
+
+bool FastllmCudaDFlashMergeTopK(
+        const fastllm::Data &packedCandidates,
+        fastllm::Data &output,
+        int ranks, int localRows,
+        int firstRow, int outputRows,
+        int topk) {
+    if (ranks <= 0 || localRows <= 0 || firstRow < 0 ||
+        outputRows <= 0 || firstRow + outputRows > localRows ||
+        topk <= 0 || topk > 50 ||
+        packedCandidates.dataType != fastllm::DataType::INT32 ||
+        output.dataType != fastllm::DataType::FLOAT32 ||
+        packedCandidates.Count(0) !=
+            (uint64_t)ranks * localRows * topk * 2 ||
+        output.Count(0) != (uint64_t)outputRows * topk * 2 ||
+        !FastllmCudaDataHasDenseStrides(packedCandidates) ||
+        !FastllmCudaDataHasDenseStrides(output) ||
+        !FastllmCudaDataCanShareDevice(packedCandidates, output)) {
+        return false;
+    }
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(packedCandidates, device) ||
+        FastllmCudaGetDevice() != device) {
+        return false;
+    }
+    FastllmDFlashMergeTopKKernel<<<
+        outputRows, 32, 0, cudaStreamPerThread>>>(
+            (const int*)packedCandidates.cudaData,
+            (float*)output.cudaData,
+            ranks, localRows, firstRow, outputRows, topk);
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool FastllmCudaDFlashRejectionSampling(
+                                  float *logits,
+                                  const float *temperatures,
+                                  const int *topKArr,
+                                  const float *topPArr,
+                                  const int *draftTokenIds,
+                                  const int *draftCandidateIds,
+                                  const float *draftCandidateProbs,
+                                  int *outputTokenIds,
+                                  int *acceptedDraftTokens,
+                                  int batch, int draftTokens,
+                                  int selectorTopK, int vocabSize) {
+    if (logits == nullptr || temperatures == nullptr ||
+        topKArr == nullptr || topPArr == nullptr ||
+        draftTokenIds == nullptr || draftCandidateIds == nullptr ||
+        draftCandidateProbs == nullptr || outputTokenIds == nullptr ||
+        acceptedDraftTokens == nullptr || batch <= 0 ||
+        draftTokens <= 0 || selectorTopK <= 0 || vocabSize <= 0) {
+        return false;
+    }
+
+    const int targetRows = batch * (draftTokens + 1);
+    const int draftRows = batch * draftTokens;
+    const size_t targetProbBytes =
+        (size_t)targetRows * vocabSize * sizeof(float);
+    const size_t draftProbBytes =
+        (size_t)draftRows * vocabSize * sizeof(float);
+    const size_t rowStateBytes =
+        (size_t)targetRows *
+        sizeof(flashinfer::sampling::RadixRowState);
+    const size_t temperaturesBytes =
+        (size_t)targetRows * sizeof(float);
+    const size_t topKBytes = (size_t)targetRows * sizeof(int);
+    const size_t topPBytes = (size_t)targetRows * sizeof(float);
+    const size_t draftTokenBytes =
+        (size_t)draftRows * sizeof(int);
+    const size_t candidateIdBytes =
+        (size_t)draftRows * selectorTopK * sizeof(int);
+    const size_t candidateProbBytes =
+        (size_t)draftRows * selectorTopK * sizeof(float);
+    const size_t outputBytes =
+        (size_t)targetRows * sizeof(int);
+    const size_t countBytes = (size_t)batch * sizeof(int);
+
+    size_t scratchNeed = 0;
+    auto reserveAligned = [&](size_t bytes) {
+        size_t offset = scratchNeed;
+        scratchNeed += FastllmCudaAlignBytes(bytes, 256);
+        return offset;
+    };
+    size_t targetAOffset = reserveAligned(targetProbBytes);
+    size_t targetBOffset = reserveAligned(targetProbBytes);
+    size_t draftProbsOffset = reserveAligned(draftProbBytes);
+    size_t rowStatesOffset = reserveAligned(rowStateBytes);
+    size_t temperaturesOffset = reserveAligned(temperaturesBytes);
+    size_t topKOffset = reserveAligned(topKBytes);
+    size_t topPOffset = reserveAligned(topPBytes);
+    size_t draftTokensOffset = reserveAligned(draftTokenBytes);
+    size_t candidateIdsOffset = reserveAligned(candidateIdBytes);
+    size_t candidateProbsOffset = reserveAligned(candidateProbBytes);
+    size_t outputOffset = reserveAligned(outputBytes);
+    size_t acceptedOffset = reserveAligned(countBytes);
+    size_t emittedOffset = reserveAligned(countBytes);
+
+    size_t scratchBytes = 0;
+    bool scratchOwn = false;
+    uint8_t *scratch = (uint8_t*)FastllmBorrowDequantScratch(
+        scratchNeed, &scratchBytes, &scratchOwn);
+    if (scratch == nullptr || scratchBytes < scratchNeed) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaDFlashRejectionSampling: failed to borrow CUDA temp buffer.\n");
+        fflush(stdout);
+        return false;
+    }
+
+    float *targetA = (float*)(scratch + targetAOffset);
+    float *targetB = (float*)(scratch + targetBOffset);
+    float *draftProbs = (float*)(scratch + draftProbsOffset);
+    auto *rowStates =
+        (flashinfer::sampling::RadixRowState*)(scratch + rowStatesOffset);
+    float *cudaTemperatures = (float*)(scratch + temperaturesOffset);
+    int *cudaTopKs = (int*)(scratch + topKOffset);
+    float *cudaTopPs = (float*)(scratch + topPOffset);
+    int *cudaDraftTokens = (int*)(scratch + draftTokensOffset);
+    int *cudaCandidateIds = (int*)(scratch + candidateIdsOffset);
+    float *cudaCandidateProbs =
+        (float*)(scratch + candidateProbsOffset);
+    int *cudaOutput = (int*)(scratch + outputOffset);
+    int *cudaAccepted = (int*)(scratch + acceptedOffset);
+    int *cudaEmitted = (int*)(scratch + emittedOffset);
+
+    static thread_local std::vector<float> clampedTemperatures;
+    static thread_local std::vector<int> clampedTopKs;
+    static thread_local std::vector<float> clampedTopPs;
+    clampedTemperatures.resize(targetRows);
+    clampedTopKs.resize(targetRows);
+    clampedTopPs.resize(targetRows);
+    bool needTopP = false;
+    for (int row = 0; row < targetRows; row++) {
+        clampedTemperatures[row] =
+            std::max(temperatures[row], 1.0e-6f);
+        clampedTopKs[row] =
+            std::max(1, std::min(topKArr[row], vocabSize));
+        clampedTopPs[row] =
+            std::max(1.0e-6f, std::min(topPArr[row], 1.0f));
+        needTopP |= clampedTopPs[row] < 1.0f;
+    }
+    FastllmCudaCopyFromHostToDevice(
+        cudaTemperatures, clampedTemperatures.data(), temperaturesBytes);
+    FastllmCudaCopyFromHostToDevice(
+        cudaTopKs, clampedTopKs.data(), topKBytes);
+    FastllmCudaCopyFromHostToDevice(
+        cudaTopPs, clampedTopPs.data(), topPBytes);
+    FastllmCudaCopyFromHostToDevice(
+        cudaDraftTokens, (void*)draftTokenIds, draftTokenBytes);
+    FastllmCudaCopyFromHostToDevice(
+        cudaCandidateIds, (void*)draftCandidateIds, candidateIdBytes);
+    FastllmCudaCopyFromHostToDevice(
+        cudaCandidateProbs, (void*)draftCandidateProbs,
+        candidateProbBytes);
+
+    cudaStream_t stream = cudaStreamPerThread;
+    cudaError_t state = cudaMemsetAsync(
+        rowStates, 0, rowStateBytes, stream);
+    if (state == cudaSuccess) {
+        state = cudaMemsetAsync(
+            draftProbs, 0, draftProbBytes, stream);
+    }
+    if (state == cudaSuccess) {
+        state = cudaMemsetAsync(
+            cudaAccepted, 0, countBytes, stream);
+    }
+    if (state == cudaSuccess) {
+        state = cudaMemsetAsync(
+            cudaEmitted, 0, countBytes, stream);
+    }
+    if (state != cudaSuccess) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaDFlashRejectionSampling: memset failed: %s\n",
+               cudaGetErrorString(state));
+        fflush(stdout);
+        return false;
+    }
+
+    FastllmTemperatureSoftmaxKernel<1024>
+        <<<targetRows, 1024, 0, stream>>>(
+            logits, targetA, cudaTemperatures, vocabSize);
+    state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+        targetA, targetB, cudaTopKs, (uint32_t)targetRows, 0,
+        (uint32_t)vocabSize, rowStates, stream);
+    float *targetProbs = targetB;
+    if (state == cudaSuccess && needTopP) {
+        state = flashinfer::sampling::TopPRenormProb<float>(
+            targetB, targetA, cudaTopPs, (uint32_t)targetRows,
+            1.0f, (uint32_t)vocabSize, stream);
+        targetProbs = targetA;
+    }
+    if (state != cudaSuccess) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaDFlashRejectionSampling: target probability filtering failed: %s\n",
+               cudaGetErrorString(state));
+        fflush(stdout);
+        return false;
+    }
+
+    int candidateEntries = draftRows * selectorTopK;
+    FastllmDFlashScatterDraftProbsKernel
+        <<<(candidateEntries + 255) / 256, 256, 0, stream>>>(
+            draftProbs, cudaCandidateIds, cudaCandidateProbs,
+            draftRows, selectorTopK, vocabSize);
+    state = cudaGetLastError();
+    if (state == cudaSuccess) {
+        static thread_local std::mt19937 rng(std::random_device{}());
+        uint64_t seed = ((uint64_t)rng() << 32) | rng();
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+            draftProbs, cudaDraftTokens, targetProbs, cudaOutput,
+            cudaAccepted, cudaEmitted, (uint32_t)batch,
+            (uint32_t)draftTokens, (uint32_t)vocabSize,
+            true, nullptr, seed, nullptr, 0, stream);
+    }
+    if (state != cudaSuccess) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        printf("FastllmCudaDFlashRejectionSampling: rejection sampling failed: %s\n",
+               cudaGetErrorString(state));
+        fflush(stdout);
+        return false;
+    }
+
+    FastllmCudaCopyFromDeviceToHost(
+        outputTokenIds, cudaOutput, outputBytes);
+    FastllmCudaCopyFromDeviceToHost(
+        acceptedDraftTokens, cudaEmitted, countBytes);
+    DeviceSync();
+    FastllmReleaseDequantScratch(scratch, scratchOwn);
+    return true;
+}
+
 template <int BLOCK_THREADS>
 __global__ void FastllmRepeatPenaltyFactorsKernel(
         float *logits, const int *penaltyIds,
@@ -14424,7 +15592,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluTwoTokenHalfKernel(
 #endif
 }
 
-static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 6;
+static constexpr int FASTLLM_CUDA_MTP_FAST_SEQ_MAX = 8;
 static constexpr int FASTLLM_CUDA_MTP_PREFIX_SNAPSHOT_MAX =
     FASTLLM_CUDA_MTP_FAST_SEQ_MAX - 1;
 // Ordinary batched prefill does not materialize per-token MTP snapshots.  Its
@@ -14646,12 +15814,13 @@ bool FastllmCudaGetRaggedGdnMetadata(
     return true;
 }
 
-// 处理最多6个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
+// 处理最多8个新token的conv1d(kernel=4)滑窗更新, 并在处理完第t个token后
 // 把当时的滑窗状态写入对应快照 (用于MTP验证的逐token状态回滚)。
 __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
     half *cache, const half *newTokens, const float *weight, const float *bias,
     half *output,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4, half *snap5,
+    half *snap6,
     int numSnaps,
     int batch, int channels, int numTokens) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -14697,6 +15866,7 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfKernel(
                 case 3: snapBase = snap3; break;
                 case 4: snapBase = snap4; break;
                 case 5: snapBase = snap5; break;
+                case 6: snapBase = snap6; break;
                 default: break;
             }
         }
@@ -15453,7 +16623,7 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         (const float *) weight.cudaData,
         bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr,
         (half *) output.cudaData,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5],
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
         numTokenCaches, batch, channels, numTokens
     );
     cudaError_t launchState = cudaGetLastError();
@@ -17991,6 +19161,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     int seqLen, int numKHeads, int numVHeads, int headKDim, int headVDim,
     float eps, float qScale,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
+    half *snap5, half *snap6,
     half **snapshotPointers, int numSnaps) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
@@ -18116,6 +19287,8 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                     case 2: snapBase = snap2; break;
                     case 3: snapBase = snap3; break;
                     case 4: snapBase = snap4; break;
+                    case 5: snapBase = snap5; break;
+                    case 6: snapBase = snap6; break;
                     default: break;
                 }
             }
@@ -18536,7 +19709,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         (half*)last_recurrent_state.cudaData, nullptr,
         (half*)core_attn_out.cudaData,
         seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4],
+        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
         nullptr, numTokenStates
     );
 
@@ -18677,7 +19850,7 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             nullptr, (half**)devicePointers,
             (half*)coreAttnOut.cudaData,
             seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-            nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             (half**)(devicePointers + batch), numTokenStates);
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
@@ -19863,7 +21036,7 @@ __global__ void FastllmPickOutputKernel(float *partOutput, float *output, int ro
     }
 }
 // Host 调用函数
-void FastllmCudaPickOutput(float *partOutput, float *output, int rows, int cols, int *index, float *scales) {
+void FastllmCudaPickOutputFloat(float *partOutput, float *output, int rows, int cols, int *index, float *scales) {
     // 设定 Block 大小：使用 256 作为通用高性能值
     dim3 block(256);
     

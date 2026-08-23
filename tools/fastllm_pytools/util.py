@@ -361,18 +361,12 @@ def _configure_qwen35_auto_fast_paths(args, is_qwen35_model: bool, mtp: int):
     if eligible and "FASTLLM_CUDA_GRAPH" not in os.environ:
         os.environ["FASTLLM_CUDA_GRAPH"] = "1"
 
-    handoff_envs = (
-        "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF",
-        "FASTLLM_GPU_TOKEN_HANDOFF",
-    )
-    if eligible and not any(name in os.environ for name in handoff_envs):
-        os.environ["FASTLLM_QWEN35_GPU_TOKEN_HANDOFF"] = "1"
+    handoff_env = "FASTLLM_GPU_TOKEN_HANDOFF"
+    if eligible and handoff_env not in os.environ:
+        os.environ[handoff_env] = "1"
 
     graph_enabled = _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
-    handoff_enabled = _fastllm_env_flag_enabled(
-        "FASTLLM_QWEN35_GPU_TOKEN_HANDOFF",
-        "FASTLLM_GPU_TOKEN_HANDOFF",
-    )
+    handoff_enabled = _fastllm_env_flag_enabled(handoff_env)
     if is_qwen35_model and (graph_enabled or handoff_enabled):
         # Qwen3.5 handoff keeps sampled tokens on device, and graph replay also
         # benefits from avoiding a host embedding round trip.
@@ -462,9 +456,10 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "HYV3ForCausalLM",
         "LagunaForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "Dots3NoteForCausalLM",
     ] or model_type in [
         "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
-        "kimi_k3",
+        "kimi_k3", "dots3_note",
     ] or text_model_type == "qwen3_5_moe_text")
 
 def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
@@ -520,10 +515,13 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "启用模型内置 DSpark，并指定每轮 draft token 数；例如 --dspark 7")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；当前支持 dspark")
+                        help = "投机解码算法；当前支持 dspark、dflash")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
-                        help = "DSpark draft model 的 Hugging Face 目录")
+                        help = "DSpark/DFlash draft model 的 Hugging Face 目录")
+    parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
+                        dest = "speculative_num_draft_tokens", type = int, default = -1,
+                        help = "DFlash 每轮 block token 数（含 anchor），默认读取 draft config")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
                         help = "DSpark block size；默认读取 draft config")
@@ -608,27 +606,65 @@ def make_normal_llm_model(args, startup_progress = None):
         raise ValueError("--dspark must be >= 0")
     if dspark_tokens > 0 and not speculative_algorithm:
         speculative_algorithm = "dspark"
-    if speculative_draft_path and not speculative_algorithm:
-        speculative_algorithm = "dspark"
-    if speculative_algorithm and speculative_algorithm != "dspark":
-        raise ValueError("--speculative_algorithm currently only supports dspark")
-    if (speculative_algorithm == "dspark" and not speculative_draft_path and
-            dspark_tokens <= 0):
-        raise ValueError(
-            "DSpark requires either --dspark N for an embedded checkpoint or "
-            "--speculative_draft_model_path")
+    draft_config = None
+    draft_architectures = []
     if speculative_draft_path:
-        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
         draft_config_path = os.path.join(speculative_draft_path, "config.json")
         if not os.path.isfile(draft_config_path):
             raise ValueError(
-                "DSpark draft directory has no config.json: %s" %
+                "speculative draft directory has no config.json: %s" %
                 speculative_draft_path)
         with open(draft_config_path, "r", encoding = "utf-8") as file:
             draft_config = json.load(file)
         draft_architectures = draft_config.get("architectures", [])
+        if not speculative_algorithm:
+            speculative_algorithm = (
+                "dflash" if "DFlash2DraftModel" in draft_architectures
+                else "dspark")
+    if speculative_algorithm and speculative_algorithm not in ("dspark", "dflash"):
+        raise ValueError(
+            "--speculative_algorithm currently supports dspark or dflash")
+    if (speculative_algorithm == "dspark" and not speculative_draft_path and
+            dspark_tokens <= 0):
+        raise ValueError(
+            "DSpark requires either --dspark N for an embedded checkpoint or "
+            "--speculative_draft_model_path")
+    if speculative_algorithm == "dflash":
+        if not speculative_draft_path:
+            raise ValueError(
+                "DFlash requires --speculative_draft_model_path")
+        if mtp > 0:
+            raise ValueError("DFlash and --mtp cannot be enabled together")
+        if dspark_tokens > 0:
+            raise ValueError("DFlash and --dspark cannot be enabled together")
+        if "DFlash2DraftModel" not in draft_architectures:
+            raise ValueError(
+                "draft checkpoint is not DFlash2DraftModel: %s" %
+                speculative_draft_path)
+        dflash_config = draft_config.get("dflash_config", {})
+        configured_block = int(dflash_config.get("block_size", 0))
+        requested_block = int(
+            getattr(args, "speculative_num_draft_tokens", -1))
+        if requested_block <= 0:
+            requested_block = configured_block
+        if configured_block < 2 or not 2 <= requested_block <= configured_block:
+            raise ValueError(
+                "DFlash block tokens must be in [2, checkpoint block_size] "
+                "(requested=%d, checkpoint=%d)" %
+                (requested_block, configured_block))
+        os.environ.pop("FASTLLM_DSPARK_MODEL_PATH", None)
+        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
+        os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
+        os.environ["FASTLLM_DFLASH_MODEL_PATH"] = speculative_draft_path
+        os.environ["FASTLLM_DFLASH_BLOCK_SIZE"] = str(requested_block)
+        args.speculative_draft_model_path = speculative_draft_path
+        args.speculative_algorithm = "dflash"
+    elif speculative_draft_path:
+        os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
+        os.environ.pop("FASTLLM_DFLASH_MODEL_PATH", None)
+        os.environ.pop("FASTLLM_DFLASH_BLOCK_SIZE", None)
         if "DSparkDraftModel" not in draft_architectures:
             raise ValueError(
                 "draft checkpoint is not DSparkDraftModel: %s" %
@@ -668,6 +704,8 @@ def make_normal_llm_model(args, startup_progress = None):
         else:
             os.environ.pop("FASTLLM_DSPARK_TOKENS", None)
             os.environ.pop("FASTLLM_DSPARK_CONFIDENCE_THRESHOLD", None)
+        os.environ.pop("FASTLLM_DFLASH_MODEL_PATH", None)
+        os.environ.pop("FASTLLM_DFLASH_BLOCK_SIZE", None)
 
     usenuma = False
     try:
@@ -710,6 +748,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
     is_qwen35_model = False
+    is_dots3_note_model = False
     if (os.path.exists(config_path)):
         try:
             with open(config_path, "r", encoding="utf-8") as file:
@@ -718,6 +757,9 @@ def make_normal_llm_model(args, startup_progress = None):
             model_type = config.get("model_type", "")
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
+            is_dots3_note_model = (
+                architecture == 'Dots3NoteForCausalLM' or
+                model_type == 'dots3_note')
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
@@ -762,6 +804,12 @@ def make_normal_llm_model(args, startup_progress = None):
                             "--dspark must be at least the checkpoint training "
                             "block size (requested=%d, checkpoint=%d)" %
                             (dspark_tokens, checkpoint_block))
+            elif speculative_algorithm == "dflash":
+                if not is_qwen35_model:
+                    raise ValueError(
+                        "DFlash2 draft checkpoints currently require a Qwen3.5 "
+                        "target, got architecture=%s model_type=%s" %
+                        (architecture, model_type))
             is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
@@ -931,6 +979,17 @@ def make_normal_llm_model(args, startup_progress = None):
             args.atype = "float32"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    if (is_dots3_note_model and
+            str(args.moe_device).strip().lower() == "cpu"):
+        os.environ.setdefault("FASTLLM_CPU_FP8_DECODE_ROW_TILE", "4")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_PREFILL_FUSED", "1")
+        os.environ.setdefault("FASTLLM_CPU_FP8_SMALL_BATCH", "1")
+        os.environ.setdefault(
+            "FASTLLM_DOTS3_NOTE_PREFILL_MAX_EXPERT_BATCH", "5")
+        os.environ.setdefault(
+            "FASTLLM_DOTS3_NOTE_PREFILL_LPT_SCHEDULE", "1")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_PREFETCH_WEIGHTS", "1")
+        os.environ.setdefault("FASTLLM_DOTS3_NOTE_CPU_LM_HEAD", "1")
     raw_main_device = str(args.device or "").strip()
     os.environ["FASTLLM_CUDAPP_SERIAL"] = "1" if raw_main_device.lower().startswith("cudapp=") else "0"
 
@@ -944,6 +1003,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
         if (is_laguna_model and _uses_thread_tp(tp_arg)):
+            args.moe_atype = "bfloat16"
+        elif (architecture == "Dots3NoteForCausalLM" or model_type == "dots3_note"):
             args.moe_atype = "bfloat16"
         elif (_uses_cuda_device(args.moe_device)):
             args.moe_atype = "float16"
